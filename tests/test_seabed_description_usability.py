@@ -11,7 +11,7 @@ from qgis.core import (
 )
 
 from ..processing.attach_seabed_descriptions_algorithm import AttachSeabedDescriptionsAlgorithm
-from ..qgis_compat import DISTANCE_METERS, FIELD_TYPE_INT, FIELD_TYPE_STRING, GEOMETRY_POINT, GEOMETRY_LINE
+from ..qgis_compat import FIELD_TYPE_INT, FIELD_TYPE_STRING, GEOMETRY_POINT, GEOMETRY_LINE
 from .test_seabed_description_association import Feedback, labels, layer, leaders, polygons, rows, run
 
 
@@ -44,9 +44,6 @@ def test_non_metre_preference_and_different_geographic_datum_do_not_relabel_inpu
         outputs, context, project, _ = run(labels(), [leaders()], [polygons()], TEXT_FIELD='', WORKING_CRS=preference)
         assert rows(outputs['OUTPUT_POLYGONS'])[0]['description_status'] == 'matched'
         assert outputs['OUTPUT_LABELS'].crs().authid() == 'EPSG:32631'
-    crs = AttachSeabedDescriptionsAlgorithm._working_crs(
-        labels(), QgsCoordinateReferenceSystem('EPSG:4326'), QgsProcessingContext())
-    assert crs.mapUnits() == DISTANCE_METERS and not crs.isGeographic()
 
 
 def test_automatic_text_field_is_conservative_and_override_is_case_insensitive():

@@ -1,4 +1,7 @@
-"""Conservative text-block assembly; coordinates and tolerances are in metres.
+"""Conservative text-block assembly with planar or ellipsoidal measurements.
+
+Tolerances are in metres. An optional metric interprets geographic coordinates;
+the default metric treats coordinates as Cartesian metres.
 
 No soil interpretation occurs here. Certainty describes the geometric evidence,
 never the correctness of the survey interpretation or a statistical probability.
@@ -15,7 +18,7 @@ class TextLine:
     x: float
     y: float
     text: str
-    angle: float = 0.0  # counter-clockwise from working-CRS east
+    angle: float = 0.0  # counter-clockwise from east (local true east with an ellipsoidal metric)
     alignment: str = ''
 
 
@@ -33,28 +36,32 @@ def normalized_text(text):
     return ' '.join(text.split()).casefold()
 
 
-def _offset(a, b):
+def _offset(a, b, metric=None):
+    if metric is not None:
+        return metric.offset(a, b)
     angle = math.radians(a.angle)
     dx, dy = b.x - a.x, b.y - a.y
     return dx * math.cos(angle) + dy * math.sin(angle), -dx * math.sin(angle) + dy * math.cos(angle)
 
 
-def compatible(a, b, angle_tolerance=10.0):
+def compatible(a, b, angle_tolerance=10.0, metric=None):
+    if metric is not None:
+        return a.alignment == b.alignment and metric.compatible(a, b, angle_tolerance)
     angle_delta = abs((a.angle - b.angle + 180) % 360 - 180)
     return a.alignment == b.alignment and angle_delta <= angle_tolerance
 
 
-def aligned(a, b):
-    if not compatible(a, b):
+def aligned(a, b, metric=None):
+    if not compatible(a, b, metric=metric):
         return False
-    across, up = _offset(a, b)
-    across_b, up_b = _offset(b, a)
+    across, up = _offset(a, b, metric)
+    across_b, up_b = _offset(b, a, metric)
     slope = math.tan(math.radians(10))
     return (abs(up) > 1e-6 and abs(across) <= abs(up) * slope
             and abs(across_b) <= abs(up_b) * slope)
 
 
-def estimate_line_gap(lines, neighbor_pairs):
+def estimate_line_gap(lines, neighbor_pairs, metric=None):
     """Estimate from mutual nearest aligned neighbors, with explicit uncertainty.
 
     The caller supplies spatial-index neighbors, avoiding a quadratic scan.
@@ -64,8 +71,8 @@ def estimate_line_gap(lines, neighbor_pairs):
     nearest = {}
     for i, j in neighbor_pairs:
         a, b = lookup[i], lookup[j]
-        distance = math.hypot(a.x - b.x, a.y - b.y)
-        if distance <= 1e-6 or not aligned(a, b):
+        distance = metric.distance(a, b) if metric else math.hypot(a.x - b.x, a.y - b.y)
+        if distance <= 1e-6 or not aligned(a, b, metric):
             continue
         for source, target in ((i, j), (j, i)):
             if source not in nearest or (distance, target) < nearest[source]:
@@ -82,7 +89,7 @@ def estimate_line_gap(lines, neighbor_pairs):
     return typical * 1.5, reliable, reason
 
 
-def assemble_blocks(lines, pairs, max_gap, anchored=(), reliable_gap=True, cancel=lambda: None):
+def assemble_blocks(lines, pairs, max_gap, anchored=(), reliable_gap=True, cancel=lambda: None, metric=None):
     """Assemble candidates, marking branches, mixed spacing and overlaps for review.
 
     ``pairs`` contains all pairs within max_gap (plus coincident points). Distinct
@@ -105,17 +112,17 @@ def assemble_blocks(lines, pairs, max_gap, anchored=(), reliable_gap=True, cance
         if number % 1000 == 0:
             cancel()
         a, b = lookup[i], lookup[j]
-        distance = math.hypot(a.x - b.x, a.y - b.y)
+        distance = metric.distance(a, b) if metric else math.hypot(a.x - b.x, a.y - b.y)
         if distance <= 1e-6:
             parent[find(j)] = find(i)
-            if not compatible(a, b) or normalized_text(a.text) != normalized_text(b.text):
+            if not compatible(a, b, metric=metric) or normalized_text(a.text) != normalized_text(b.text):
                 problems[i].add('Different text or orientation at the same position.')
             continue
-        if distance > max_gap or not aligned(a, b):
+        if distance > max_gap or not aligned(a, b, metric):
             continue
         parent[find(j)] = find(i)
         for source, target in ((a, b), (b, a)):
-            _, up = _offset(source, target)
+            _, up = _offset(source, target, metric)
             choices.setdefault((source.key, up > 0), []).append(distance)
     for (key, _direction), distances in choices.items():
         distances.sort()
@@ -129,21 +136,22 @@ def assemble_blocks(lines, pairs, max_gap, anchored=(), reliable_gap=True, cance
     for members in components.values():
         cancel()
         reference = lookup[members[0]]
-        ordered = sorted(members, key=lambda key: (-_offset(reference, lookup[key])[1], key))
+        ordered = sorted(members, key=lambda key: (-_offset(reference, lookup[key], metric)[1], key))
         reasons = set().union(*(problems[key] for key in members))
         # Identical overprinted text is one line, but all source IDs are retained.
         representatives, seen_lines = [], set()
         for key in ordered:
             line = lookup[key]
-            signature = (round(line.x, 6), round(line.y, 6), normalized_text(line.text))
+            position = metric.position(line) if metric else (round(line.x, 6), round(line.y, 6))
+            signature = (position, normalized_text(line.text))
             if signature not in seen_lines:
                 representatives.append(key)
                 seen_lines.add(signature)
-        gaps = [abs(_offset(lookup[a], lookup[b])[1])
+        gaps = [abs(_offset(lookup[a], lookup[b], metric)[1])
                 for a, b in zip(representatives, representatives[1:])]
         if gaps and (min(gaps) <= 1e-6 or max(gaps) > 1.8 * min(gaps)):
             reasons.add('Uneven line spacing; neighboring callouts may have been combined.')
-        anchor_positions = {(round(lookup[key].x, 6), round(lookup[key].y, 6))
+        anchor_positions = {(metric.position(lookup[key]) if metric else (round(lookup[key].x, 6), round(lookup[key].y, 6)))
                             for key in set(members) & anchored}
         if len(anchor_positions) > 1:
             reasons.add('Several distinct leader anchors in the proposed text block.')

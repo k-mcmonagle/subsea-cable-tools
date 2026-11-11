@@ -106,11 +106,15 @@ Certainty describes geometric evidence, not confirmation of the soil interpretat
 never assigns a polygon merely because it is nearest. Ambiguous text grouping, insufficient
 spacing evidence and invalid geometry are explicit; no source text is silently discarded.
 Geographic inputs (such as EPSG:4326) and layers with different CRSs are supported without manual
-reprojection. Measurements use a suitable projected CRS in metres automatically, while outputs
-keep the text layer's CRS. A geographic or non-metre measurement CRS preference also uses this
-automatic selection. For large survey extents or polar regions, process smaller sections or
-choose a suitable projected metre CRS under **Advanced parameters**. This optional tool does not
-change general-purpose MDB importing.
+reprojection. Long routes can cross UTM zones, the date line and polar regions; there is no overall
+route-length or latitude restriction. Text spacing and leader distances use the WGS84 ellipsoid.
+Polygon checks use local coordinates centred on each target, with adaptive subdivision of
+transformed edges (2 mm numerical tolerance; boundary checks include a 4 mm review margin).
+These are calculation tolerances, not a statement of survey accuracy. Geographic polygon edges
+crossing the date line follow the short longitude interval. Outputs keep the text layer's CRS;
+old measurement CRS preferences are ignored. Valid source CRS definitions and datum transformations
+are still required. Invalid, ambiguous or unmeasurable geometries remain review cases, and feature
+count/complexity safeguards still apply. This optional tool does not change general-purpose MDB importing.
 
 ## Map and dock tools
 

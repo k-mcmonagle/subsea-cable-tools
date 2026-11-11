@@ -8,13 +8,13 @@ import re
 
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
-    NULL, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsFeature,
+    NULL, QgsCoordinateTransform, QgsFeature,
     QgsField, QgsFields, QgsGeometry, QgsPointXY, QgsProcessing,
     QgsProcessingException, QgsProcessingLayerPostProcessorInterface,
     QgsProcessingParameterCrs, QgsProcessingParameterFeatureSink,
     QgsProcessingParameterFeatureSource, QgsProcessingParameterField,
     QgsProcessingParameterMultipleLayers, QgsProcessingParameterNumber,
-    QgsRectangle, QgsSpatialIndex, QgsVectorLayerSimpleLabeling,
+    QgsVectorLayerSimpleLabeling,
     QgsPalLayerSettings, QgsTextFormat, QgsWkbTypes, QgsCategorizedSymbolRenderer,
     QgsMarkerSymbol, QgsRendererCategory, QgsProperty,
     QgsProviderRegistry, Qgis, QgsProcessingParameterDefinition,
@@ -22,8 +22,11 @@ from qgis.core import (
 
 from .algorithm_base import SubseaCableAlgorithm
 from .annotation_blocks import TextBlock, TextLine, assemble_blocks, estimate_line_gap, normalized_text
+from .annotation_geodesy import (
+    BOUNDARY_MARGIN, EllipsoidalMetric, GlobalPointIndex, GlobalPolygonIndex, LocalPolygon, geographic,
+)
 from ..qgis_compat import (
-    DISTANCE_METERS, FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING,
+    FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING,
     GEOMETRY_LINE, GEOMETRY_POLYGON, PROCESSING_FIELD_ANY,
     PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE, WKB_POINT, WKB_LINESTRING,
 )
@@ -44,12 +47,6 @@ def _string(value):
 
 def _json(value):
     return json.dumps(value, ensure_ascii=False)
-
-
-def _point_feature(key, point):
-    feature = QgsFeature(key)
-    feature.setGeometry(QgsGeometry.fromPointXY(point))
-    return feature
 
 
 def _safe_coordinates(geometry, cancel):
@@ -82,23 +79,6 @@ def _new_field(fields, name, kind):
         name, suffix = f'{base}_{suffix}', suffix + 1
     fields.append(QgsField(name, kind))
     return name
-
-
-def _polygon_parts(geometry):
-    """Extract area components from makeValid's possible geometry collection.
-
-    Collapsed edges may accompany valid areas. They are excluded from the search,
-    while the original polygon is retained in the output and marked for review.
-    """
-    if geometry.isNull() or geometry.isEmpty():
-        return []
-    if geometry.type() == GEOMETRY_POLYGON and not geometry.isMultipart():
-        return [geometry]
-    parts = []
-    for part in geometry.asGeometryCollection():
-        if part.type() == GEOMETRY_POLYGON or part.isMultipart():
-            parts.extend(_polygon_parts(part))
-    return parts
 
 
 class _LabelPoints(QgsProcessingLayerPostProcessorInterface):
@@ -194,7 +174,7 @@ class AttachSeabedDescriptionsAlgorithm(SubseaCableAlgorithm):
             self.BOUNDARY_TOLERANCE, self.tr('Flag targets this close to polygon boundaries for review (metres)'),
             type=PROCESSING_NUMBER_DOUBLE, defaultValue=0.5, minValue=0))
         self.addParameter(QgsProcessingParameterCrs(
-            self.WORKING_CRS, self.tr('Measurement CRS preference (optional; geographic CRSs handled automatically)'), optional=True))
+            self.WORKING_CRS, self.tr('Legacy measurement CRS (ignored; measurements are now ellipsoidal)'), optional=True))
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUTPUT_LABELS, self.tr('Assembled description points'), type=QgsProcessing.TypeVectorPoint))
         self.addParameter(QgsProcessingParameterFeatureSink(
@@ -205,22 +185,26 @@ class AttachSeabedDescriptionsAlgorithm(SubseaCableAlgorithm):
             type=QgsProcessing.TypeVectorLine, optional=True, createByDefault=True))
         try:
             advanced = Qgis.ProcessingParameterFlag.Advanced
+            hidden = Qgis.ProcessingParameterFlag.Hidden
         except AttributeError:
             advanced = QgsProcessingParameterDefinition.FlagAdvanced
+            hidden = QgsProcessingParameterDefinition.FlagHidden
         for name in (self.ROTATION_FIELD, self.ALIGNMENT_FIELD, self.MAX_LINE_GAP,
                      self.ANCHOR_TOLERANCE, self.BOUNDARY_TOLERANCE, self.WORKING_CRS):
             parameter = self.parameterDefinition(name)
             parameter.setFlags(parameter.flags() | advanced)
+        legacy_crs = self.parameterDefinition(self.WORKING_CRS)
+        legacy_crs.setFlags(legacy_crs.flags() | hidden)
 
     def shortHelpString(self):
         return '''<p><b>Quick start:</b> select the description point layer and run. The text field
 is detected automatically for normal MDB imports. Leaders and soil polygons are optional: add
 them to attach descriptions to polygons, or leave them empty to assemble labels only.
 Source layers are never edited. Inputs may use geographic coordinates (such as EPSG:4326),
-projected coordinates or different CRSs; no manual reprojection is needed for local surveys.</p>
+projected coordinates or different CRSs. Long routes, multiple UTM zones, date-line crossings
+and polar regions are supported without splitting the input or selecting a measurement CRS.</p>
 <p>If several possible text fields are present, choose the correct field explicitly. Rotation,
-alignment, spacing, distance tolerances and a CRS preference are under <b>Advanced parameters</b>.
-The normal defaults require no CRS selection.</p>
+alignment, spacing and distance tolerances are under <b>Advanced parameters</b>.</p>
 <p>Aligned lines with compatible rotations, alignment and consistent spacing are assembled in
 reading order, with newlines preserved. Zero line gap estimates a limit from repeated local
 spacing; small or mixed-scale samples require review or an explicit limit. The rule is geometric,
@@ -243,11 +227,15 @@ association. Only matched polygons receive <b>soil_description</b>; proposals re
 attributes are copied; generated names gain a suffix if they would overwrite an existing field.
 The source layer, feature IDs and block IDs permit tracing results back to the input.</p>
 <p>The leader-check layer explains each association, including rejected leaders. Use it with
-the original annotation layers to review results. The tool measures internally in metres and
-keeps outputs in the text layer's original CRS. If a geographic or non-metre CRS preference is
-selected, a local metre-based CRS is chosen automatically; the preference never relabels input
-coordinates or changes the output CRS. Automatic selection requires local data; for larger
-areas, use a suitable projected metre CRS under Advanced parameters or process smaller sections.
+the original annotation layers to review results. Text spacing and leader-anchor distances are
+measured on the WGS84 ellipsoid. Polygon containment and boundary distances use a separate local
+projection centred on each leader target, with curved transformed edges subdivided to a 2 mm
+numerical tolerance and a 4 mm boundary review margin. These tolerances describe the calculation,
+not survey accuracy. Geographic polygon edges crossing the date line follow the short longitude
+interval. Outputs keep the text layer's original CRS. Valid source CRS definitions and available
+datum transformations are still necessary; ambiguous or unmeasurable geometry requires review.
+There is no overall route-length or latitude restriction; feature-count and complexity safeguards
+still apply. Old saved measurement CRS preferences are ignored.
 Select only relevant soil and leader layers;
 this tool does not classify soil, infer ground conditions, or change MDB import behaviour.
 Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the long text and field names.</p>'''
@@ -256,30 +244,6 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
     def _cancel(feedback):
         if feedback.isCanceled():
             raise QgsProcessingException('Description association canceled.')
-
-    @staticmethod
-    def _working_crs(source, requested, context):
-        # A geographic preference is common when the dialog inherits a map CRS.
-        # It must not prevent geographic input from following the automatic path.
-        # All geometry still gets transformed from its actual source CRS.
-        if requested.isValid() and not requested.isGeographic() and requested.mapUnits() == DISTANCE_METERS:
-            return requested
-        crs = source.sourceCrs()
-        if not crs.isValid():
-            raise QgsProcessingException('The description point layer must have a valid CRS.')
-        if not crs.isGeographic() and crs.mapUnits() == DISTANCE_METERS:
-            return crs
-        extent = source.sourceExtent()
-        transform = QgsCoordinateTransform(crs, QgsCoordinateReferenceSystem('EPSG:4326'), context.transformContext())
-        extent = transform.transformBoundingBox(extent)
-        if (not all(math.isfinite(v) for v in (extent.xMinimum(), extent.yMinimum(), extent.xMaximum(), extent.yMaximum()))
-                or extent.width() > 6 or extent.height() > 6
-                or extent.yMinimum() < -80 or extent.yMaximum() > 84):
-            raise QgsProcessingException('This area is too large or outside the supported latitude range for automatic measurement CRS selection. '
-                                         'Process smaller sections, or choose a suitable projected metre CRS under Advanced parameters.')
-        centre = extent.center()
-        zone = max(1, min(60, int((centre.x() + 180) // 6) + 1))
-        return QgsCoordinateReferenceSystem(f'EPSG:{(32600 if centre.y() >= 0 else 32700) + zone}')
 
     @staticmethod
     def _text_field(source, selected):
@@ -315,8 +279,8 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
             raise QgsProcessingException(f'Field {selected} does not exist in the text layer.')
         return names.get((selected or automatic).casefold())
 
-    def _read_text(self, source, text_field, rotation_field, alignment_field, transform, feedback):
-        records, lines, index, size = {}, [], QgsSpatialIndex(), 0
+    def _read_text(self, source, text_field, rotation_field, alignment_field, transform, metric, feedback):
+        records, lines, size = {}, [], 0
         for number, feature in enumerate(source.getFeatures()):
             self._cancel(feedback)
             if number >= MAX_FEATURES:
@@ -338,7 +302,7 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
                 original = points[0]
                 if not all(math.isfinite(v) and abs(v) <= 1e12 for v in (original.x(), original.y())):
                     raise ValueError('Unsafe text anchor coordinates.')
-                point = transform.transform(original)
+                point = geographic(transform.transform(original))
                 if not all(math.isfinite(v) and abs(v) <= 1e12 for v in (point.x(), point.y())):
                     raise ValueError('Non-finite text anchor.')
                 record['geometry'] = QgsGeometry.fromPointXY(original)
@@ -357,23 +321,21 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
                 angle = math.radians(rotation)
                 along = transform.transform(QgsPointXY(original.x() + step * math.cos(angle),
                                                        original.y() + step * math.sin(angle)))
-                working_angle = math.degrees(math.atan2(along.y() - point.y(), along.x() - point.x()))
+                working_angle = metric.angle(point, geographic(along))
                 alignment = _string(feature[alignment_field]) if alignment_field else ''
                 lines.append(TextLine(key, point.x(), point.y(), text, working_angle, alignment))
-                index.addFeature(_point_feature(key, point))
             except Exception as exc:  # retain an explicit review row, never drop text
                 record['error'] = str(exc) if isinstance(exc, ValueError) else 'Text anchor could not be transformed or read.'
         if not records:
             raise QgsProcessingException('The description point input contains no features.')
-        return records, lines, index
+        return records, lines
 
     def _pairs(self, lines, index, gap, feedback, nearest=False):
         count = 0
         for line in lines:
             self._cancel(feedback)
             point = QgsPointXY(line.x, line.y)
-            candidates = (index.nearestNeighbor(point, 13) if nearest else
-                          index.intersects(QgsRectangle(line.x - gap, line.y - gap, line.x + gap, line.y + gap)))
+            candidates = (index.nearest(point, 13) if nearest else index.near(point, gap))
             for other in candidates:
                 if other == line.key or (not nearest and other < line.key):
                     continue
@@ -382,12 +344,12 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
                     raise QgsProcessingException('Too many competing text neighbors. Reduce the line-gap limit or select a smaller area.')
                 yield line.key, other
 
-    def _read_leaders(self, layers, working_crs, output_crs, text_index, positions, tolerance, context, feedback):
+    def _read_leaders(self, layers, metric, output_crs, text_index, tolerance, context, feedback):
         leaders, anchored = [], set()
         for layer_number, layer in enumerate(layers, 1):
             if not layer.crs().isValid():
                 raise QgsProcessingException(f'Leader layer {layer.name()} has no valid CRS.')
-            transform = QgsCoordinateTransform(layer.crs(), working_crs, context.transformContext())
+            transform = QgsCoordinateTransform(layer.crs(), metric.crs, context.transformContext())
             to_output = QgsCoordinateTransform(layer.crs(), output_crs, context.transformContext())
             for feature in layer.getFeatures():
                 self._cancel(feedback)
@@ -417,18 +379,15 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
                         output = QgsGeometry.fromPolylineXY(part)
                         _transform_geometry(output, to_output, lambda: self._cancel(feedback))
                         row['geometry'] = output
-                        ends = [transform.transform(part[0]), transform.transform(part[-1])]
+                        ends = [geographic(transform.transform(part[0])), geographic(transform.transform(part[-1]))]
                         if not all(math.isfinite(v) for p in ends for v in (p.x(), p.y())):
                             raise ValueError('Non-finite leader endpoint.')
-                        if ends[0].distance(ends[1]) <= 1e-6:
+                        if metric.metres(ends[0], ends[1]) <= 1e-6:
                             raise ValueError('Closed leader or arrowhead; no distinct text and target ends.')
                         row['ends'] = ends
                         for point in ends:
                             radius = max(tolerance, 1e-6)
-                            candidates = text_index.intersects(QgsRectangle(point.x() - radius, point.y() - radius,
-                                                                            point.x() + radius, point.y() + radius))
-                            close = {key: point.distance(positions[key]) for key in candidates
-                                     if point.distance(positions[key]) <= radius}
+                            close = text_index.near(point, radius)
                             row['near'].append(close)
                         # A seed is only evidence when one end has one distinct
                         # text position. Ambiguous seeds do not strengthen groups.
@@ -441,8 +400,8 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
                         row['error'] = str(exc) if isinstance(exc, ValueError) else 'Leader geometry could not be transformed.'
         return leaders, anchored
 
-    def _read_polygons(self, layers, working_crs, output_crs, context, feedback):
-        fields, maps, records, index = QgsFields(), [], [], QgsSpatialIndex()
+    def _read_polygons(self, layers, output_crs, context, feedback):
+        fields, maps, records, index = QgsFields(), [], [], GlobalPolygonIndex(EllipsoidalMetric(context))
         # Preserve attributes, including case/type conflicts and existing soil
         # descriptions. Source fid columns must not become a sink's primary key.
         for layer in layers:
@@ -460,7 +419,6 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
         for layer_number, (layer, mapping) in enumerate(zip(layers, maps), 1):
             if not layer.crs().isValid():
                 raise QgsProcessingException(f'Polygon layer {layer.name()} has no valid CRS.')
-            transform = QgsCoordinateTransform(layer.crs(), working_crs, context.transformContext())
             to_output = QgsCoordinateTransform(layer.crs(), output_crs, context.transformContext())
             for feature in layer.getFeatures():
                 self._cancel(feedback)
@@ -470,8 +428,7 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
                 for source_i, dest_i in enumerate(mapping):
                     attrs[dest_i] = feature[source_i]
                 row = {'ref': f'P{layer_number}:{feature.id()}', 'layer': layer.name(), 'layer_id': layer.id(), 'fid': feature.id(),
-                       'attrs': attrs, 'geometry': QgsGeometry(), 'search': QgsGeometry(),
-                       'boundary': QgsGeometry(), 'error': '', 'blocks': set(), 'review': set(), 'leaders': set()}
+                       'attrs': attrs, 'geometry': QgsGeometry(), 'local': None, 'error': '', 'blocks': set(), 'review': set(), 'leaders': set()}
                 records.append(row)
                 try:
                     original = feature.geometry()
@@ -488,22 +445,24 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
                     row['geometry'] = output
                     working = QgsGeometry(original)
                     working.convertToStraightSegment()
-                    _transform_geometry(working, transform, lambda: self._cancel(feedback))
-                    if not working.isGeosValid():
+                    local = LocalPolygon(working, layer.crs(), context, lambda: self._cancel(feedback))
+                    row['local'] = local
+                    # Validate at a local point without interpreting a geographic
+                    # date-line/polar ring as a flat longitude/latitude polygon.
+                    first = next(working.vertices())
+                    centre = geographic(local.to_global.transform(QgsPointXY(first.x(), first.y())))
+                    local_geometry, repaired = local.at(centre)
+                    local.cap_centre = centre
+                    local.cap_radius = max(math.hypot(v.x(), v.y()) for v in local_geometry.vertices()) + BOUNDARY_MARGIN
+                    if repaired:
                         row['error'] = 'Invalid polygon; repaired only for candidate search. Review geometry and match.'
-                        working = working.makeValid()
-                        working = QgsGeometry.collectGeometry(_polygon_parts(working))
-                    if working.isEmpty() or working.isNull() or working.type() != GEOMETRY_POLYGON or not working.isGeosValid():
-                        raise ValueError('Polygon cannot be used for reliable spatial matching.')
-                    row['search'] = working
-                    row['boundary'] = QgsGeometry(working.constGet().boundary())
-                    indexed = QgsFeature(len(records) - 1)
-                    indexed.setGeometry(working)
-                    index.addFeature(indexed)
                 except QgsProcessingException:
                     raise
                 except Exception as exc:
                     row['error'] = str(exc) if isinstance(exc, ValueError) else 'Polygon geometry could not be transformed.'
+                finally:
+                    if row['local'] is not None:
+                        index.add(len(records) - 1, row['local'])
         return fields, records, index
 
     def _associate(self, leaders, blocks, polygons, polygon_index, boundary_tolerance, feedback):
@@ -528,31 +487,43 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
             leader['block'] = block_id
             leader['gap'] = min(leader['near'][text_end].values())
             target = leader['ends'][1 - text_end]
-            geometry = QgsGeometry.fromPointXY(target)
-            radius = max(boundary_tolerance, 1e-6)
-            ids = polygon_index.intersects(QgsRectangle(target.x() - radius, target.y() - radius,
-                                                        target.x() + radius, target.y() + radius))
-            inside, nearby = [], []
+            geometry = QgsGeometry.fromPointXY(QgsPointXY(0, 0))
+            radius = max(boundary_tolerance, 1e-6) + BOUNDARY_MARGIN
+            ids = polygon_index.candidates(target, radius)
+            inside, nearby, failed, distances = [], [], [], {}
             for key in ids:
+                self._cancel(feedback)
                 polygon = polygons[key]
-                search = polygon['search']
-                if search.contains(geometry):
-                    inside.append(key)
-                elif search.distance(geometry) <= radius:
-                    nearby.append(key)
-            candidates = sorted(set(inside + nearby))
+                try:
+                    search, repaired = polygon['local'].at(target)
+                    if repaired:
+                        polygon['error'] = 'Invalid polygon; repaired only for candidate search. Review geometry and match.'
+                    boundary = QgsGeometry(search.constGet().boundary())
+                    distances[key] = boundary.distance(geometry)
+                    if search.contains(geometry):
+                        inside.append(key)
+                    elif search.distance(geometry) <= radius:
+                        nearby.append(key)
+                except QgsProcessingException:
+                    raise
+                except Exception as exc:
+                    polygon['error'] = str(exc) if isinstance(exc, ValueError) else 'Polygon could not be measured at this target.'
+                    failed.append(key)
+            candidates = sorted(set(inside + nearby + failed))
             leader['polygons'] = candidates
             if not candidates:
                 leader['reason'] = ('No polygon layers selected.' if not polygons else
                                     'Target is outside the selected soil polygons; no nearest-polygon assignment made.')
                 continue
             reasons = []
+            if failed:
+                reasons.append("A candidate polygon could not be measured reliably at this target.")
             if len(inside) != 1 or nearby:
                 reasons.append('Target overlaps polygons or lies on/near a polygon boundary.')
             if len(inside) == 1:
-                edge_distance = polygons[inside[0]]['boundary'].distance(geometry)
+                edge_distance = distances[inside[0]]
                 leader['target_gap'] = edge_distance
-                if edge_distance <= boundary_tolerance:
+                if edge_distance <= boundary_tolerance + BOUNDARY_MARGIN:
                     reasons.append('Target is too close to the polygon boundary.')
             if blocks[block_id].status in {'review', 'layout_only'}:
                 reasons.append('Text assembly lacks unambiguous leader support or requires review.')
@@ -622,15 +593,16 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
             feedback.pushInfo('No rotation field: text is assumed horizontal in its source CRS.')
         if not alignment:
             feedback.pushInfo('No alignment field: text grouping uses anchor positions without justification metadata.')
-        preference = self.parameterAsCrs(parameters, self.WORKING_CRS, context)
-        working_crs = self._working_crs(source, preference, context)
+        metric = EllipsoidalMetric(context)
         output_crs = source.sourceCrs()
-        if preference.isValid() and (preference.isGeographic() or preference.mapUnits() != DISTANCE_METERS):
-            feedback.pushInfo('The selected CRS preference does not use projected metres; a measurement CRS was chosen automatically.')
-        feedback.pushInfo('Measurement CRS: ' + working_crs.authid() + '. Outputs use the description point CRS.')
-        transform = QgsCoordinateTransform(output_crs, working_crs, context.transformContext())
-        records, lines, text_index = self._read_text(source, text_field, rotation, alignment, transform, feedback)
+        feedback.pushInfo('Measurements use the WGS84 ellipsoid and local coordinates at each target; there is no route-extent limit. '
+                          'Outputs use the description point CRS.')
+        if self.parameterAsCrs(parameters, self.WORKING_CRS, context).isValid():
+            feedback.pushInfo('The legacy measurement CRS preference is ignored; ellipsoidal measurements are automatic.')
+        transform = QgsCoordinateTransform(output_crs, metric.crs, context.transformContext())
+        records, lines = self._read_text(source, text_field, rotation, alignment, transform, metric, feedback)
         positions = {line.key: QgsPointXY(line.x, line.y) for line in lines}
+        text_index = GlobalPointIndex(positions, metric, lambda: self._cancel(feedback))
         feedback.setProgress(15)
         gap = self.parameterAsDouble(parameters, self.MAX_LINE_GAP, context)
         anchor_tolerance = self.parameterAsDouble(parameters, self.ANCHOR_TOLERANCE, context)
@@ -639,7 +611,7 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
             raise QgsProcessingException('Tolerances must be finite, non-negative distances in metres.')
         reliable_gap = True
         if gap == 0:
-            gap, reliable_gap, message = estimate_line_gap(lines, self._pairs(lines, text_index, 0, feedback, nearest=True))
+            gap, reliable_gap, message = estimate_line_gap(lines, self._pairs(lines, text_index, 0, feedback, nearest=True), metric)
             feedback.pushInfo(message)
         leader_layers = self.parameterAsLayerList(parameters, self.LEADERS, context)
         polygon_layers = self.parameterAsLayerList(parameters, self.POLYGONS, context)
@@ -651,17 +623,17 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
         self._validate_destinations(parameters, context,
                                     [self.parameterAsVectorLayer(parameters, self.TEXT, context)] + leader_layers + polygon_layers,
                                     output_names)
-        leaders, anchored = self._read_leaders(leader_layers, working_crs, output_crs, text_index,
-                                              positions, anchor_tolerance, context, feedback)
+        leaders, anchored = self._read_leaders(leader_layers, metric, output_crs, text_index,
+                                              anchor_tolerance, context, feedback)
         blocks = assemble_blocks(lines, self._pairs(lines, text_index, max(gap, 1e-6), feedback), gap,
-                                 anchored, reliable_gap, lambda: self._cancel(feedback))
+                                 anchored, reliable_gap, lambda: self._cancel(feedback), metric)
         for key, record in records.items():
             if record['error']:
                 blocks.append(TextBlock((key,), key, record['text'], 'review', record['error']))
         blocks.sort(key=lambda block: min(block.members))
         feedback.setProgress(40)
         polygon_fields, polygons, polygon_index = self._read_polygons(
-            polygon_layers, working_crs, output_crs, context, feedback)
+            polygon_layers, output_crs, context, feedback)
         feedback.setProgress(65)
         self._associate(leaders, blocks, polygons, polygon_index, boundary_tolerance, feedback)
         result = self._outputs(parameters, context, feedback, source, records, blocks, leaders, polygons,
