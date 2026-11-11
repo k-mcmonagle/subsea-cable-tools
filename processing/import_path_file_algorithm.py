@@ -24,15 +24,14 @@ from qgis.core import (
     QgsField,
     QgsGeometry,
     QgsPointXY,
-    QgsProcessing,
     QgsProcessingException,
     QgsProcessingOutputMultipleLayers,
     QgsProcessingParameterCrs,
-    QgsProcessingParameterMultipleLayers,
     QgsVectorLayer,
 )
 
 from .algorithm_base import SubseaCableAlgorithm
+from .file_list_parameter import FileListParameter
 from ..qgis_compat import (
     FIELD_TYPE_DOUBLE,
     FIELD_TYPE_INT,
@@ -108,10 +107,9 @@ class ImportPathFileAlgorithm(SubseaCableAlgorithm):
     OUTPUT_LAYERS = 'OUTPUT_LAYERS'
 
     def initAlgorithm(self, config=None):
-        self.addParameter(QgsProcessingParameterMultipleLayers(
+        self.addParameter(FileListParameter(
             self.INPUT_FILES,
             self.tr('Input path file(s) (.pthmdb)'),
-            QgsProcessing.TypeFile,
         ))
         self.addParameter(QgsProcessingParameterCrs(
             self.CRS_OVERRIDE,

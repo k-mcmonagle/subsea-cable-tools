@@ -30,8 +30,6 @@ from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsPointXY,
-    QgsProcessing,
-    QgsProcessingParameterMultipleLayers,
     QgsProcessingParameterCrs,
     QgsProcessingParameterEnum,
     QgsProcessingParameterFile,
@@ -44,6 +42,7 @@ from qgis.core import (
     QgsProcessingContext,
 )
 from .algorithm_base import SubseaCableAlgorithm
+from .file_list_parameter import FileListParameter
 from ..qgis_compat import (
     FIELD_TYPE_DOUBLE,
     FIELD_TYPE_INT,
@@ -719,10 +718,9 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
         return bool(load_all_geoms) or str(geometry_type_name) in cls.DEFAULT_GEOMETRY_TYPES
 
     def initAlgorithm(self, config=None):
-        self.addParameter(QgsProcessingParameterMultipleLayers(
+        self.addParameter(FileListParameter(
             self.INPUT_MDB,
             self.tr('Input MDB File(s)'),
-            QgsProcessing.TypeFile,
         ))
         self.addParameter(QgsProcessingParameterCrs(
             self.SOURCE_CRS,
@@ -754,13 +752,15 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
         exe_dir = os.path.dirname(sys.executable)
         candidates = [
             os.environ.get('QGIS_PYTHON_EXECUTABLE', ''),
+            sys.executable,
             os.path.join(exe_dir, 'python3.exe'),
             os.path.join(exe_dir, 'python.exe'),
             os.path.join(exe_dir, 'python3'),
             os.path.join(exe_dir, 'python'),
+            os.path.join(sys.prefix, 'python.exe'),
+            os.path.join(sys.prefix, 'bin', 'python3'),
             os.path.join(exe_dir, 'python-qgis.bat'),
             shutil.which('python3') or '',
-            sys.executable,
         ]
         python_exe = ''
         for c in candidates:
@@ -785,7 +785,7 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
                 text=True,
                 encoding='utf-8',
                 errors='replace',
-                env=dict(os.environ, PYTHONIOENCODING='utf-8'),
+                env=self._worker_environment(worker_script),
                 creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
             )
             deadline = None if not timeout else time.monotonic() + timeout
@@ -854,6 +854,28 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
         if not out:
             return None
         return json.loads(out)
+
+    @staticmethod
+    def _worker_environment(worker_script):
+        env = dict(os.environ, PYTHONIOENCODING='utf-8')
+        if worker_script == 'mdb_convert_worker.py':
+            # The desktop app adds QGIS/Qt to sys.path at startup; these paths
+            # are not necessarily in PYTHONPATH. A bare child Python therefore
+            # cannot import qgis even when it belongs to the same installation.
+            # Use the packages already loaded by the host, including its Qt
+            # generation, rather than guessing install directories or inheriting
+            # unrelated plugin directories from the entire host sys.path.
+            import qgis
+
+            qt_package = sys.modules[QCoreApplication.__module__.split('.')[0]]
+            roots = [os.path.dirname(os.path.dirname(package.__file__))
+                     for package in (qgis, qt_package)]
+            existing = env.get('PYTHONPATH')
+            if existing:
+                roots.append(existing)
+            env['PYTHONPATH'] = os.pathsep.join(dict.fromkeys(roots))
+            env['QGIS_PREFIX_PATH'] = QgsApplication.prefixPath()
+        return env
 
     @staticmethod
     def _register_output_layer(context, layer, layer_name, group_name):

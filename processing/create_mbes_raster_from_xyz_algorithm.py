@@ -17,14 +17,14 @@ from qgis.core import (
     QgsProcessingParameterCrs,
     QgsProcessingParameterEnum,
     QgsProcessingParameterFolderDestination,
-    QgsProcessingParameterMultipleLayers,
     QgsProcessingParameterNumber,
     QgsRectangle,
 )
 from .algorithm_base import SubseaCableAlgorithm, gdal_creation_options
+from .file_list_parameter import FileListParameter
 from ..qgis_compat import (
     PROCESSING_NUMBER_DOUBLE, PROCESSING_NUMBER_INTEGER,
-    PROCESSING_SOURCE_FILE, processing_temp_folder,
+    processing_temp_folder,
 )
 from qgis import processing
 try:
@@ -165,10 +165,9 @@ class CreateMBESRasterFromXYZAlgorithm(SubseaCableAlgorithm):
 
     def initAlgorithm(self, config=None):
         self.addParameter(
-            QgsProcessingParameterMultipleLayers(
+            FileListParameter(
                 self.INPUT_XYZ,
                 self.tr('Input XYZ file(s)'),
-                layerType=PROCESSING_SOURCE_FILE,
             )
         )
         self.addParameter(

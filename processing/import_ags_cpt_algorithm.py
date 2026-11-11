@@ -33,7 +33,6 @@ from qgis.core import (
     QgsProcessingParameterEnum,
     QgsProcessingParameterFeatureSink,
     QgsProcessingParameterFile,
-    QgsProcessingParameterMultipleLayers,
     QgsProcessingParameterNumber,
     QgsProcessingParameterString,
 )
@@ -45,11 +44,11 @@ from ..qgis_compat import (
     FIELD_TYPE_INT,
     FIELD_TYPE_STRING,
     PROCESSING_NUMBER_DOUBLE,
-    PROCESSING_SOURCE_FILE,
     WKB_NO_GEOMETRY,
     WKB_POINT,
 )
 from .algorithm_base import SubseaCableAlgorithm
+from .file_list_parameter import FileListParameter
 
 _NAME_RULES = [cpt_mod.NAME_AUTO, cpt_mod.NAME_FILE, cpt_mod.NAME_LOCATION, cpt_mod.NAME_FILE_LOCATION]
 _PORE = ["u2", "u1", "u3"]
@@ -118,9 +117,8 @@ class ImportAgsCptAlgorithm(SubseaCableAlgorithm):
     OUTPUT_STRATA = "OUTPUT_STRATA"
 
     def initAlgorithm(self, config=None):
-        self.addParameter(QgsProcessingParameterMultipleLayers(
-            self.INPUT, self.tr("AGS file(s) (AGS 3.x or 4.x, any extension)"),
-            layerType=PROCESSING_SOURCE_FILE))
+        self.addParameter(FileListParameter(
+            self.INPUT, self.tr("AGS file(s) (AGS 3.x or 4.x, any extension)")))
         self.addParameter(QgsProcessingParameterEnum(
             self.NAME_RULE, self.tr("Name each CPT by"),
             options=[self.tr("Automatic (file name when each file holds one CPT)"),

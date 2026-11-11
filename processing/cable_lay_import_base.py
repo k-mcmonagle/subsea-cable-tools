@@ -35,7 +35,6 @@ from qgis.core import (
     QgsProcessingException,
     QgsProcessingOutputVectorLayer,
     QgsProcessingParameterFileDestination,
-    QgsProcessingParameterMultipleLayers,
     QgsProcessingParameterString,
     QgsProcessingParameterVectorLayer,
     QgsProviderRegistry,
@@ -43,6 +42,7 @@ from qgis.core import (
 )
 
 from .algorithm_base import SubseaCableAlgorithm
+from .file_list_parameter import FileListParameter
 from . import cable_lay_parsers as clp
 
 
@@ -75,10 +75,9 @@ class CableLayImportAlgorithm(SubseaCableAlgorithm):
     # --------------------------------------------------------------- parameters
     def initAlgorithm(self, config=None):
         self.addParameter(
-            QgsProcessingParameterMultipleLayers(
+            FileListParameter(
                 self.INPUT,
                 self.tr(self.INPUT_LABEL),
-                layerType=QgsProcessing.TypeFile,
             )
         )
         if self.NEEDS_START_DATE:
