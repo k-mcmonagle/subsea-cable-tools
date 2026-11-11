@@ -90,6 +90,9 @@ def iter_python_files() -> list[Path]:
         rel = path.relative_to(ROOT)
         if any(part in SKIP_DIRS for part in rel.parts):
             continue
+        # Local scratch copies are not shipped and can contain old APIs.
+        if rel.parts[:2] == ("scripts", "local"):
+            continue
         if rel in SKIP_FILES:
             continue
         files.append(path)

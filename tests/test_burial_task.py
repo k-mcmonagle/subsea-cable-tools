@@ -423,7 +423,7 @@ def test_workbench_path_recovers_after_project_move() -> bool:
         recovered = burial_dock.BurialPlannerDock.workbench_store(dock_like)
         ok = recovered is not None
         ok = ok and os.path.normcase(recovered.gpkg_path) == os.path.normcase(expected)
-        ok = ok and workbench_store_module.project_gpkg_path(project) == expected
+        ok = ok and os.path.normcase(workbench_store_module.project_gpkg_path(project)) == os.path.normcase(expected)
     finally:
         project.setFileName(old_filename)
         if old_path:

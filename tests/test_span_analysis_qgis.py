@@ -15,6 +15,8 @@ import time
 from typing import List
 
 import numpy as np
+from ..project_lifecycle import project_teardown_signal
+
 from qgis.core import QgsFeature, QgsGeometry, QgsPointXY, QgsProject, QgsRasterLayer, QgsVectorLayer
 from qgis.gui import QgsMapCanvas
 from qgis.PyQt.QtCore import QCoreApplication, QPoint, QPointF, Qt
@@ -647,7 +649,7 @@ def test_follows_project() -> List[bool]:
         store_b.close()
         dialog._dirty = False
         span_store.set_project_gpkg_path(gpkg_b)
-        project.aboutToBeCleared.emit()
+        project_teardown_signal(project).emit()
         project.readProject.emit(QDomDocument())
         ok = _wait(lambda: dialog._scenario_id == b_id, 5.0)
         out.append(_report("another project opened: its scenario file and last scenario load",
@@ -657,7 +659,7 @@ def test_follows_project() -> List[bool]:
 
         dialog.setup.value.setValue(7.0)
         span_store.set_project_gpkg_path(gpkg_a)
-        project.aboutToBeCleared.emit()
+        project_teardown_signal(project).emit()
         project.addMapLayer(QgsRasterLayer(near_path, "loaded with the project"))   # layer events in between
         added.append(project.mapLayersByName("loaded with the project")[0].id())
         project.readProject.emit(QDomDocument())
@@ -701,7 +703,7 @@ def test_close_drops_the_old_routes() -> List[bool]:
         setup.fit_combo.setCurrentIndex(setup.fit_combo.findData("fit-b"))
         before = listed()
         sources.open_workbench = lambda: None    # Close: no project, no Workbench
-        project.aboutToBeCleared.emit()
+        project_teardown_signal(project).emit()
         closed = listed()
         setup.refresh_sources()                  # the window shown again with no project
         shown = listed()

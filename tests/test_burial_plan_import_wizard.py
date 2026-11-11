@@ -8,8 +8,9 @@ are redirected to a temp INI so the tester's QGIS profile is untouched.
 
 from __future__ import annotations
 
+from .temp_utils import temporary_directory
+
 import os
-import tempfile
 
 from ..burial import change_log, schema
 from ..burial.plan_model import PlanModel
@@ -259,7 +260,7 @@ def run_all():
     results = []
     old_format = QSettings.defaultFormat()
     # The GeoPackages stay open until the models are collected (Windows).
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
+    with temporary_directory() as temp:
         QSettings.setDefaultFormat(QSettings.Format.IniFormat)
         QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, temp)
         os.makedirs(os.path.join(temp, "overlay"), exist_ok=True)

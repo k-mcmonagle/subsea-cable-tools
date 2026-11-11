@@ -13,6 +13,8 @@ import logging
 import os
 from typing import Dict, Optional
 
+from ..project_lifecycle import project_teardown_signal_names
+
 from qgis.PyQt.QtCore import QSettings, Qt
 from qgis.PyQt.QtGui import QBrush, QColor
 from qgis.PyQt.QtWidgets import (
@@ -254,7 +256,8 @@ class WorkbenchDock(QDockWidget):
     def _project_sync_signal_slots(self):
         project = QgsProject.instance()
         pairs = [
-            (project, "aboutToBeCleared", self._on_project_teardown_starts),
+            *((project, name, self._on_project_teardown_starts)
+              for name in project_teardown_signal_names(project)),
             (project, "cleared", self._on_project_teardown_done),
             (project, "layerWillBeRemoved", self._on_project_layers_will_be_removed),
             (project, "layersWillBeRemoved", self._on_project_layers_will_be_removed),

@@ -18,6 +18,8 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from ..project_lifecycle import project_teardown_signal_names
+
 from qgis.PyQt.QtCore import QSettings, Qt
 from qgis.PyQt.QtGui import QGuiApplication, QKeySequence
 from qgis.PyQt.QtWidgets import (
@@ -1189,7 +1191,8 @@ class CableLayExplorerWindow(QMainWindow):
 
     # -- project changes ------------------------------------------------------
     def _project_hook_slots(self) -> list:
-        pairs = [(QgsProject.instance(), "aboutToBeCleared", self._on_project_closing)]
+        pairs = [(QgsProject.instance(), name, self._on_project_closing)
+                 for name in project_teardown_signal_names(QgsProject.instance())]
         for name in ("projectRead", "newProjectCreated"):
             if hasattr(self.iface, name):
                 pairs.append((self.iface, name, self._on_project_ready))

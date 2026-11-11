@@ -5,6 +5,8 @@ from __future__ import annotations
 from copy import deepcopy
 import os
 
+from ..project_lifecycle import project_teardown_slots
+
 from qgis.core import QgsProject, QgsVectorLayer
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import (
@@ -72,7 +74,8 @@ class GroundSourcesDialog(QDialog):
         box.accepted.connect(self._save)
         box.rejected.connect(self.reject)
         layout.addWidget(box)
-        QgsProject.instance().aboutToBeCleared.connect(self.reject)
+        for signal, slot in project_teardown_slots(QgsProject.instance(), self.reject):
+            signal.connect(slot)
         model.planChanged.connect(self._context_changed)
         self._render()
         selected = next((i for i, link in enumerate(self.links)

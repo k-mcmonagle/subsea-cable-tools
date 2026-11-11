@@ -21,6 +21,8 @@ QSettings are redirected to a temporary folder.
 
 from __future__ import annotations
 
+from .temp_utils import temporary_directory
+
 import json
 import os
 import tempfile
@@ -271,7 +273,7 @@ def test_shutdown_disconnects(folder) -> bool:
 def run_all():
     results = []
     old_format = QSettings.defaultFormat()
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
+    with temporary_directory() as temp:
         QSettings.setDefaultFormat(QSettings.Format.IniFormat)
         QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, temp)
         folder = tempfile.mkdtemp(prefix="explorer_switch_")  # GeoPackages: never auto-deleted

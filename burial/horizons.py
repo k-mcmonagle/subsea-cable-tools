@@ -376,10 +376,10 @@ def build_horizons(drawing, selected, options, kp_map, reference=None, source=No
         segments = []
         for entity in entities:
             checkpoint(progress, percent=90 * processed / max(1, total), message=f"Converting {layer}…")
-            def phase(start, end):
+            def phase(start, end, processed=processed, point_count=len(entity["points"])):
                 def report(percent, message):
                     value = None if percent is None else (
-                        90 * (processed + len(entity["points"]) * (start + (end - start) * percent / 100))
+                        90 * (processed + point_count * (start + (end - start) * percent / 100))
                         / max(1, total))
                     checkpoint(progress, percent=value, message=message)
                 return report

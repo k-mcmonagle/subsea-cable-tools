@@ -549,7 +549,9 @@ def test_hooks_follow_close_and_shutdown(root: str) -> bool:
         project.clear()
         iface.newProjectCreated.emit()
         _pump(0.2)
-        ok = hooks == 2 and closed == ("", True, False)
+        from ..project_lifecycle import project_teardown_signal_names
+        expected_hooks = len(project_teardown_signal_names(project)) + 1
+        ok = hooks == expected_hooks and closed == ("", True, False)
         ok = ok and not dock._lifecycle_hooks and not calls
         return _result("project switches are followed while the window is "
                        "closed; shutdown releases the hooks", ok,

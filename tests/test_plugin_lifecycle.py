@@ -18,6 +18,8 @@ redirected to a temporary folder, so nothing persists to the tester's profile.
 
 from __future__ import annotations
 
+from .temp_utils import temporary_directory
+
 import importlib
 import importlib.machinery
 import logging
@@ -25,7 +27,6 @@ import os
 import runpy
 import struct
 import sys
-import tempfile
 from contextlib import contextmanager
 from typing import List
 
@@ -635,7 +636,7 @@ def test_vendored_libs_do_not_shadow_host(_h: _Harness) -> bool:
 def run_all() -> List[bool]:
     results = []
     old_format = QSettings.defaultFormat()
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
+    with temporary_directory() as temp:
         QSettings.setDefaultFormat(QSettings.Format.IniFormat)
         QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, temp)
         harness = _Harness(temp)

@@ -9,7 +9,7 @@ from ... import debug as debug
 from ... import functions as fn
 from ... import getConfigOption
 from ...Point import Point
-from ...Qt import QtCore, QtGui, QtWidgets, isQObjectAlive, QT_LIB
+from ...Qt import QtCore, QtGui, QtWidgets, isQObjectAlive, QT_LIB, safe_graphics_item_change
 from ..GraphicsWidget import GraphicsWidget
 from ..ItemGroup import ItemGroup
 
@@ -303,7 +303,7 @@ class ViewBox(GraphicsWidget):
         return interface == 'ViewBox'
 
     def itemChange(self, change, value):
-        ret = super().itemChange(change, value)
+        ret = safe_graphics_item_change(super().itemChange, change, value)
         if change == self.GraphicsItemChange.ItemSceneChange:
             scene = self.scene()
             if scene is not None and hasattr(scene, 'sigPrepareForPaint'):

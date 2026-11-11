@@ -9,8 +9,9 @@
 
 from __future__ import annotations
 
+from .temp_utils import temporary_directory
+
 import os
-import tempfile
 
 from qgis.core import (QgsFeature, QgsField, QgsGeometry, QgsPointXY, QgsProject,
                        QgsVectorLayer)
@@ -349,7 +350,7 @@ def run_all():
     from qgis.PyQt.QtCore import QSettings
     old_format = QSettings.defaultFormat()
     results = []
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
+    with temporary_directory() as temp:
         # KP settings are QSettings: keep the tester's profile untouched.
         QSettings.setDefaultFormat(QSettings.Format.IniFormat)
         QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, temp)

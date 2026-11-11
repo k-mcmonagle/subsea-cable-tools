@@ -1,5 +1,5 @@
 import warnings
-from ..Qt import QT_LIB, QtCore, QtWidgets
+from ..Qt import QT_LIB, QtCore, QtWidgets, safe_graphics_item_change
 from .GraphicsItem import GraphicsItem
 
 __all__ = ['GraphicsObject']
@@ -17,7 +17,7 @@ class GraphicsObject(GraphicsItem, QtWidgets.QGraphicsObject):
         GraphicsItem.__init__(self)
         
     def itemChange(self, change, value):
-        ret = super().itemChange(change, value)
+        ret = safe_graphics_item_change(super().itemChange, change, value)
         if change in [self.GraphicsItemChange.ItemParentHasChanged, self.GraphicsItemChange.ItemSceneHasChanged]:
             if self.__class__.__dict__.get('parentChanged') is not None:
                 # user's GraphicsObject subclass has a parentChanged() method

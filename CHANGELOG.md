@@ -138,6 +138,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **QGIS compatibility:** fixed plugin startup and tool-opening failures on QGIS 3.22–3.32, including cleanup when switching empty projects; map zooms in feet now use the correct minimum extent on older releases. The bundled MDB reader dependency now declares Python 3.9 support, acquired-data imports accept UTC timestamps ending in Z on Python 3.9/3.10, and profile plots no longer raise QVariant conversion errors on affected Qt5 builds.
+
 - **Cable Lay Data Explorer — Seabed Profile:** *Measure* now places measurements; clicks on the plot did nothing before.
 - **KP from a map position (KP Mouse Tool, Burial Planner, Nearest KP, Span & Slack Analysis and other tools):** on a route in latitude/longitude, a point beside the route now reads the KP of its true nearest point on the ellipsoid (within 2 mm for a point 100 m off); it could read tens of metres along the route at high latitude (about 0.4 x the distance from the line at 50°N), and could choose the wrong leg near an alter course. Points on the line are unchanged.
 - **Cable Route Workbench — RPL editing:** editing a position no longer changes the KPs before it; the cumulative KPs were re-summed from rounded leg lengths, so rounding could build up along a long RPL.

@@ -8,8 +8,9 @@ boundary, merging back (first tool kept) and Ctrl+Z.
 
 from __future__ import annotations
 
+from .temp_utils import temporary_directory
+
 import os
-import tempfile
 
 from ..burial import io_csv, schema
 from .test_burial_plan_import_wizard import _model
@@ -119,7 +120,7 @@ def run_all():
     from qgis.PyQt.QtCore import QSettings
     results = []
     old_format = QSettings.defaultFormat()
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
+    with temporary_directory() as temp:
         QSettings.setDefaultFormat(QSettings.Format.IniFormat)
         QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, temp)
         for sub in ("a", "b", "c"):

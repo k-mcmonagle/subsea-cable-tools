@@ -255,6 +255,26 @@ def test_time_formats() -> bool:
     })
 
 
+def test_iso_on_older_python() -> bool:
+    from unittest.mock import patch
+
+    class LegacyDatetime(datetime):
+        @classmethod
+        def fromisoformat(cls, value):
+            if value.endswith(("Z", "z")):
+                raise ValueError("Python before 3.11 rejects Z suffixes")
+            return super().fromisoformat(value)
+
+    with patch.object(reader, "datetime", LegacyDatetime):
+        values, bad, fmt, _ambiguous = reader.parse_timestamps(
+            ["2026-10-20T00:00:00Z", "2026-10-20T00:00:00z",
+             "2026-10-20T01:00:00+01:00"], "auto", 3600)
+    return _check("UTC suffixes on Python 3.9/3.10", {
+        "all accepted": not bad.any() and fmt == "iso",
+        "explicit UTC overrides local offset": np.all(values == _utc("2026-10-20T00:00:00")),
+    })
+
+
 def test_numbers_and_coordinates() -> bool:
     values, bad = reader.parse_numbers(["1.5", " 2 ", "", "n/a", "-9999", "x", "inf", "1e3"])
     comma, bad_c = reader.parse_numbers(["1,5", "-0,25", "3"], decimal_comma=True)
@@ -366,6 +386,7 @@ def run_all() -> list:
         test_parse_plough_day(),
         test_parse_other_house_style(),
         test_time_formats(),
+        test_iso_on_older_python(),
         test_numbers_and_coordinates(),
         test_ragged_rows_and_extras(),
         test_xlsx(),

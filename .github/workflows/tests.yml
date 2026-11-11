@@ -71,10 +71,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.40 / 4.0: the versions also verified locally before release.
+        # 3.22: the declared minimum; 3.40 / 4.0 are also verified locally.
         # ltr / stable: floating tags - what users install today (3.44 LTR and
         # 4.2 at the time of writing); they catch API drift early.
-        qgis: ["3.40", "ltr", "4.0", "stable"]
+        qgis: ["3.22", "3.40", "ltr", "4.0", "stable"]
     container:
       image: qgis/qgis:${{ matrix.qgis }}
     env:

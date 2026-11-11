@@ -415,3 +415,26 @@ def _onColorSchemeChange(colorScheme):
 def exec_():
     app = mkQApp()
     return app.exec() if hasattr(app, 'exec') else app.exec_()
+
+
+# Subsea compatibility patch: on QGIS/PyQt5, a removed scene/parent can arrive
+# as an unreadable PyQt_PyObject QVariant instead of Python None.
+def safe_graphics_item_change(base_method, change, value):
+    """Normalise the PyQt5 null-pointer QVariant used when detaching plots.
+
+    Only parent/scene notifications are affected. Decode valid Python-object
+    variants normally; on the known null conversion error pass None. Other
+    notifications, bindings, errors and non-null pointer objects are unchanged.
+    """
+    changes = QtWidgets.QGraphicsItem.GraphicsItemChange
+    if (QT_LIB == PYQT5
+            and change in (changes.ItemParentChange, changes.ItemSceneChange)
+            and isinstance(value, QtCore.QVariant)
+            and value.typeName() == "PyQt_PyObject"):
+        try:
+            value = value.value()
+        except TypeError as exc:
+            if str(exc) != "unable to convert a QVariant back to a Python object":
+                raise
+            value = None
+    return base_method(change, value)

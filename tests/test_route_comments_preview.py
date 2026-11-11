@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-import tempfile
+from .temp_utils import temporary_directory
+
 
 from qgis.core import QgsCoordinateReferenceSystem, QgsProject, QgsRectangle
 from qgis.PyQt import sip
@@ -163,7 +164,7 @@ def test_dialog_previews():
 def run_all():
     results = []
     old = QSettings.defaultFormat()
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+    with temporary_directory() as folder:
         QSettings.setDefaultFormat(QSettings.Format.IniFormat)
         QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, folder)
         try:

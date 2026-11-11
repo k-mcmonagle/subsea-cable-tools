@@ -95,7 +95,7 @@ def test_data_file_location() -> bool:
     return _check("data file: nothing until the user acts; beside the plan file; forgotten on clear", {
         "no file made by asking": os.path.exists(default) == existed,
         "no entry": state_new == (None, location.STATE_NONE) and entry_new is None,
-        "beside the plan file": beside == os.path.join(folder, "Cable S1_burial_data.gpkg"),
+        "beside the plan file": beside == os.path.join(folder, "burial_plans", "Cable S1_burial_data.gpkg"),
         "plans name": location.data_path_for_plans(r"C:\x\Job_burial_plans.gpkg") == os.path.join(
             r"C:\x", "Job_burial_data.gpkg") and location.data_path_for_plans("/x/plans.gpkg").endswith(
             "plans_burial_data.gpkg"),

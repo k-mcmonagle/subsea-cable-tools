@@ -30,6 +30,8 @@ import time
 import traceback
 from contextlib import contextmanager
 
+from ..project_lifecycle import project_teardown_signal
+
 from qgis.core import (QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsDistanceArea,
                        QgsPointXY, QgsProject, QgsRasterLayer, QgsVectorLayer)
 from qgis.PyQt import sip
@@ -424,7 +426,7 @@ def test_transit_open_and_crs(iface, utm, mercator):
     from ..maptools.transit_measure_tool import TransitMeasureTool
     project = QgsProject.instance()
     _open_project(iface, utm)
-    hooks_before = _receivers(project, project.aboutToBeCleared)
+    hooks_before = _receivers(project, project_teardown_signal(project))
     tool = TransitMeasureTool(iface)
     problems = []
     try:
@@ -468,7 +470,7 @@ def test_transit_open_and_crs(iface, utm, mercator):
         tool.cleanup()
         tool.cleanup()
         _pump()
-    if _receivers(project, project.aboutToBeCleared) != hooks_before:
+    if _receivers(project, project_teardown_signal(project)) != hooks_before:
         problems.append("cleanup() left the project hook connected")
     return _result("Transit Measure: disposed on Open, legs measured in the map CRS", not problems,
                    "; ".join(problems))
@@ -514,7 +516,7 @@ def test_depth_profile_dock(iface, utm, mercator):
     from ..depth_profile_dockwidget import DepthProfileDockWidget
     project = QgsProject.instance()
     layers = _open_project(iface, utm)
-    hooks_before = _receivers(project, project.aboutToBeCleared)
+    hooks_before = _receivers(project, project_teardown_signal(project))
     dock = DepthProfileDockWidget(iface)
     dock.show()
     _pump(150)
@@ -548,7 +550,7 @@ def test_depth_profile_dock(iface, utm, mercator):
         # Closed and shown again: hooks back, and they still clear and refresh.
         _draw_line(dock, [QgsPointXY(1, 1), QgsPointXY(2, 2)])
         dock.close()
-        if dock.temp_drawn_points or _receivers(project, project.aboutToBeCleared) != hooks_before:
+        if dock.temp_drawn_points or _receivers(project, project_teardown_signal(project)) != hooks_before:
             problems.append("close: drawn points %d kept or hooks left connected" % len(dock.temp_drawn_points))
         dock.show()
         _pump(150)
@@ -561,7 +563,7 @@ def test_depth_profile_dock(iface, utm, mercator):
         dock.shutdown()
         dock.deleteLater()
         _pump()
-    if _receivers(project, project.aboutToBeCleared) != hooks_before:
+    if _receivers(project, project_teardown_signal(project)) != hooks_before:
         problems.append("shutdown() left the project hook connected")
     return _result("Depth Profile: New / Open drop plot, marker, drawn line; lists refresh; "
                    "hooks survive close + show", not problems, "; ".join(problems))
@@ -583,11 +585,11 @@ def test_kp_plot_dock(iface, utm, mercator):
     from ..kp_plotter_dockwidget import KpPlotterDockWidget
     project = QgsProject.instance()
     layers = _open_project(iface, utm)
-    hooks_before = (_receivers(project, project.aboutToBeCleared), _receivers(iface, iface.projectRead),
+    hooks_before = (_receivers(project, project_teardown_signal(project)), _receivers(iface, iface.projectRead),
                     _receivers(iface, iface.newProjectCreated))
 
     def hooks():
-        return (_receivers(project, project.aboutToBeCleared), _receivers(iface, iface.projectRead),
+        return (_receivers(project, project_teardown_signal(project)), _receivers(iface, iface.projectRead),
                 _receivers(iface, iface.newProjectCreated))
 
     dock = KpPlotterDockWidget(iface)

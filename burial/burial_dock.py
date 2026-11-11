@@ -20,6 +20,8 @@ import math
 import os
 from typing import Dict, List, Optional
 
+from ..project_lifecycle import project_teardown_slots
+
 from qgis.core import (
     QgsApplication,
     QgsCoordinateTransform,
@@ -66,6 +68,7 @@ except (ImportError, AttributeError):  # pragma: no cover
 from ..plugin_log import log_debug, log_exception, log_info, log_warning
 from ..schema_guard import NewerVersionError
 from ..qgis_compat import (
+    DISTANCE_METERS,
     GEOMETRY_LINE,
     MESSAGE_BOX_NO,
     MESSAGE_BOX_YES,
@@ -2291,9 +2294,7 @@ class BurialPlannerDock(QDockWidget):
                 from qgis.core import QgsUnitTypes
 
                 factor = QgsUnitTypes.fromUnitToUnitFactor(
-                    QgsUnitTypes.DistanceUnit.Meters
-                    if hasattr(QgsUnitTypes, "DistanceUnit")
-                    else QgsUnitTypes.DistanceMeters, crs.mapUnits())
+                    DISTANCE_METERS, crs.mapUnits())
                 if factor and math.isfinite(factor) and factor > 0:
                     floor = 50.0 * factor
         except (AttributeError, RuntimeError, TypeError):
@@ -2566,7 +2567,7 @@ class BurialPlannerDock(QDockWidget):
         (idempotent)."""
         if self._lifecycle_hooks:
             return
-        pairs = [(QgsProject.instance().aboutToBeCleared, self._leave_project)]
+        pairs = [*project_teardown_slots(QgsProject.instance(), self._leave_project)]
         created = getattr(self.iface, "newProjectCreated", None)
         if created is not None:
             pairs.append((created, self._project_created))

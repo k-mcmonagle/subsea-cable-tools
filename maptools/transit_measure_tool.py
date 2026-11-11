@@ -18,6 +18,8 @@ import logging
 import math
 from typing import List, Optional
 
+from ..project_lifecycle import project_teardown_slots
+
 from qgis.PyQt.QtCore import Qt, QCoreApplication
 from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
@@ -80,7 +82,8 @@ class TransitMeasureTool(QgsMapTool):
         # New / Open / Close project: the path belongs to the old project.
         # Opening a project leaves a plugin map tool active, so without this
         # the old path stayed drawn and new legs were measured in the old CRS.
-        QgsProject.instance().aboutToBeCleared.connect(self._on_project_about_to_be_cleared)
+        for signal, slot in project_teardown_slots(QgsProject.instance(), self._on_project_about_to_be_cleared):
+            signal.connect(slot)
 
     def _on_project_about_to_be_cleared(self):
         """Turn the tool off; deactivate() disposes the dialog and its drawing."""
@@ -136,10 +139,11 @@ class TransitMeasureTool(QgsMapTool):
         self.selected_waypoint_idx = None
         self.is_dragging = False
         self._dispose_dialog()
-        try:
-            QgsProject.instance().aboutToBeCleared.disconnect(self._on_project_about_to_be_cleared)
-        except TypeError:  # already disconnected
-            pass
+        for signal, slot in project_teardown_slots(QgsProject.instance(), self._on_project_about_to_be_cleared):
+            try:
+                signal.disconnect(slot)
+            except TypeError:  # already disconnected
+                pass
 
     def _dispose_dialog(self):
         dialog, self.dialog = self.dialog, None

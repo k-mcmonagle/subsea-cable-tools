@@ -9,6 +9,8 @@ import json
 import logging
 import os
 
+from ..project_lifecycle import project_teardown_slots
+
 from qgis.PyQt.QtCore import QDateTime, QSettings, Qt
 from qgis.PyQt.QtGui import QColor, QCursor, QFontMetrics
 from qgis.PyQt.QtWidgets import (
@@ -181,7 +183,7 @@ class PlannerDock(QDockWidget):
     # -- following the QGIS project -------------------------------------------
     def _install_project_hooks(self):
         project = QgsProject.instance()
-        hooks = [(project.aboutToBeCleared, self._leave_project),
+        hooks = [*project_teardown_slots(project, self._leave_project),
                  (project.readProject, self._project_ready)]
         new_project = getattr(self.iface, "newProjectCreated", None)  # stub ifaces lack it
         if new_project is not None:

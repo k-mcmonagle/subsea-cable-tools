@@ -2,6 +2,8 @@
 """Pure checks for project store defaults and manual relocation (no migration)."""
 from __future__ import annotations
 
+from contextlib import closing
+
 import json
 import os
 import sqlite3
@@ -39,7 +41,7 @@ class Project:
 
 def database(path, registry='bp_plan', layer='bp_sections'):
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn:
         conn.execute('CREATE TABLE gpkg_contents (table_name TEXT)')
         conn.execute('CREATE TABLE "' + registry + '" (name TEXT)')
         conn.execute('CREATE TABLE "' + layer + '" (name TEXT)')

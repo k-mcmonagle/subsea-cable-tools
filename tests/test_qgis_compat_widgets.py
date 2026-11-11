@@ -333,3 +333,22 @@ def run_all():
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit("Run via tests/run_qgis_smoke_tests.py (needs QGIS Python).")
+
+
+def test_burial_zoom_floor_in_feet_on_legacy_qgis():
+    from types import SimpleNamespace
+    from unittest.mock import patch
+    from qgis import core
+    from qgis.core import QgsCoordinateReferenceSystem, QgsUnitTypes
+    from ..burial.burial_dock import BurialPlannerDock
+
+    # QGIS before 3.30 has DistanceUnit.DistanceMeters, not .Meters.
+    legacy_units = SimpleNamespace(
+        DistanceUnit=SimpleNamespace(DistanceMeters=QgsUnitTypes.DistanceMeters),
+        fromUnitToUnitFactor=QgsUnitTypes.fromUnitToUnitFactor)
+    crs = QgsCoordinateReferenceSystem('EPSG:2227')  # US survey feet
+    canvas = SimpleNamespace(mapSettings=lambda: SimpleNamespace(destinationCrs=lambda: crs),
+                             mapUnitsPerPixel=lambda: 0.0)
+    with patch.object(core, 'QgsUnitTypes', legacy_units):
+        floor = BurialPlannerDock._min_frame_size(SimpleNamespace(canvas=canvas))
+    assert abs(floor - 164.0416667) < 0.001

@@ -449,7 +449,8 @@ def _strptime(text: str, pattern: str) -> Optional[datetime]:
 
 def _iso(text: str) -> Optional[datetime]:
     try:
-        return datetime.fromisoformat(text.replace("z", "Z"))
+        # Python 3.9/3.10 (older QGIS) do not accept the ISO UTC suffix.
+        return datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text)
     except ValueError:
         return None
 

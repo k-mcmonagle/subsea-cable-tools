@@ -25,6 +25,8 @@ QSettings and the unsaved-project folder are redirected to temporary folders.
 
 from __future__ import annotations
 
+from .temp_utils import temporary_directory
+
 import os
 import tempfile
 
@@ -435,7 +437,7 @@ def run_all():
     old_format = QSettings.defaultFormat()
     old_unsaved = schema.unsaved_project_folder
     old_get_text, old_get_item = QInputDialog.getText, QInputDialog.getItem
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp:
+    with temporary_directory() as temp:
         QSettings.setDefaultFormat(QSettings.Format.IniFormat)
         QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, temp)
         folder = tempfile.mkdtemp(prefix="wb_switch_")  # GeoPackages: never auto-deleted

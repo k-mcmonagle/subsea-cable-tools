@@ -12,6 +12,8 @@ import logging
 import os
 from typing import Optional, Tuple
 
+from ..project_lifecycle import project_teardown_slots
+
 from qgis.PyQt.QtCore import Qt, QCoreApplication, QSettings, QTimer
 from qgis.PyQt.QtGui import QIcon, QColor, QCursor
 from qgis.PyQt.QtWidgets import (QMessageBox, QToolTip,
@@ -2137,7 +2139,8 @@ class KPMouseTool:
         project.layersRemoved.connect(self._on_layers_removed)
         # New / Open / Close project: the tool's route, depth sampler and map
         # graphics belong to the old project's layers.
-        project.aboutToBeCleared.connect(self._on_project_about_to_be_cleared)
+        for signal, slot in project_teardown_slots(project, self._on_project_about_to_be_cleared):
+            signal.connect(slot)
         # The button follows the canvas's map tool (stub canvases lack the signal).
         map_tool_set = getattr(self.iface.mapCanvas(), "mapToolSet", None)
         if map_tool_set is not None:
@@ -2158,7 +2161,7 @@ class KPMouseTool:
 
         project = QgsProject.instance()
         for signal, slot in ((project.layersRemoved, self._on_layers_removed),
-                             (project.aboutToBeCleared, self._on_project_about_to_be_cleared)):
+                             *project_teardown_slots(project, self._on_project_about_to_be_cleared)):
             try:
                 signal.disconnect(slot)
             except TypeError:  # initGui never ran / already unloaded

@@ -31,6 +31,8 @@ from __future__ import annotations
 import os
 from typing import Dict, List, Optional
 
+from ...project_lifecycle import project_teardown_slots
+
 from qgis.PyQt.QtCore import QTimer
 from qgis.PyQt.QtWidgets import (
     QFileDialog,
@@ -223,8 +225,7 @@ class ProjectPanel(QWidget):
 
     def _project_signal_slots(self, project):
         return (
-            (project.aboutToBeCleared, self.release_project),
-            (project.cleared, self.release_project),
+            *project_teardown_slots(project, self.release_project),
             (project.readProject, self._on_project_changed),
             (project.layersAdded, self._on_layers_changed),
             (project.layersRemoved, self._on_layers_changed),

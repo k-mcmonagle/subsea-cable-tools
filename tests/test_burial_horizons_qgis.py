@@ -370,7 +370,7 @@ class HorizonQgisTests(unittest.TestCase):
             entered = threading.Event()
             dialog = self.widget(HorizonImportDialog)
 
-            def slow_read(path, progress):
+            def slow_read(path, progress, entered=entered):
                 entered.set()
                 while True:
                     progress(10, "Reading test data")
@@ -378,7 +378,7 @@ class HorizonQgisTests(unittest.TestCase):
 
             ticks = []
             timer = QTimer()
-            timer.timeout.connect(lambda: ticks.append(1))
+            timer.timeout.connect(lambda ticks=ticks: ticks.append(1))
             timer.start(5)
             with patch.object(h, "read_dxf", side_effect=slow_read):
                 dialog.load_file(self.path)

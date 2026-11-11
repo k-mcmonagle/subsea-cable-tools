@@ -1,3 +1,5 @@
+from .project_lifecycle import project_teardown_slots
+
 from qgis.PyQt.QtWidgets import (
     QDockWidget, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QPushButton,
     QSpinBox, QCheckBox, QFileDialog, QTabWidget, QFormLayout, QProgressBar,
@@ -577,7 +579,8 @@ class DepthProfileDockWidget(QDockWidget):
             new_project.connect(self._on_new_project)
         proj = QgsProject.instance()
         # New / Open / Close project: drop the old project's profile and drawing.
-        proj.aboutToBeCleared.connect(self._on_project_about_to_be_cleared)
+        for signal, slot in project_teardown_slots(proj, self._on_project_about_to_be_cleared):
+            signal.connect(slot)
         # A failed connection silently stops the layer lists refreshing.
         try:
             proj.layerWasAdded.connect(self.on_layer_event)
@@ -608,10 +611,11 @@ class DepthProfileDockWidget(QDockWidget):
             self.iface.newProjectCreated.disconnect(self._on_new_project)
         except Exception:
             pass
-        try:
-            QgsProject.instance().aboutToBeCleared.disconnect(self._on_project_about_to_be_cleared)
-        except Exception:
-            pass
+        for signal, slot in project_teardown_slots(QgsProject.instance(), self._on_project_about_to_be_cleared):
+            try:
+                signal.disconnect(slot)
+            except Exception:
+                pass
         try:
             QgsProject.instance().layerWasAdded.disconnect(self.on_layer_event)
         except Exception:

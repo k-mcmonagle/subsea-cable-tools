@@ -18,7 +18,7 @@ re-vendoring.
 | pyqtgraph | 0.13.7 | MIT | https://github.com/pyqtgraph/pyqtgraph | Fast interactive plots (Depth Profile, KP Plotter, catenary / lay simulator, Burial Planner profile). Never shipped with QGIS. Needs NumPy, which QGIS provides. |
 | access_parser | 0.0.6 | Apache-2.0 | https://github.com/ClarotyICS/access_parser | Pure-Python reader for Jet/Access `.mdb` files, so Import MDB and path-file (`.pthmdb`) import work without the Microsoft Access ODBC driver (ODBC remains a fallback). |
 | construct | 2.10.70 | MIT | https://github.com/construct/construct | Dependency of access_parser. |
-| tabulate | 0.10.0 | MIT | https://github.com/astanin/python-tabulate | Dependency of access_parser. Its metadata says Python >= 3.10, but it imports and works on Python 3.9 (checked); re-check when upgrading, since QGIS 3.22-3.28 ship Python 3.9. |
+| tabulate | 0.9.0 | MIT | https://github.com/astanin/python-tabulate | Dependency of access_parser. Pinned to a release declaring support for Python 3.9, shipped by QGIS 3.22–3.28 on Windows. |
 
 Versions come from the `*.dist-info` folders, which also carry each
 package's licence file. The CET colour-map data inside pyqtgraph carries its
@@ -35,8 +35,11 @@ fresh wheel without re-applying these:
   scan): `examples/`, `opengl/`, `flowchart/`, `console/`, `dockarea/`,
   `multiprocess/`, `configfile.py`, `widgets/RemoteGraphicsView.py`.
 * `pyqtgraph/__init__.py` - no longer imports the removed modules.
+* `pyqtgraph/icons/icons.svg` - removed editor-only absolute export paths.
 * `pyqtgraph/Qt/__init__.py` - drops the `subprocess`-based `loadUiType`
-  helper for PySide.
+  helper for PySide; provides a narrow PyQt5 graphics-item QVariant conversion
+  normalisation used by `GraphicsObject.py` and `ViewBox.py` when a removed
+  parent/scene is delivered as an unreadable `PyQt_PyObject` QVariant.
 * `pyqtgraph/exporters/SVGExporter.py` - hardened SVG export (patch marker
   `__SUBSEA_SVG_EXPORTER_PATCH_VERSION__`), Bandit `nosec` annotations.
 * `pyqtgraph/metaarray/MetaArray.py` - `eval` replaced by

@@ -3,9 +3,10 @@
 
 from __future__ import annotations
 
+from .temp_utils import temporary_directory
+
 import os
 import sqlite3
-import tempfile
 
 from qgis.core import QgsCoordinateReferenceSystem, QgsGeometry, QgsPointXY, QgsProject
 from qgis.PyQt.QtCore import QCoreApplication, QSettings, Qt
@@ -519,7 +520,7 @@ def test_dock_position_save(folder):
 def run_all():
     old_format = QSettings.defaultFormat()
     results = []
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+    with temporary_directory() as folder:
         QSettings.setDefaultFormat(QSettings.Format.IniFormat)
         QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, folder)
         try:

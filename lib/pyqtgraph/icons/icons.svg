@@ -64,7 +64,6 @@
     <g
        style="display:inline"
        id="g3764"
-       inkscape:export-filename="/home/luke/work/manis_lab/code/acq4/lib/util/pyqtgraph/graphicsItems/PlotItem/auto.png"
        inkscape:export-xdpi="26.181818"
        inkscape:export-ydpi="26.181818">
       <rect
@@ -93,7 +92,6 @@
        id="g3777"
        style="display:inline"
        transform="translate(140,0)"
-       inkscape:export-filename="/home/luke/work/manis_lab/code/acq4/lib/util/pyqtgraph/graphicsItems/PlotItem/ctrl.png"
        inkscape:export-xdpi="26.181818"
        inkscape:export-ydpi="26.181818">
       <rect
@@ -114,7 +112,6 @@
        transform="translate(280,0)"
        style="display:inline"
        id="g3785"
-       inkscape:export-filename="/home/luke/work/manis_lab/code/acq4/lib/util/pyqtgraph/graphicsItems/PlotItem/lock.png"
        inkscape:export-xdpi="26.181818"
        inkscape:export-ydpi="26.181818">
       <rect

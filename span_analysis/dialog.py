@@ -30,6 +30,8 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
+from ..project_lifecycle import project_teardown_slots
+
 from qgis.PyQt.QtCore import QSettings, Qt, QTimer, QUrl
 from qgis.PyQt.QtGui import QColor, QDesktopServices
 from qgis.PyQt.QtWidgets import (
@@ -1668,7 +1670,7 @@ class SpanAnalysisDialog(QDialog):
         project = QgsProject.instance()
         hooks = [(project.layersAdded, self._on_layers_event),
                  (project.layersRemoved, self._on_layers_event),
-                 (project.aboutToBeCleared, self._leave_project),
+                 *project_teardown_slots(project, self._leave_project),
                  (project.readProject, self._on_project_read)]
         # Project > New is followed like an opened project (stub ifaces lack the signal).
         new_project = getattr(self.iface, "newProjectCreated", None)

@@ -209,7 +209,7 @@ class CptQgisTests(unittest.TestCase):
         from unittest.mock import patch
         original_channels = window.channels
         for zones in ([], [None], [3]):
-            with patch.object(window, "channels", side_effect=lambda key: dict(original_channels(key), zone=zones)):
+            with patch.object(window, "channels", side_effect=lambda key, zones=zones: dict(original_channels(key), zone=zones)):
                 window.redraw()
         window.redraw()
         headers, rows = window.table_rows()

@@ -1,3 +1,5 @@
+from .project_lifecycle import project_teardown_slots
+
 from qgis.PyQt.QtWidgets import QDockWidget, QVBoxLayout, QWidget, QComboBox, QLabel, QListWidget, QPushButton, QListWidgetItem, QTabWidget, QHBoxLayout, QCheckBox, QGroupBox, QRadioButton, QButtonGroup, QDoubleSpinBox
 from qgis.PyQt.QtCore import Qt
 from qgis.core import QgsProject, QgsVectorLayer, QgsGeometry, QgsPointXY, QgsCoordinateTransform, QgsCsException
@@ -202,7 +204,8 @@ class KpPlotterDockWidget(QDockWidget):
         new_project = getattr(self.iface, "newProjectCreated", None)
         if new_project is not None:
             new_project.connect(self.populate_layer_combos)
-        QgsProject.instance().aboutToBeCleared.connect(self._on_project_about_to_be_cleared)
+        for signal, slot in project_teardown_slots(QgsProject.instance(), self._on_project_about_to_be_cleared):
+            signal.connect(slot)
         self._project_signals_connected = True
 
     def _disconnect_project_signals(self):
@@ -211,7 +214,7 @@ class KpPlotterDockWidget(QDockWidget):
         self._project_signals_connected = False
         for signal, slot in ((self.iface.projectRead, self.populate_layer_combos),
                              (getattr(self.iface, "newProjectCreated", None), self.populate_layer_combos),
-                             (QgsProject.instance().aboutToBeCleared, self._on_project_about_to_be_cleared)):
+                             *project_teardown_slots(QgsProject.instance(), self._on_project_about_to_be_cleared)):
             if signal is None:
                 continue
             try:
