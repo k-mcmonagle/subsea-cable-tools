@@ -514,6 +514,7 @@ class RiskTab(QWidget):
         layout = QVBoxLayout(self)
         self.overview = VerdictStrip()
         self.overview.kpClicked.connect(self.dock.goto_kp)
+        self.overview.kpHovered.connect(self.dock.sync_hover_kp)
         layout.addWidget(self.overview)
 
         splitter = QSplitter(getattr(Qt, "Orientation", Qt).Vertical)
@@ -537,6 +538,7 @@ class RiskTab(QWidget):
         self._fire_hover = FireBarHover(self.check_table, _CHECK_FIRE_COL,
                                         self._fire_delegate,
                                         self._fire_tooltip)
+        self._fire_hover.kpHovered.connect(self.dock.sync_hover_kp)
         header = self.check_table.horizontalHeader()
         header.setSectionResizeMode(0, HEADER_RESIZE_MODE_CONTENTS)
         header.setSectionResizeMode(_CHECK_FIRE_COL, HEADER_RESIZE_MODE_STRETCH)

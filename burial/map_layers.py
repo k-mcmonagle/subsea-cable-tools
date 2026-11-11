@@ -101,7 +101,30 @@ def layer_fingerprint(layer: Optional[QgsMapLayer]) -> str:
             count = str(layer.featureCount())
         except Exception:
             count = ""
-    return f"{source}|{suffix}|{stamp}|{count}"
+    # A plan and its inputs can share a GeoPackage. Writing analysis results
+    # must not invalidate every input in that file.
+    stamp = layer_content_stamp(layer) or stamp
+    if not _gpkg_table_parts(layer)[1]:
+        path = str(layer.source()).split("|")[0]
+        paths = [path, path[:-4] + ".dbf"] if path.lower().endswith(".shp") else [path]
+        file_stamps = []
+        for filename in paths:
+            try:
+                info = os.stat(filename)
+                file_stamps.append((info.st_mtime_ns, info.st_size))
+            except OSError:
+                continue
+        if file_stamps:
+            stamp = repr(file_stamps)
+    subset = layer.subsetString() if isinstance(layer, QgsVectorLayer) else ""
+    edits = ""
+    if isinstance(layer, QgsVectorLayer) and layer.isEditable() and layer.isModified():
+        buffer = layer.editBuffer()
+        edits = repr((buffer.changedAttributeValues(), buffer.deletedFeatureIds(),
+                      {k: g.asWkt() for k, g in buffer.changedGeometries().items()},
+                      {k: (f.attributes(), f.geometry().asWkt())
+                       for k, f in buffer.addedFeatures().items()}))
+    return f"{source}|{suffix}|{stamp}|{count}|{subset}|{edits}"
 
 
 # -- bathymetry content fingerprints ------------------------------------------

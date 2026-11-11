@@ -1152,7 +1152,10 @@ class BurialPlannerDock(QDockWidget):
                                                    params.scope))
         saved = self.model.save_analysis(analysis_context, list(nodata), params,
                                  task_rules, message, warnings,
-                                 basis=getattr(self, "_task_basis", None))
+                                 basis=getattr(self, "_task_basis", None),
+                                 acquisitions={r.cache_key: (r.footprint, r.nodata)
+                                               for r in task.results
+                                               if r.cache_key and not r.error})
         self.rules_tab.set_results(message)
         self._refresh_profile_overlays()
 
@@ -1692,9 +1695,19 @@ class BurialPlannerDock(QDockWidget):
             self._marker.setPenWidth(2)
         return self._marker
 
-    def _on_profile_hover(self, kp: float) -> None:
+    def sync_hover_kp(self, kp: float, *, sync_ground: bool = True) -> None:
+        """Synchronise KP cursors without panning or re-emitting hover signals."""
+        self.profile.focus_kp(kp)
+        self._on_profile_hover(kp, sync_ground=sync_ground)
+
+    def _on_profile_hover(self, kp: float, *, sync_ground: bool = True) -> None:
+        self.rules_tab.overview.set_hover_kp(kp)
+        self.rules_tab._fire_hover.set_hover_kp(kp)
+        self.risk_tab._fire_hover.set_hover_kp(kp)
+        self.risk_tab.overview.set_hover_kp(kp)
         try:
-            self.ground_tab.sync_kp(kp)
+            if sync_ground:
+                self.ground_tab.sync_kp(kp)
         except Exception:
             log_exception("Burial Planner: ground plot hover sync failed",
                           level=logging.DEBUG)
@@ -1795,6 +1808,13 @@ class BurialPlannerDock(QDockWidget):
                           result.get("tool_path_wkt") or ""),
                       path_data.parse_linestring_wkt(
                           result.get("barge_track_wkt") or ""))
+            points, barge = cached
+            if len(points) >= 2 and self.model.route is not None:
+                start = self.model.route.kp_at_point(QgsPointXY(*points[0]))
+                end = self.model.route.kp_at_point(QgsPointXY(*points[-1]))
+                if start is not None and end is not None and (
+                        (end.kp_km - start.kp_km) * self.model.direction < 0):
+                    cached = (list(reversed(points)), list(reversed(barge)))
             self._path_points_cache = {path_id: cached}
         return cached
 
@@ -1885,6 +1905,7 @@ class BurialPlannerDock(QDockWidget):
                     try:
                         geom, _heading = footprint.place_outline(
                             outline, self.model.route, kp,
+                            heading_offset_deg=180.0 if self.model.direction < 0 else 0.0,
                             target_crs=dest_crs)
                     except Exception:
                         log_exception("Burial Planner: tool outline "
@@ -2692,6 +2713,7 @@ class BurialPlannerDock(QDockWidget):
             self.model.flush_layer_refresh()
         except Exception:
             log_exception("Burial Planner: pending plan-layer refresh failed")
+        self.model._clear_analysis_watchers()
         self._close_store()  # checkpoint WAL + release the SQL handle
         try:
             # Reopened from the project on the next show (refresh).

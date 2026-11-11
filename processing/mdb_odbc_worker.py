@@ -288,7 +288,7 @@ def _finite_number(value):
             return None
     else:
         return None
-    return number if math.isfinite(number) else None
+    return number if math.isfinite(number) and abs(number) <= 1e12 else None
 
 
 def build_fallback_point(row_values, x_field, y_field, z_field=None):
@@ -682,6 +682,8 @@ def _coerce_json_value(v):
         # silently truncate the value in QGIS.
         return v.replace("\x00", "")
 
+    if isinstance(v, float) and not math.isfinite(v):
+        return None
     if isinstance(v, (int, float, bool)):
         return v
 
@@ -978,14 +980,14 @@ def _decode_row_geometry(blob_bytes, geometry_type_code, forced_kind=None):
     vertices = list(iter_vertices(decoded))
     if not vertices:
         return None
-    if not all(math.isfinite(v[0]) and math.isfinite(v[1]) and math.isfinite(v[2])
+    if not all(all(math.isfinite(c) and abs(c) <= 1e12 for c in v)
                for v in vertices):
         return None
     kind = forced_kind or output_kind_for_geometry(decoded, geometry_type_code)
     geometry = geojson_for_kind(kind, decoded)
     if geometry is None:
         return None
-    mean_z = sum(v[2] for v in vertices) / len(vertices)
+    mean_z = sum(v[2] / len(vertices) for v in vertices)
     return geometry, kind, mean_z, _text_properties(decoded)
 
 

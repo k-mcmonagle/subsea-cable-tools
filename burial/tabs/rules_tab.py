@@ -1086,6 +1086,7 @@ class RulesTab(QWidget):
         layout = QVBoxLayout(self)
         self.overview = VerdictStrip()
         self.overview.kpClicked.connect(self.dock.goto_kp)
+        self.overview.kpHovered.connect(self.dock.sync_hover_kp)
         layout.addWidget(self.overview)
 
         self.rule_table = QTableWidget(0, 5)
@@ -1106,6 +1107,7 @@ class RulesTab(QWidget):
         self._fire_hover = FireBarHover(self.rule_table, FIRE_COL,
                                         self._fire_delegate,
                                         self._fire_tooltip)
+        self._fire_hover.kpHovered.connect(self.dock.sync_hover_kp)
         header = self.rule_table.horizontalHeader()
         header.setSectionResizeMode(0, HEADER_RESIZE_MODE_CONTENTS)
         header.setSectionResizeMode(FIRE_COL, HEADER_RESIZE_MODE_STRETCH)
@@ -1308,6 +1310,10 @@ class RulesTab(QWidget):
         model.inputsChanged.connect(refresh_soon)
         model.analysisChanged.connect(refresh_soon)
         self.refresh()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.refresh()  # also check file stamps when returning to Exclusions
 
     # -- refresh --------------------------------------------------------------
     def refresh(self) -> None:
@@ -1512,12 +1518,11 @@ class RulesTab(QWidget):
         if when:
             text += f" ({when})"
         text += "."
+        if not (self.model.analysis_row or {}).get("_unsaved"):
+            text += " Saved results are restored when this plan is reopened."
         changed = [rid for rid, state in (status.get("rule_state") or {}).items()
                    if state in (analysis_state.STATE_CHANGED,
-                                analysis_state.STATE_NEW)
-                   and any(str(r.get("rule_id")) == rid
-                           and int(r.get("enabled") or 0)
-                           for r in self.model.rules)]
+                                analysis_state.STATE_NEW)]
         kind = ""
         if status.get("reasons"):
             text += (" Out of date — " + ", ".join(status["reasons"])

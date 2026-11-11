@@ -121,6 +121,12 @@ class PlanModel(QObject):
         self.analysis_row: Optional[Dict] = None
         self.analysis_context: Optional[generation.ResolutionContext] = None
         self.analysis_nodata: List[Interval] = []
+        self._analysis_watched_layers = {}
+        self._analysis_memory_fps = {}
+        self._analysis_source_timer = QTimer(self)
+        self._analysis_source_timer.setSingleShot(True)
+        self._analysis_source_timer.setInterval(250)
+        self._analysis_source_timer.timeout.connect(self.analysisChanged.emit)
         self._route_geom_fp = ""
         self._kp_path_fp: Optional[str] = None
         self.route = None            # RouteFrame over the plan's RPL (WGS84)
@@ -261,6 +267,7 @@ class PlanModel(QObject):
         # left; flush it (against the old plan/route state) rather than
         # dropping it, or that plan's map layers stay stale on disk.
         self._flush_layer_refresh()
+        self._clear_analysis_watchers()
         self.plan = plan
         self.inputs = self.store.list_inputs(plan_id)
         self._depth_config_cache = None
@@ -281,6 +288,11 @@ class PlanModel(QObject):
         self._load_route()
         self._sync_kp_datum()
         self._load_analysis()
+        if self.acq_cache:
+            status = self.analysis_status()
+            if status["reasons"] or any(state != analysis_state.STATE_CURRENT
+                                        for state in status["rule_state"].values()):
+                self.acq_cache.clear()
         self._normalise_plan_status()
         self.planChanged.emit()
         self.inputsChanged.emit()
@@ -312,6 +324,7 @@ class PlanModel(QObject):
 
     def close_plan(self) -> None:
         self._flush_layer_refresh()  # keep a pending write, not drop it
+        self._clear_analysis_watchers()
         self.plan = {}
         self._display_settings_raw = None
         self._display_settings_cache = {}
@@ -843,11 +856,79 @@ class PlanModel(QObject):
         profile = self.bathy_profile
         return str(profile.sampled_utc or "") if profile is not None else ""
 
+    def _clear_analysis_watchers(self) -> None:
+        self._analysis_source_timer.stop()
+        for layer in self._analysis_watched_layers.values():
+            for name in ("dataChanged", "featureAdded", "featureDeleted", "geometryChanged",
+                         "attributeValueChanged", "subsetStringChanged", "editingStopped"):
+                try:
+                    signal = getattr(layer, name, None)
+                    if signal is not None:
+                        signal.disconnect(self._analysis_input_changed)
+                except (RuntimeError, TypeError):
+                    pass  # provider already removed from the project
+        self._analysis_watched_layers.clear()
+        self._analysis_memory_fps.clear()
+
+    def _analysis_input_changed(self, *_args) -> None:
+        self._analysis_memory_fps.clear()
+        self.acq_cache.clear()
+        self._analysis_source_timer.start()
+
+    def _analysis_sources(self, rules, inputs) -> Dict:
+        """Cheap persisted source stamps, with content hashes for memory inputs."""
+        from qgis.core import QgsVectorLayer
+        from ..workbench import rules_inputs
+        project = QgsProject.instance()
+        by_id = {str(r.get("input_id") or ""): r for r in inputs}
+        snapshots = {}
+        depth_stamp = None
+        for rule in rules:
+            config = analysis_state.decode_json(rule.get("config_json"), {})
+            source = by_id.get(str(config.get("input_id") or ""))
+            uses_depth = analysis_state.rule_uses_depth(rule)
+            has_layer = bool(source or config.get("layer_id") or config.get("layer_source"))
+            if not has_layer and not uses_depth:
+                continue
+            try:
+                layer = (map_layers.resolve_input_layer(project, source) if source
+                         else rules_inputs.resolve_layer(project, config) if has_layer else None)
+                if not has_layer:
+                    stamp = ""
+                elif layer is None or not layer.isValid():
+                    stamp = "missing"
+                else:
+                    if project.mapLayer(layer.id()) is layer and layer.id() not in self._analysis_watched_layers:
+                        self._analysis_watched_layers[layer.id()] = layer
+                        for name in ("dataChanged", "featureAdded", "featureDeleted", "geometryChanged",
+                                     "attributeValueChanged", "subsetStringChanged", "editingStopped"):
+                            signal = getattr(layer, name, None)
+                            if signal is not None:
+                                signal.connect(self._analysis_input_changed)
+                    stamp = map_layers.layer_fingerprint(layer)
+                    if isinstance(layer, QgsVectorLayer) and layer.providerType() == "memory":
+                        content = self._analysis_memory_fps.get(layer.id())
+                        if content is None:
+                            content = analysis_state.digest([
+                                (f.id(), f.attributes(), f.geometry().asWkt(12))
+                                for f in layer.getFeatures()])
+                            self._analysis_memory_fps[layer.id()] = content
+                        stamp += "|" + content
+            except Exception:
+                log_exception("Burial Planner: exclusion input currency check failed", level=logging.DEBUG)
+                stamp = "unavailable"
+            if uses_depth:
+                if depth_stamp is None:
+                    depth_stamp = self.depth_fingerprint() + "|" + self._profile_stamp()
+                stamp += "|depth:" + depth_stamp
+            snapshots[str(rule.get("rule_id"))] = stamp
+        return snapshots
+
     def exclusion_fingerprints(self, params: Optional[generation.GenParams] = None,
                                rules: Optional[List[Dict]] = None,
                                inputs: Optional[List[Dict]] = None,
                                profile_stamp: Optional[str] = None) -> Dict:
-        return analysis_state.exclusion_fingerprints(
+        fingerprints = analysis_state.exclusion_fingerprints(
             params or self.gen_params(),
             self.rules if rules is None else rules,
             self.inputs if inputs is None else inputs,
@@ -855,12 +936,19 @@ class PlanModel(QObject):
             profile_stamp=(self._profile_stamp() if profile_stamp is None
                            else profile_stamp),
             kp_path=self.kp_path_component())
+        fingerprints["sources"] = self._analysis_sources(
+            self.rules if rules is None else rules, self.inputs if inputs is None else inputs)
+        fingerprints["order"] = [str(r.get("rule_id")) for r in
+                                  (self.rules if rules is None else rules)]
+        fingerprints["kp_mode"] = list(self.kp_mode())
+        return fingerprints
 
     def analysis_basis(self) -> Dict:
         """What a recompute is computed from, captured at launch."""
         return {"rules": [dict(r) for r in self.rules],
                 "inputs": [dict(r) for r in self.inputs],
-                "profile_stamp": self._profile_stamp()}
+                "profile_stamp": self._profile_stamp(),
+                "fingerprints": self.exclusion_fingerprints()}
 
     def _load_analysis(self) -> None:
         """Read the plan's latest analysis row (tolerating a missing table
@@ -889,6 +977,19 @@ class PlanModel(QObject):
                 except (IndexError, TypeError, ValueError):
                     continue
             self.analysis_nodata = nodata
+            acquisitions = payload.get("acquisitions")
+            for key, cached in (acquisitions if isinstance(acquisitions, dict) else {}).items():
+                try:
+                    import math
+                    pairs = [[(float(a), float(b)) for a, b in cached[field]]
+                             for field in ("footprint", "nodata")]
+                    if not all(math.isfinite(a) and math.isfinite(b) and a <= b
+                               for group in pairs for a, b in group):
+                        continue
+                    self.acq_cache[str(key)] = tuple(
+                        [Interval(a, b) for a, b in group] for group in pairs)
+                except (KeyError, TypeError, ValueError):
+                    continue
             self._refresh_analysis_insufficient()
 
     def _refresh_analysis_insufficient(self) -> None:
@@ -919,7 +1020,8 @@ class PlanModel(QObject):
                       nodata: List[Interval], params: generation.GenParams,
                       rules: List[Dict], message: str = "",
                       warnings: Optional[List[str]] = None,
-                      basis: Optional[Dict] = None) -> bool:
+                      basis: Optional[Dict] = None,
+                      acquisitions: Optional[Dict] = None) -> bool:
         """Persist the latest Exclusions resolution (derived; not logged)."""
         if not self.plan_id:
             return False
@@ -927,10 +1029,15 @@ class PlanModel(QObject):
         row = dict(self.analysis_row or {})
         row.pop("_unsaved", None)
         row.update({"plan_id": self.plan_id})
+        payload = generation.context_dict(context)
+        payload["acquisitions"] = {
+            key: {"footprint": [[iv.start_km, iv.end_km] for iv in footprint],
+                  "nodata": [[iv.start_km, iv.end_km] for iv in missing]}
+            for key, (footprint, missing) in (acquisitions or {}).items()}
         row.update(analysis_state.encode_exclusions(
-            generation.context_dict(context),
+            payload,
             [(iv.start_km, iv.end_km) for iv in nodata],
-            self.exclusion_fingerprints(
+            (basis or {}).get("fingerprints") or self.exclusion_fingerprints(
                 params, rules, (basis or {}).get("inputs"),
                 (basis or {}).get("profile_stamp")),
             message, warnings or [], run_utc))
@@ -1015,6 +1122,23 @@ class PlanModel(QObject):
                 stored.get("global"), current["global"])
             status["rule_state"] = analysis_state.compare_items(
                 stored.get("rules"), current["rules"])
+            if "order" in stored and stored["order"] != current["order"]:
+                status["reasons"].append("the exclusion stack order or membership")
+            if "kp_mode" in stored and stored["kp_mode"] != current["kp_mode"]:
+                status["reasons"].append("the KP measurement settings")
+            old_sources = stored.get("sources")
+            if isinstance(old_sources, dict):
+                for rid, stamp in current["sources"].items():
+                    if old_sources.get(rid) != stamp or stamp.startswith(("missing", "unavailable")):
+                        status["rule_state"][rid] = analysis_state.STATE_CHANGED
+                if any(old_sources.get(rid) != stamp or stamp.startswith(("missing", "unavailable"))
+                       for rid, stamp in current["sources"].items()):
+                    status["reasons"].append("the exclusion input data or its availability")
+            elif current["sources"]:
+                status["reasons"].append("input data verification (not recorded in this older run)")
+            if any(analysis_state.rule_uses_depth(r) for r in self.rules):
+                if self.bathy_profile is not None and self.profile_stale_reasons():
+                    status["reasons"].append("the bathymetry used by the exclusions")
             if status["source"] == "generation":
                 # No profile identity was stored with generations: never
                 # report depth/slope criteria stale on that account alone.

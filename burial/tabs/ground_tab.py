@@ -872,7 +872,7 @@ class GroundTab(QWidget):
     # -- plot sync -------------------------------------------------------------
     def _plot_hover(self, kp: float) -> None:
         if self.dock is not None:
-            self.dock.highlight_kp(kp)
+            self.dock.sync_hover_kp(kp, sync_ground=False)
 
     def _plot_clicked(self, kp: float) -> None:
         if self.dock is not None:
@@ -887,5 +887,4 @@ class GroundTab(QWidget):
 
     def sync_kp(self, kp: float) -> None:
         """Mirror the profile crosshair (called by the dock)."""
-        if self._working or self._horizon_rows or self._annotation_state["groups"]:
-            self.plot.show_kp(kp, 0.0)
+        self.plot.show_kp(kp, 0.0)

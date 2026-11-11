@@ -368,6 +368,7 @@ def test_invalid_or_non_finite_coordinates_are_rejected(tmp_path):
         ("", 6000200.0, None),
         (float("nan"), 6000200.0, None),
         (500100.0, float("inf"), None),
+        (1e200, 6000200.0, None),
         ("not-a-number", 6000200.0, None),
         (True, False, None),
     ]

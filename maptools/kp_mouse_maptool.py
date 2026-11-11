@@ -1063,10 +1063,11 @@ class KPMouseMapTool(QgsMapTool):
             # Create line geometry
             line_geom = QgsGeometry.fromPolylineXY([self.range_bearing_origin, self.last_mouse_point])
 
-            # The same geodesic ring the rubber band shows.
+            # The same distance basis and cursor bearing as the rubber band.
             if range_distance_m <= 0:
                 return
-            circle_geom = self._range_ring_geometry(self.range_bearing_origin, range_distance_m)
+            circle_geom = self._range_ring_geometry(self.range_bearing_origin, range_distance_m,
+                                                     target=self.last_mouse_point)
 
             # Create line feature
             line_layer = self._ensure_lines_layer()
@@ -1326,20 +1327,36 @@ class KPMouseMapTool(QgsMapTool):
         return dirs[idx]
 
     def _range_ring_geometry(self, origin: QgsPointXY, range_m: float,
-                             segments: int = 180) -> QgsGeometry:
+                             segments: int = 180, target=None) -> QgsGeometry:
         """Polygon of the range ring of ``range_m`` metres around ``origin``.
 
-        A true geodesic circle on the WGS84 spheroid, transformed to the map
-        CRS in one call — correct for any map CRS (Web Mercator, UTM,
-        geographic, non-metre units), where a flat circle drifts off the
-        cursor. The planar approximation is only a fallback for points
-        outside the CRS's valid area.
+        Use the measurement's grid for Cartesian ranges, or WGS84 for
+        geodesic ranges. Starting at the cursor bearing puts a vertex at
+        the pointer instead of a chord that falls inside the true circle.
         """
+        from ..kp_range_utils import is_grid_distance
+        distance = self.distanceArea
+        if is_grid_distance(distance) or not distance.willUseEllipsoid():
+            grid = is_grid_distance(distance)
+            center = distance.to_grid(origin) if grid else origin
+            angle = 0.0
+            if target is not None:
+                endpoint = distance.to_grid(target) if grid else target
+                angle = math.atan2(endpoint.x() - center.x(), endpoint.y() - center.y())
+            ring = [QgsPointXY(center.x() + range_m * math.sin(angle + 2 * math.pi * i / segments),
+                               center.y() + range_m * math.cos(angle + 2 * math.pi * i / segments))
+                    for i in range(segments)]
+            if grid:
+                ring = [distance.from_grid(p) for p in ring]
+            ring.append(QgsPointXY(ring[0]))
+            return QgsGeometry.fromPolygonXY([ring])
         to_wgs84, from_wgs84 = self._wgs84_transforms()
         try:
             origin_ll = to_wgs84.transform(QgsPointXY(origin)) if to_wgs84 is not None else QgsPointXY(origin)
             spheroid = self._spheroid()
-            ring = [spheroid.computeSpheroidProject(origin_ll, range_m, 2.0 * math.pi * i / segments)
+            angle = (spheroid.bearing(origin_ll, self._to_wgs84(target))
+                     if target is not None else 0.0)
+            ring = [spheroid.computeSpheroidProject(origin_ll, range_m, angle + 2.0 * math.pi * i / segments)
                     for i in range(segments + 1)]
             geom = QgsGeometry.fromPolygonXY([ring])
             if from_wgs84 is not None:
@@ -1372,16 +1389,18 @@ class KPMouseMapTool(QgsMapTool):
             circle.reset(GEOMETRY_POLYGON)
             self._ring_key = None
             return
-        # Keep the drawn ring while its radius changes by under half a pixel
-        # (e.g. moving around the circle): 181 spheroid projections per move
-        # otherwise, for no visible change.
+        # Tessellate more finely when zoomed into a large ring. Include the
+        # cursor bearing in the cache identity: reusing a ring at a different
+        # bearing would put the pointer between vertices, inside a chord.
         units = math.hypot(mousePoint.x() - origin.x(), mousePoint.y() - origin.y())
         pixels = units / (self.canvas.mapUnitsPerPixel() or 1.0)
-        key = (origin.x(), origin.y())
+        segments = min(4096, max(180, int(math.ceil(math.pi * math.sqrt(max(pixels, 1.0) / 0.5)))))
+        key = (origin.x(), origin.y(), mousePoint.x(), mousePoint.y(), segments)
         if (self._ring_key is not None and self._ring_key[0] == key and pixels > 0
                 and abs(self._ring_key[1] - range_meters) <= 0.5 * range_meters / pixels):
             return
-        circle.setToGeometry(self._range_ring_geometry(origin, range_meters), None)
+        circle.setToGeometry(self._range_ring_geometry(
+            origin, range_meters, segments=segments, target=mousePoint), None)
         self._ring_key = (key, range_meters)
 
     def _clear_range_bearing_graphics(self):

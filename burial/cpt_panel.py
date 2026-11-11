@@ -237,6 +237,14 @@ class CptPanel(QWidget):
         self.show_map.toggled.connect(self._map_toggled)
         row.addWidget(self.show_map)
         layout.addLayout(row)
+        self.spacing = QLabel()
+        self.spacing.setWordWrap(True)
+        self.spacing.setToolTip(
+            "Along-route KP gaps between adjacent active CPTs within the plan scope "
+            "and the maximum route offset. All current imports are included; "
+            "superseded imports are excluded. Coincident tests give a zero gap. "
+            "Distances from scope boundaries to the nearest CPT are excluded.")
+        layout.addWidget(self.spacing)
         self.status = QLabel()
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
@@ -401,6 +409,10 @@ class CptPanel(QWidget):
         self._update_status()
 
     def _update_status(self) -> None:
+        from .cpt_spacing import spacing_summary, spacing_text
+        scope = self.model.gen_params().scope
+        self.spacing.setText(spacing_text(spacing_summary(
+            self.placements.values(), scope.start_km, scope.end_km)))
         cpts = self.register.cpts
         has = bool(cpts)
         for key in ("edit", "reload", "remove"):

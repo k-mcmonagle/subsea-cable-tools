@@ -678,7 +678,7 @@ class BurialProfileWidget(QWidget):
                                     fill=pg.mkBrush(255, 255, 255, 220))
         self._readout.setZValue(22)
         self._readout.setVisible(False)
-        item.addItem(self._readout)
+        item.addItem(self._readout, ignoreBounds=True)
 
         # One band item per overlay kind (see RangeBandItem).
         self._regions: Dict[str, RangeBandItem] = {}
@@ -1750,6 +1750,8 @@ class BurialProfileWidget(QWidget):
 
     def focus_kp(self, kp: float) -> None:
         """Show the profile crosshair/readout at a table-selected KP."""
+        self._hover_timer.stop()
+        self._hover_kp = None
         lo, hi = self._scope
         value = float(kp)
         if hi > lo:

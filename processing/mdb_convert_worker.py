@@ -6,6 +6,7 @@ Run with the QGIS Python interpreter. stdout is reserved for the JSON result.
 import argparse
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -23,6 +24,7 @@ def main(argv=None):
     os.environ['QT_QPA_PLATFORM'] = 'offscreen'
     app = None
     source = None
+    verified = None
     try:
         from qgis.core import (
             QgsApplication, QgsCoordinateReferenceSystem,
@@ -56,13 +58,33 @@ def main(argv=None):
             fid_name='__subsea_fid')
         if error:
             raise RuntimeError(error)
-        result = {'renamed_fields': renamed}
+        source_count = source.featureCount()
+        source = None
+        verified = QgsVectorLayer(args.output + '|layername=' + args.table, args.table, 'ogr')
+        if not verified.isValid():
+            raise RuntimeError('Converted GeoPackage could not be reopened')
+        count = 0
+        for feature in verified.getFeatures():
+            geometry = feature.geometry()
+            if not geometry.isNull():
+                # Extremely large but finite coordinates can overflow native
+                # extent, indexing and rendering calculations.
+                for vertex in geometry.vertices():
+                    if not all(math.isfinite(v) and abs(v) <= 1e12
+                               for v in (vertex.x(), vertex.y())):
+                        raise ValueError('Converted geometry contains unsafe coordinates')
+                geometry.boundingBox()
+            count += 1
+        if count != source_count:
+            raise RuntimeError(f'GeoPackage verification read {count} of {source_count} features')
+        result = {'renamed_fields': renamed, 'verified': True, 'feature_count': count}
     except Exception as exc:
         sys.stderr.write(json.dumps({'error': str(exc), 'traceback': traceback.format_exc()}))
         return 1
     finally:
         # Release provider handles before tearing down the provider registry.
         source = None
+        verified = None
         if app is not None:
             app.exitQgis()
     sys.stdout.write(json.dumps(result))

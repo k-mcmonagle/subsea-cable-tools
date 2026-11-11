@@ -200,7 +200,7 @@ class VerdictStrip(QWidget):
         self._domain_start_km = 0.0
         self._spans: List = []
         self._method_name = ""
-        self._hover_x: Optional[int] = None
+        self._hover_kp: Optional[float] = None
         self._base_tip = ("Combined suitability for the selected method. "
                           "Click to locate on the map.")
         self.setToolTip(self._base_tip)
@@ -216,6 +216,10 @@ class VerdictStrip(QWidget):
         self._domain_start_km = domain_start_km
         self._spans = spans
         self._method_name = method_name or ""
+        self.update()
+
+    def set_hover_kp(self, kp: Optional[float]) -> None:
+        self._hover_kp = kp
         self.update()
 
     def _kp_at(self, x: int) -> Optional[float]:
@@ -242,7 +246,7 @@ class VerdictStrip(QWidget):
     def mouseMoveEvent(self, event):
         point = _event_point(event)
         kp = self._kp_at(point.x())
-        self._hover_x = point.x() if kp is not None else None
+        self._hover_kp = kp
         self.update()
         if kp is not None:
             self.kpHovered.emit(kp)
@@ -250,7 +254,7 @@ class VerdictStrip(QWidget):
         super().mouseMoveEvent(event)
 
     def leaveEvent(self, event):
-        self._hover_x = None
+        self._hover_kp = None
         self.update()
         super().leaveEvent(event)
 
@@ -267,7 +271,9 @@ class VerdictStrip(QWidget):
         paint_spans(painter, rect, self._domain_km,
                     [tuple(span[:3]) for span in self._spans],
                     domain_start_km=self._domain_start_km)
-        _paint_hover_line(painter, rect, self._hover_x)
+        x = (x_at_kp(rect, self._hover_kp, self._domain_km, self._domain_start_km)
+             if self._hover_kp is not None else None)
+        _paint_hover_line(painter, rect, x)
         painter.setPen(QPen(QColor(120, 120, 120)))
         painter.drawRect(rect)
         painter.setPen(QPen(QColor(40, 40, 40)))
@@ -393,6 +399,10 @@ class FireBarHover(QObject):
         if kp is None:
             return None
         return index.row(), kp, domain_km / max(1, rect.width())
+
+    def set_hover_kp(self, kp: Optional[float]) -> None:
+        """Mirror a linked view's cursor without emitting another hover."""
+        self._set_hover(kp)
 
     def _set_hover(self, kp: Optional[float]) -> None:
         if self._delegate.hover_kp == kp:

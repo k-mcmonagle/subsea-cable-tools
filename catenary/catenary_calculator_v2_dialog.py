@@ -3516,7 +3516,7 @@ class CatenaryCalculatorV2Dialog(QDialog):
         self._sync_crosshair_connection()
         if self.show_crosshair_values.isChecked():
             self._crosshair_vline = ax.axvline(0.0, color="#111827", linestyle="--", linewidth=0.8)
-            self._crosshair_hline = ax.axhline(0.0, color="#111827", linestyle="--", linewidth=0.8)
+            self._crosshair_hline = ax.axhline(0.0, color="#111827", linestyle="--", linewidth=0.8, ignore_bounds=True)
             self._crosshair_vline.set_visible(False)
             self._crosshair_hline.set_visible(False)
         else:

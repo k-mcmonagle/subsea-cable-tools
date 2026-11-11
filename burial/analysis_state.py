@@ -16,8 +16,9 @@ computed from, and this module decides what is still current:
   Names, notes and stack order are deliberately excluded: renaming a
   criterion must not mark its bar stale.
 
-Editing a layer's features on disk is not detected (re-hashing every input
-layer on each refresh would be too slow); the tabs say so in their tooltips.
+PlanModel also records exclusion input content stamps and watches live
+input edits. These survive reopen without hashing every disk-backed layer
+on each refresh.
 """
 
 from __future__ import annotations
@@ -99,6 +100,15 @@ def _input_binding(config: object, inputs_by_id: Dict[str, Dict]) -> Dict:
         binding[input_id] = [str(row.get("layer_source") or ""),
                              str(row.get("config_json") or "")] if row else None
     return binding
+
+
+def rule_uses_depth(rule: Dict) -> bool:
+    config = decode_json(rule.get("config_json"), {})
+    return (rule.get("kind") == "threshold_profile"
+            or (rule.get("kind") == "data_coverage"
+                and config.get("coverage_source", "bathymetry") != "polygon")
+            or config.get("route_buffer_mode") == "wd"
+            or config.get("extend_mode") == "wd")
 
 
 def rule_fingerprint(rule: Dict, inputs_by_id: Dict[str, Dict],

@@ -743,7 +743,7 @@ class PlotPanel(QWidget):
         self._label = pg.TextItem(color=(10, 10, 10), anchor=(0, 1), fill=pg.mkBrush(255, 255, 255, 220))
         self._label.setZValue(22)
         self._label.setVisible(False)
-        plot_item.addItem(self._label)
+        plot_item.addItem(self._label, ignoreBounds=True)
 
         # Right-click: pyqtgraph's own view menu gains a "go to" entry for the
         # record under the cursor (recorded by _on_click on the right button).

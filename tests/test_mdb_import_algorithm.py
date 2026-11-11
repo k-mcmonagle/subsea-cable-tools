@@ -555,7 +555,9 @@ def test_conversion_isolated_end_to_end():
                                        'label_rotation': 35.0, 'label_alignment': 9},
                     }]}, handle)
                 return {'outputs': {'Point': path}, 'feature_counts': {'Point': 1}}
-            return super()._run_worker(args, feedback, **kwargs)
+            result = super()._run_worker(args, feedback, **kwargs)
+            assert result['verified'] is True and result['feature_count'] == 1
+            return result
 
     with tempfile.TemporaryDirectory() as folder:
         mdb = os.path.join(folder, 'synthetic.mdb')

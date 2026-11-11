@@ -480,12 +480,12 @@ class PyQtGraphAxis:
         default = self._next_color() if color is None else "#1f77b4"
         return pg.mkPen(_as_plot_color(color, default, alpha=alpha), width=float(linewidth or 1), style=_pen_style(linestyle))
 
-    def _add_item(self, item: Any):
+    def _add_item(self, item: Any, *, ignore_bounds: bool = False):
         if self.is_twin:
-            self.view_box.addItem(item)
+            self.view_box.addItem(item, ignoreBounds=ignore_bounds)
             self.view_box.enableAutoRange()
         else:
-            self.plot_item.addItem(item)
+            self.plot_item.addItem(item, ignoreBounds=ignore_bounds)
 
     def plot(self, x_values, y_values, *args, **kwargs):
         label = kwargs.pop("label", None)
@@ -548,7 +548,7 @@ class PyQtGraphAxis:
         linestyle = kwargs.pop("linestyle", kwargs.pop("ls", None))
         linewidth = kwargs.pop("lw", kwargs.pop("linewidth", 1))
         line_item = pg.InfiniteLine(pos=float(x), angle=90, pen=self._make_pen(color, linewidth, linestyle))
-        self._add_item(line_item)
+        self._add_item(line_item, ignore_bounds=kwargs.pop("ignore_bounds", True))
         return PyQtGraphLine(line_item, [x, x], [], kind="vline")
 
     def axhline(self, y: float = 0, *args, **kwargs):
@@ -557,7 +557,7 @@ class PyQtGraphAxis:
         linewidth = kwargs.pop("linewidth", kwargs.pop("lw", 1))
         linestyle = kwargs.pop("linestyle", None)
         line_item = pg.InfiniteLine(pos=float(y), angle=0, pen=self._make_pen(color, linewidth, linestyle))
-        self._add_item(line_item)
+        self._add_item(line_item, ignore_bounds=kwargs.pop("ignore_bounds", False))
         line = PyQtGraphLine(line_item, [], [y, y], label=label, kind="hline")
         if label:
             self._legend_items.append(line)

@@ -616,14 +616,15 @@ def test_range_ring_cached_and_unchanged():
         spheroid.setEllipsoid("WGS84")
         to_wgs = QgsCoordinateTransform(crs, wgs84, QgsProject.instance())
         origin_ll = to_wgs.transform(origin)
-        legacy = [to_merc.transform(spheroid.computeSpheroidProject(origin_ll, range_m * 1.5,
-                                                                    2.0 * math.pi * i / 180))
-                  for i in range(181)]
-        # Keep the geometry alive: vertices() of a temporary never ends.
         ring_geom = tool.rangeBearingCircle.asGeometry()
         ring = [QgsPointXY(v) for v in ring_geom.vertices()]
+        segments = len(ring) - 1
+        angle = spheroid.bearing(origin_ll, to_wgs.transform(mouse))
+        legacy = [to_merc.transform(spheroid.computeSpheroidProject(
+            origin_ll, range_m * 1.5, angle + 2.0 * math.pi * i / segments))
+                  for i in range(segments + 1)]
         worst = max(math.hypot(a.x() - b.x(), a.y() - b.y()) for a, b in zip(ring, legacy))
-        same_ring = len(ring) == 181 and worst < 1e-6
+        same_ring = segments >= 180 and worst < 1e-6
         line_ok = tool.rangeBearingLine.numberOfVertices() == 2
         # A new map CRS invalidates the transforms (and rebuilds the route).
         canvas.setDestinationCrs(QgsCoordinateReferenceSystem("EPSG:32631"))

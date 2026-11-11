@@ -772,6 +772,7 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
                 'No Python interpreter found for the MDB worker. Set '
                 'QGIS_PYTHON_EXECUTABLE to the Python executable bundled with QGIS.')
 
+        self._record_stage('worker starting: ' + worker_script)
         cmd = [python_exe, '-u', '-X', 'faulthandler', worker_path] + args
         feedback.pushInfo('Running MDB worker: ' + ' '.join(cmd))
         if feedback.isCanceled():
@@ -823,6 +824,7 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
                 raise
             raise QgsProcessingException(f'Failed to run MDB worker: {e}')
 
+        self._record_stage(f'worker ended: {worker_script}; exit={process.returncode}')
         if process.returncode != 0:
             # Worker writes JSON to stderr on error.
             err = (stderr or '').strip()
@@ -863,7 +865,44 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
             details.groupName = group_name
         context.addLayerToLoadOnCompletion(layer.id(), details)
 
+    def _record_stage(self, stage):
+        handle = getattr(self, '_diagnostic_handle', None)
+        if handle is not None:
+            try:
+                handle.write(json.dumps({'time': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                                         'stage': stage}) + '\n')
+                handle.flush()
+                os.fsync(handle.fileno())
+            except OSError:
+                pass  # diagnostic storage must not break the import
+
     def processAlgorithm(self, parameters, context, feedback):
+        # Flushed before native calls so even a host access violation leaves
+        # the last phase on disk. No feature values or coordinates are logged.
+        log_path = os.path.join(QgsApplication.qgisSettingsDirPath(), 'subsea_mdb_import.log')
+        self._diagnostic_handle = None
+        try:
+            if os.path.exists(log_path) and os.path.getsize(log_path) > 1024 * 1024:
+                os.replace(log_path, log_path + '.previous')
+            self._diagnostic_handle = open(log_path, 'a', encoding='utf-8')
+        except OSError:
+            feedback.pushWarning('Could not create the MDB import diagnostic log.')
+        else:
+            feedback.pushInfo('MDB diagnostic log: ' + log_path)
+        try:
+            self._record_stage('import started')
+            result = self._process_algorithm(parameters, context, feedback)
+            self._record_stage('import completed; outputs handed to QGIS')
+            return result
+        except Exception as exc:
+            self._record_stage('import failed: ' + type(exc).__name__)
+            raise
+        finally:
+            if self._diagnostic_handle is not None:
+                self._diagnostic_handle.close()
+                self._diagnostic_handle = None
+
+    def _process_algorithm(self, parameters, context, feedback):
         # The bundled pure-Python reader works on any platform; only fall back
         # to requiring Windows/ODBC when it is missing (broken install).
         have_pure_reader = os.path.isdir(os.path.join(
@@ -1262,6 +1301,7 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
             return layer
 
         output_layers = {}
+        pending_outputs = []
         table_count = len(feature_tables)
         for table_index, (table_name, (geom_field_name, geometry_type_code)) in enumerate(
             feature_tables.items(),
@@ -1333,21 +1373,14 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
                         ['--input', path, '--output', gpkg_path, '--table', table,
                          '--crs', crs.toWkt(), '--prefix', QgsApplication.prefixPath()],
                         feedback, worker_script='mdb_convert_worker.py')
-                    renamed = (conversion or {}).get('renamed_fields', {})
+                    if not isinstance(conversion, dict) or conversion.get('verified') is not True:
+                        raise QgsProcessingException('MDB conversion did not verify its GeoPackage output.')
+                    renamed = conversion.get('renamed_fields', {})
                     if renamed:
                         feedback.pushInfo('  Renamed for GeoPackage: ' + ', '.join(
                             f'{old} -> {new}' for old, new in sorted(renamed.items())))
-                    # Only the completed GeoPackage enters the QGIS process. Raw
-                    # GeoJSON parsing and native writer callbacks stay isolated.
-                    layer = QgsVectorLayer(gpkg_layer_uri(gpkg_path, table), layer_name, 'ogr')
-                    if not layer.isValid():
-                        raise QgsProcessingException(f'Could not open converted layer {layer_name}')
-                    warning = extent_crs_warning(layer.extent(), crs, context.transformContext())
-                    if warning:
-                        implausible.append(f'{layer_name}: {warning}')
-
-                    self._register_output_layer(context, layer, layer_name, file_name)
-                    output_layers[f"{output_namespace}::{table_name}::{geom_type_name}"] = layer.id()
+                    pending_outputs.append((gpkg_path, table, layer_name, table_name,
+                                            geom_type_name, crs, table_index))
                 continue
             else:
                 mem_layer, error = import_table_as_memory_layer(
@@ -1371,6 +1404,26 @@ class ImportMdbAlgorithm(SubseaCableAlgorithm):
                         continue
                 self._register_output_layer(context, mem_layer, layer_name, file_name)
                 output_layers[f"{output_namespace}::{table_name}"] = mem_layer.id()
+
+        # All writes to this database have finished. Opening a provider while
+        # a later worker is still replacing tables in the same file can leave
+        # native provider state referring to a changing SQLite schema.
+        for gpkg_path, table, layer_name, table_name, geom_type_name, crs, table_index in pending_outputs:
+            if feedback.isCanceled():
+                raise QgsProcessingException("MDB import canceled.")
+            self._record_stage(f'opening verified output; table {table_index}/{table_count}; {geom_type_name}')
+            options = QgsVectorLayer.LayerOptions(context.transformContext())
+            options.loadDefaultStyle = False
+            options.skipCrsValidation = True
+            layer = QgsVectorLayer(gpkg_layer_uri(gpkg_path, table), layer_name, 'ogr', options)
+            if not layer.isValid():
+                raise QgsProcessingException(f'Could not open converted layer {layer_name}')
+            warning = extent_crs_warning(layer.extent(), crs, context.transformContext())
+            if warning:
+                implausible.append(f'{layer_name}: {warning}')
+            self._record_stage('registering verified output with Processing')
+            self._register_output_layer(context, layer, layer_name, file_name)
+            output_layers[f"{output_namespace}::{table_name}::{geom_type_name}"] = layer.id()
 
         # Cleanup runs only after every worker file has been opened, copied to a
         # GeoPackage and validated above. Failures here never fail the import.
