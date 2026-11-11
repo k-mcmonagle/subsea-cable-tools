@@ -70,6 +70,7 @@ Find these in the QGIS Processing Toolbox under **Subsea Cable Tools**.
 - **Import Path File (.pthmdb)** — import route and profile data from a path database.
 - **Create Raster from XYZ** — grid XYZ bathymetry files.
 - **Merge MBES Rasters** — combine bathymetry grids.
+- **Attach descriptions to seabed polygons (experimental)** — assemble annotation fragments into label points and follow leaders to selected soil polygons; under **Other Tools**.
 - **Dynamic Buffer (Lay Corridor)** — create a route corridor with changing width.
 - **Export KP section chartlets** — export map images for route sections.
 - **Extract Lines Intersecting Polygons** — select lines crossing areas.
@@ -77,6 +78,34 @@ Find these in the QGIS Processing Toolbox under **Subsea Cable Tools**.
 - **Place Ship Outlines at Points** — position vessel outlines at map points.
 - **Place Outline Along Route (KP)** — position an outline at a route KP.
 - **Plot Line Segments from Table** — draw segments from tabular coordinates.
+
+## Seabed description assembly (experimental)
+
+After importing an MDB, open **Other Tools → Attach descriptions to seabed polygons (experimental)**.
+Select the description point layer and its text field (normally `label_text`). Select the relevant
+leader lines and soil polygon layers if you want polygon descriptions; both are optional for
+creating assembled labels alone. Start with automatic line spacing, then inspect the results at
+the drawing scale. Use GeoPackage or temporary outputs to preserve full descriptions.
+
+The tool creates copies and leaves the imported layers unchanged:
+
+- **Assembled description points** contain one point per proposed text block. `assembled_text`
+  is labelled automatically. Green points have consistent layout supported by a leader anchor;
+  blue points preserve single original text; amber points use layout alone and should be checked.
+  Red points need review: their proposal is in `candidate_text`, with accepted text left empty.
+- **Soil polygons with description candidates** retain original attributes and add
+  `soil_description`, `description_status`, candidate text and source references. Only a unique
+  accepted description is filled automatically. Different descriptions, overlapping polygons,
+  boundary targets and invalid geometry remain review cases. Existing field names are preserved;
+  newly generated fields receive a suffix if needed.
+- **Leader association checks** show which text block and polygon each leader could connect,
+  with the reason for accepting or rejecting it. Several leaders may share a description block.
+
+Certainty describes geometric evidence, not confirmation of the soil interpretation. The tool
+never assigns a polygon merely because it is nearest. Ambiguous text grouping, insufficient
+spacing evidence and invalid geometry are explicit; no source text is silently discarded.
+Measurements use a projected CRS in metres. Large survey extents require a suitable working CRS
+chosen by the user. This optional tool does not change general-purpose MDB importing.
 
 ## Map and dock tools
 

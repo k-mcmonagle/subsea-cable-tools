@@ -1,0 +1,720 @@
+"""Optional annotation assembly and conservative leader-to-polygon association."""
+
+from collections import Counter, defaultdict
+import json
+import math
+import os
+
+from qgis.PyQt.QtCore import QCoreApplication
+from qgis.core import (
+    NULL, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsFeature,
+    QgsField, QgsFields, QgsGeometry, QgsPointXY, QgsProcessing,
+    QgsProcessingException, QgsProcessingLayerPostProcessorInterface,
+    QgsProcessingParameterCrs, QgsProcessingParameterFeatureSink,
+    QgsProcessingParameterFeatureSource, QgsProcessingParameterField,
+    QgsProcessingParameterMultipleLayers, QgsProcessingParameterNumber,
+    QgsRectangle, QgsSpatialIndex, QgsVectorLayerSimpleLabeling,
+    QgsPalLayerSettings, QgsTextFormat, QgsWkbTypes, QgsCategorizedSymbolRenderer,
+    QgsMarkerSymbol, QgsRendererCategory, QgsProperty,
+    QgsProviderRegistry,
+)
+
+from .algorithm_base import SubseaCableAlgorithm
+from .annotation_blocks import TextBlock, TextLine, assemble_blocks, estimate_line_gap, normalized_text
+from ..qgis_compat import (
+    DISTANCE_METERS, FIELD_TYPE_DOUBLE, FIELD_TYPE_INT, FIELD_TYPE_STRING,
+    GEOMETRY_LINE, GEOMETRY_POLYGON, PROCESSING_FIELD_ANY,
+    PROCESSING_FIELD_NUMERIC, PROCESSING_NUMBER_DOUBLE, WKB_POINT, WKB_LINESTRING,
+)
+
+
+MAX_FEATURES = 100000
+MAX_PAIRS = 500000
+MAX_TEXT_CHARS = 20000000
+
+
+def _present(value):
+    return value is not None and value != NULL
+
+
+def _string(value):
+    return str(value) if _present(value) else ''
+
+
+def _json(value):
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _point_feature(key, point):
+    feature = QgsFeature(key)
+    feature.setGeometry(QgsGeometry.fromPointXY(point))
+    return feature
+
+
+def _safe_coordinates(geometry, cancel):
+    for i, vertex in enumerate(geometry.vertices()):
+        if i % 1000 == 0:
+            cancel()
+        if not all(math.isfinite(value) and abs(value) <= 1e12 for value in (vertex.x(), vertex.y())):
+            return False
+    return True
+
+
+def _transform_geometry(geometry, transform, cancel):
+    if not _safe_coordinates(geometry, cancel):
+        raise ValueError('Unsafe or non-finite geometry coordinates; output geometry omitted.')
+    if geometry.transform(transform) != 0 or not _safe_coordinates(geometry, cancel):
+        raise ValueError('Geometry could not be transformed safely; output geometry omitted.')
+
+
+def _fields(specification):
+    fields = QgsFields()
+    for name, kind in specification:
+        fields.append(QgsField(name, kind))
+    return fields
+
+
+def _new_field(fields, name, kind):
+    used = {field.name().casefold() for field in fields}
+    base, suffix = name, 2
+    while name.casefold() in used:
+        name, suffix = f'{base}_{suffix}', suffix + 1
+    fields.append(QgsField(name, kind))
+    return name
+
+
+def _polygon_parts(geometry):
+    """Extract area components from makeValid's possible geometry collection.
+
+    Collapsed edges may accompany valid areas. They are excluded from the search,
+    while the original polygon is retained in the output and marked for review.
+    """
+    if geometry.isNull() or geometry.isEmpty():
+        return []
+    if geometry.type() == GEOMETRY_POLYGON and not geometry.isMultipart():
+        return [geometry]
+    parts = []
+    for part in geometry.asGeometryCollection():
+        if part.type() == GEOMETRY_POLYGON or part.isMultipart():
+            parts.extend(_polygon_parts(part))
+    return parts
+
+
+class _LabelPoints(QgsProcessingLayerPostProcessorInterface):
+    """Applied by Processing on the GUI thread after the output is loaded."""
+
+    def postProcessLayer(self, layer, context, feedback):
+        settings = QgsPalLayerSettings()
+        settings.fieldName = 'assembled_text'
+        settings.isExpression = False
+        settings.wrapChar = '\n'
+        text_format = QgsTextFormat()
+        text_format.setSize(9)
+        settings.setFormat(text_format)
+        properties = settings.dataDefinedProperties()
+        scope = getattr(QgsPalLayerSettings, 'Property', QgsPalLayerSettings)
+        properties.setProperty(scope.LabelRotation, QgsProperty.fromExpression('-"label_rotation"'))
+        settings.setDataDefinedProperties(properties)
+        layer.setLabeling(QgsVectorLayerSimpleLabeling(settings))
+        layer.setLabelsEnabled(True)
+        categories = []
+        for value, caption, color in [
+                ('supported', 'Supported by layout and leader', '#269956'),
+                ('single', 'Original single text', '#397ec2'),
+                ('layout_only', 'Layout only — check assembly', '#d39725'),
+                ('review', 'Review — candidate text only', '#d34242')]:
+            symbol = QgsMarkerSymbol.createSimple({'name': 'circle', 'color': color, 'size': '2.2'})
+            categories.append(QgsRendererCategory(value, symbol, caption))
+        layer.setRenderer(QgsCategorizedSymbolRenderer('text_status', categories))
+        layer.setDisplayExpression('coalesce("assembled_text", "candidate_text")')
+        layer.setCustomProperty('subsea/annotation_certainty',
+                                'Geometric evidence only; review layout_only and review statuses.')
+        layer.triggerRepaint()
+
+
+class AttachSeabedDescriptionsAlgorithm(SubseaCableAlgorithm):
+    TEXT = 'TEXT'
+    TEXT_FIELD = 'TEXT_FIELD'
+    ROTATION_FIELD = 'ROTATION_FIELD'
+    ALIGNMENT_FIELD = 'ALIGNMENT_FIELD'
+    LEADERS = 'LEADERS'
+    POLYGONS = 'POLYGONS'
+    WORKING_CRS = 'WORKING_CRS'
+    MAX_LINE_GAP = 'MAX_LINE_GAP'
+    ANCHOR_TOLERANCE = 'ANCHOR_TOLERANCE'
+    BOUNDARY_TOLERANCE = 'BOUNDARY_TOLERANCE'
+    OUTPUT_LABELS = 'OUTPUT_LABELS'
+    OUTPUT_POLYGONS = 'OUTPUT_POLYGONS'
+    OUTPUT_CHECKS = 'OUTPUT_CHECKS'
+
+    def name(self):
+        return 'attach_seabed_descriptions'
+
+    def displayName(self):
+        return self.tr('Attach descriptions to seabed polygons (experimental)')
+
+    def group(self):
+        return self.tr('Other Tools')
+
+    def groupId(self):
+        return 'other_tools'
+
+    def createInstance(self):
+        return AttachSeabedDescriptionsAlgorithm()
+
+    def tr(self, text):
+        return QCoreApplication.translate('AttachSeabedDescriptionsAlgorithm', text)
+
+    def initAlgorithm(self, config=None):
+        self.addParameter(QgsProcessingParameterFeatureSource(
+            self.TEXT, self.tr('Description text points'), [QgsProcessing.TypeVectorPoint]))
+        self.addParameter(QgsProcessingParameterField(
+            self.TEXT_FIELD, self.tr('Description text field'), defaultValue='label_text',
+            parentLayerParameterName=self.TEXT, type=PROCESSING_FIELD_ANY))
+        self.addParameter(QgsProcessingParameterField(
+            self.ROTATION_FIELD, self.tr('Text rotation field (optional; auto-detect label_rotation, counter-clockwise degrees)'),
+            parentLayerParameterName=self.TEXT, type=PROCESSING_FIELD_NUMERIC, optional=True))
+        self.addParameter(QgsProcessingParameterField(
+            self.ALIGNMENT_FIELD, self.tr('Text alignment field (optional; auto-detect label_alignment)'),
+            parentLayerParameterName=self.TEXT, type=PROCESSING_FIELD_ANY, optional=True))
+        self.addParameter(QgsProcessingParameterMultipleLayers(
+            self.LEADERS, self.tr('Description leader layers (optional)'),
+            layerType=QgsProcessing.TypeVectorLine, optional=True))
+        self.addParameter(QgsProcessingParameterMultipleLayers(
+            self.POLYGONS, self.tr('Soil polygon layers (optional)'),
+            layerType=QgsProcessing.TypeVectorPolygon, optional=True))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.MAX_LINE_GAP, self.tr('Maximum gap between consecutive text lines (metres; 0 = estimate)'),
+            type=PROCESSING_NUMBER_DOUBLE, defaultValue=0, minValue=0))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.ANCHOR_TOLERANCE, self.tr('Leader endpoint to text anchor tolerance (metres)'),
+            type=PROCESSING_NUMBER_DOUBLE, defaultValue=1, minValue=0))
+        self.addParameter(QgsProcessingParameterNumber(
+            self.BOUNDARY_TOLERANCE, self.tr('Flag targets this close to polygon boundaries for review (metres)'),
+            type=PROCESSING_NUMBER_DOUBLE, defaultValue=0.5, minValue=0))
+        self.addParameter(QgsProcessingParameterCrs(
+            self.WORKING_CRS, self.tr('Projected CRS for measurements (metres; optional, automatic for local data)'), optional=True))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUTPUT_LABELS, self.tr('Assembled description points'), type=QgsProcessing.TypeVectorPoint))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUTPUT_POLYGONS, self.tr('Soil polygons with description candidates'),
+            type=QgsProcessing.TypeVectorPolygon, optional=True, createByDefault=True))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUTPUT_CHECKS, self.tr('Leader association checks'),
+            type=QgsProcessing.TypeVectorLine, optional=True, createByDefault=True))
+
+    def shortHelpString(self):
+        return '''<p>Optional post-import tool. Select the imported description points and their
+text field (usually <b>label_text</b>). Leaders and soil polygons are optional: leave them empty
+to create one label point per proposed text block. Source layers are never edited.</p>
+<p>Aligned lines with compatible rotations, alignment and consistent spacing are assembled in
+reading order, with newlines preserved. Zero line gap estimates a limit from repeated local
+spacing; small or mixed-scale samples require review or an explicit limit. The rule is geometric,
+not a probability or confirmation of the survey interpretation. Inspect the first results at
+the survey drawing scale.</p>
+<p><b>Text status:</b> single = original text; supported = consistent layout with one text
+anchor used by the leader(s); layout_only = consistent layout without leader evidence;
+review = uncertain assembly. Accepted text is in <b>assembled_text</b>. Review rows keep the
+proposal in <b>candidate_text</b>, with assembled_text empty so they are not labelled as accepted.
+Source feature IDs and reasons are retained. A label point is placed at its first text line.</p>
+<p>For polygon assignment, a leader must have one unambiguous text end and its other end
+strictly inside one selected polygon, away from boundaries. Both line directions are supported.
+Several leaders can share a text block. Nearby polygons are never silently selected. Overlaps,
+boundary hits, invalid polygons and uncertain text are flagged. Invalid polygons are repaired
+only in a working copy for candidate searches; output geometries preserve the originals.</p>
+<p><b>Polygon status:</b> matched = one distinct accepted description; multiple_descriptions =
+different descriptions target the same polygon; review = uncertain evidence; unmatched = no
+association. Only matched polygons receive <b>soil_description</b>; proposals remain in
+<b>candidate_text</b>. Identical repeated descriptions are deduplicated. All original polygon
+attributes are copied; generated names gain a suffix if they would overwrite an existing field.
+The source layer, feature IDs and block IDs permit tracing results back to the input.</p>
+<p>The leader-check layer explains each association, including rejected leaders. Use it with
+the original annotation layers to review results. All distances are measured in a projected
+metre CRS, not degrees. Automatic CRS selection requires local data; specify a suitable CRS
+for larger areas. Outputs use the text layer's CRS. Select only relevant soil and leader layers;
+this tool does not classify soil, infer ground conditions, or change MDB import behaviour.
+Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the long text and field names.</p>'''
+
+    @staticmethod
+    def _cancel(feedback):
+        if feedback.isCanceled():
+            raise QgsProcessingException('Description association canceled.')
+
+    @staticmethod
+    def _working_crs(source, requested, context):
+        if requested.isValid():
+            if requested.isGeographic() or requested.mapUnits() != DISTANCE_METERS:
+                raise QgsProcessingException('Choose a projected working CRS whose units are metres.')
+            return requested
+        crs = source.sourceCrs()
+        if not crs.isValid():
+            raise QgsProcessingException('The description point layer must have a valid CRS.')
+        if not crs.isGeographic() and crs.mapUnits() == DISTANCE_METERS:
+            return crs
+        extent = source.sourceExtent()
+        transform = QgsCoordinateTransform(crs, QgsCoordinateReferenceSystem('EPSG:4326'), context.transformContext())
+        extent = transform.transformBoundingBox(extent)
+        if (not all(math.isfinite(v) for v in (extent.xMinimum(), extent.yMinimum(), extent.xMaximum(), extent.yMaximum()))
+                or extent.width() > 6 or extent.height() > 6
+                or extent.yMinimum() < -80 or extent.yMaximum() > 84):
+            raise QgsProcessingException('Automatic working CRS needs a local survey area. Choose a suitable projected CRS in metres.')
+        centre = extent.center()
+        zone = max(1, min(60, int((centre.x() + 180) // 6) + 1))
+        return QgsCoordinateReferenceSystem(f'EPSG:{(32600 if centre.y() >= 0 else 32700) + zone}')
+
+    @staticmethod
+    def _optional_field(source, selected, automatic):
+        names = {field.name().casefold(): field.name() for field in source.fields()}
+        if selected and selected.casefold() not in names:
+            raise QgsProcessingException(f'Field {selected} does not exist in the text layer.')
+        return names.get((selected or automatic).casefold())
+
+    def _read_text(self, source, text_field, rotation_field, alignment_field, transform, feedback):
+        records, lines, index, size = {}, [], QgsSpatialIndex(), 0
+        for number, feature in enumerate(source.getFeatures()):
+            self._cancel(feedback)
+            if number >= MAX_FEATURES:
+                raise QgsProcessingException('Too many text features; use a smaller selection or survey area.')
+            key = feature.id()
+            text = _string(feature[text_field]).replace('\r\n', '\n').replace('\r', '\n')
+            size += len(text)
+            if size > MAX_TEXT_CHARS:
+                raise QgsProcessingException('Too much annotation text; use a smaller selection.')
+            record = {'geometry': QgsGeometry(), 'text': text, 'rotation': 0.0, 'error': ''}
+            records[key] = record
+            try:
+                geometry = feature.geometry()
+                if geometry.isNull() or geometry.isEmpty():
+                    raise ValueError('Missing text anchor geometry.')
+                points = geometry.asMultiPoint() if geometry.isMultipart() else [geometry.asPoint()]
+                if len(points) != 1:
+                    raise ValueError('Text has several anchor points.')
+                original = points[0]
+                if not all(math.isfinite(v) and abs(v) <= 1e12 for v in (original.x(), original.y())):
+                    raise ValueError('Unsafe text anchor coordinates.')
+                point = transform.transform(original)
+                if not all(math.isfinite(v) and abs(v) <= 1e12 for v in (point.x(), point.y())):
+                    raise ValueError('Non-finite text anchor.')
+                record['geometry'] = QgsGeometry.fromPointXY(original)
+                if not text.strip() or '\x00' in text:
+                    raise ValueError('Empty text or embedded NUL character.')
+                rotation = feature[rotation_field] if rotation_field else 0.0
+                if not _present(rotation):
+                    rotation = 0.0
+                rotation = float(rotation)
+                if not math.isfinite(rotation):
+                    raise ValueError('Invalid text rotation.')
+                record['rotation'] = rotation
+                # Transform the local text baseline along with its anchor; a
+                # projected CRS can rotate the axes of geographic source data.
+                step = 1e-5 if source.sourceCrs().isGeographic() else 1.0
+                angle = math.radians(rotation)
+                along = transform.transform(QgsPointXY(original.x() + step * math.cos(angle),
+                                                       original.y() + step * math.sin(angle)))
+                working_angle = math.degrees(math.atan2(along.y() - point.y(), along.x() - point.x()))
+                alignment = _string(feature[alignment_field]) if alignment_field else ''
+                lines.append(TextLine(key, point.x(), point.y(), text, working_angle, alignment))
+                index.addFeature(_point_feature(key, point))
+            except Exception as exc:  # retain an explicit review row, never drop text
+                record['error'] = str(exc) if isinstance(exc, ValueError) else 'Text anchor could not be transformed or read.'
+        if not records:
+            raise QgsProcessingException('The description point input contains no features.')
+        return records, lines, index
+
+    def _pairs(self, lines, index, gap, feedback, nearest=False):
+        count = 0
+        for line in lines:
+            self._cancel(feedback)
+            point = QgsPointXY(line.x, line.y)
+            candidates = (index.nearestNeighbor(point, 13) if nearest else
+                          index.intersects(QgsRectangle(line.x - gap, line.y - gap, line.x + gap, line.y + gap)))
+            for other in candidates:
+                if other == line.key or (not nearest and other < line.key):
+                    continue
+                count += 1
+                if count > MAX_PAIRS:
+                    raise QgsProcessingException('Too many competing text neighbors. Reduce the line-gap limit or select a smaller area.')
+                yield line.key, other
+
+    def _read_leaders(self, layers, working_crs, output_crs, text_index, positions, tolerance, context, feedback):
+        leaders, anchored = [], set()
+        for layer_number, layer in enumerate(layers, 1):
+            if not layer.crs().isValid():
+                raise QgsProcessingException(f'Leader layer {layer.name()} has no valid CRS.')
+            transform = QgsCoordinateTransform(layer.crs(), working_crs, context.transformContext())
+            to_output = QgsCoordinateTransform(layer.crs(), output_crs, context.transformContext())
+            for feature in layer.getFeatures():
+                self._cancel(feedback)
+                original = feature.geometry()
+                geometry_error = ''
+                if original.isNull() or original.isEmpty():
+                    parts = [None]
+                elif not _safe_coordinates(original, lambda: self._cancel(feedback)):
+                    parts = [None]
+                    geometry_error = 'Unsafe leader coordinates; output geometry omitted.'
+                else:
+                    if original.type() != GEOMETRY_LINE:
+                        raise QgsProcessingException('Leader inputs must be line layers.')
+                    original = QgsGeometry(original)
+                    original.convertToStraightSegment()
+                    parts = original.asMultiPolyline() if original.isMultipart() else [original.asPolyline()]
+                for part_number, part in enumerate(parts or [None], 1):
+                    if len(leaders) >= MAX_FEATURES:
+                        raise QgsProcessingException('Too many leader parts; use a smaller area.')
+                    row = {'ref': f'L{layer_number}:{feature.id()}:{part_number}', 'layer': layer.name(), 'layer_id': layer.id(),
+                           'fid': feature.id(), 'part': part_number, 'geometry': QgsGeometry(),
+                           'ends': [], 'near': [], 'error': ''}
+                    leaders.append(row)
+                    try:
+                        if not part or len(part) < 2:
+                            raise ValueError(geometry_error or 'Missing or empty leader geometry.')
+                        output = QgsGeometry.fromPolylineXY(part)
+                        _transform_geometry(output, to_output, lambda: self._cancel(feedback))
+                        row['geometry'] = output
+                        ends = [transform.transform(part[0]), transform.transform(part[-1])]
+                        if not all(math.isfinite(v) for p in ends for v in (p.x(), p.y())):
+                            raise ValueError('Non-finite leader endpoint.')
+                        if ends[0].distance(ends[1]) <= 1e-6:
+                            raise ValueError('Closed leader or arrowhead; no distinct text and target ends.')
+                        row['ends'] = ends
+                        for point in ends:
+                            radius = max(tolerance, 1e-6)
+                            candidates = text_index.intersects(QgsRectangle(point.x() - radius, point.y() - radius,
+                                                                            point.x() + radius, point.y() + radius))
+                            close = {key: point.distance(positions[key]) for key in candidates
+                                     if point.distance(positions[key]) <= radius}
+                            row['near'].append(close)
+                        # A seed is only evidence when one end has one distinct
+                        # text position. Ambiguous seeds do not strengthen groups.
+                        active = [close for close in row['near'] if close]
+                        if len(active) == 1 and len(active[0]) == 1:
+                            anchored.update(active[0])
+                    except QgsProcessingException:
+                        raise
+                    except Exception as exc:
+                        row['error'] = str(exc) if isinstance(exc, ValueError) else 'Leader geometry could not be transformed.'
+        return leaders, anchored
+
+    def _read_polygons(self, layers, working_crs, output_crs, context, feedback):
+        fields, maps, records, index = QgsFields(), [], [], QgsSpatialIndex()
+        # Preserve attributes, including case/type conflicts and existing soil
+        # descriptions. Source fid columns must not become a sink's primary key.
+        for layer in layers:
+            mapping = []
+            for field in layer.fields():
+                name = 'source_fid' if field.name().casefold() == 'fid' else field.name()
+                existing = next((i for i, output in enumerate(fields)
+                                 if i not in mapping and output.name().casefold() == name.casefold()
+                                 and output.type() == field.type()), None)
+                if existing is None:
+                    name = _new_field(fields, name, field.type())
+                    existing = fields.indexFromName(name)
+                mapping.append(existing)
+            maps.append(mapping)
+        for layer_number, (layer, mapping) in enumerate(zip(layers, maps), 1):
+            if not layer.crs().isValid():
+                raise QgsProcessingException(f'Polygon layer {layer.name()} has no valid CRS.')
+            transform = QgsCoordinateTransform(layer.crs(), working_crs, context.transformContext())
+            to_output = QgsCoordinateTransform(layer.crs(), output_crs, context.transformContext())
+            for feature in layer.getFeatures():
+                self._cancel(feedback)
+                if len(records) >= MAX_FEATURES:
+                    raise QgsProcessingException('Too many polygons; use a smaller area.')
+                attrs = [None] * len(fields)
+                for source_i, dest_i in enumerate(mapping):
+                    attrs[dest_i] = feature[source_i]
+                row = {'ref': f'P{layer_number}:{feature.id()}', 'layer': layer.name(), 'layer_id': layer.id(), 'fid': feature.id(),
+                       'attrs': attrs, 'geometry': QgsGeometry(), 'search': QgsGeometry(),
+                       'boundary': QgsGeometry(), 'error': '', 'blocks': set(), 'review': set(), 'leaders': set()}
+                records.append(row)
+                try:
+                    original = feature.geometry()
+                    if original.isNull() or original.isEmpty():
+                        raise ValueError('Missing polygon geometry.')
+                    if original.type() != GEOMETRY_POLYGON:
+                        raise QgsProcessingException('Soil inputs must be polygon layers.')
+                    if not _safe_coordinates(original, lambda: self._cancel(feedback)):
+                        raise ValueError('Unsafe polygon coordinates; output geometry omitted.')
+                    output = QgsGeometry(original)
+                    output.convertToStraightSegment()
+                    _transform_geometry(output, to_output, lambda: self._cancel(feedback))
+                    output.convertToMultiType()
+                    row['geometry'] = output
+                    working = QgsGeometry(original)
+                    working.convertToStraightSegment()
+                    _transform_geometry(working, transform, lambda: self._cancel(feedback))
+                    if not working.isGeosValid():
+                        row['error'] = 'Invalid polygon; repaired only for candidate search. Review geometry and match.'
+                        working = working.makeValid()
+                        working = QgsGeometry.collectGeometry(_polygon_parts(working))
+                    if working.isEmpty() or working.isNull() or working.type() != GEOMETRY_POLYGON or not working.isGeosValid():
+                        raise ValueError('Polygon cannot be used for reliable spatial matching.')
+                    row['search'] = working
+                    row['boundary'] = QgsGeometry(working.constGet().boundary())
+                    indexed = QgsFeature(len(records) - 1)
+                    indexed.setGeometry(working)
+                    index.addFeature(indexed)
+                except QgsProcessingException:
+                    raise
+                except Exception as exc:
+                    row['error'] = str(exc) if isinstance(exc, ValueError) else 'Polygon geometry could not be transformed.'
+        return fields, records, index
+
+    def _associate(self, leaders, blocks, polygons, polygon_index, boundary_tolerance, feedback):
+        memberships = {key: i for i, block in enumerate(blocks) for key in block.members}
+        for leader in leaders:
+            self._cancel(feedback)
+            leader.update(status='unmatched', reason=leader['error'], block=None, candidate_blocks=[],
+                          polygons=[], gap=None, target_gap=None)
+            if leader['error']:
+                leader['status'] = 'review'
+                continue
+            endpoints = [{memberships[key] for key in close} for close in leader['near']]
+            leader['candidate_blocks'] = sorted(set().union(*endpoints))
+            if not any(endpoints):
+                leader['reason'] = 'Neither endpoint is close to a text anchor.'
+                continue
+            if all(endpoints) or max(map(len, endpoints)) > 1:
+                leader.update(status='review', reason='Competing text blocks or text near both leader ends.')
+                continue
+            text_end = 0 if endpoints[0] else 1
+            block_id = next(iter(endpoints[text_end]))
+            leader['block'] = block_id
+            leader['gap'] = min(leader['near'][text_end].values())
+            target = leader['ends'][1 - text_end]
+            geometry = QgsGeometry.fromPointXY(target)
+            radius = max(boundary_tolerance, 1e-6)
+            ids = polygon_index.intersects(QgsRectangle(target.x() - radius, target.y() - radius,
+                                                        target.x() + radius, target.y() + radius))
+            inside, nearby = [], []
+            for key in ids:
+                polygon = polygons[key]
+                search = polygon['search']
+                if search.contains(geometry):
+                    inside.append(key)
+                elif search.distance(geometry) <= radius:
+                    nearby.append(key)
+            candidates = sorted(set(inside + nearby))
+            leader['polygons'] = candidates
+            if not candidates:
+                leader['reason'] = ('No polygon layers selected.' if not polygons else
+                                    'Target is outside the selected soil polygons; no nearest-polygon assignment made.')
+                continue
+            reasons = []
+            if len(inside) != 1 or nearby:
+                reasons.append('Target overlaps polygons or lies on/near a polygon boundary.')
+            if len(inside) == 1:
+                edge_distance = polygons[inside[0]]['boundary'].distance(geometry)
+                leader['target_gap'] = edge_distance
+                if edge_distance <= boundary_tolerance:
+                    reasons.append('Target is too close to the polygon boundary.')
+            if blocks[block_id].status in {'review', 'layout_only'}:
+                reasons.append('Text assembly lacks unambiguous leader support or requires review.')
+            if any(polygons[key]['error'] for key in candidates):
+                reasons.append('Polygon geometry requires review.')
+            leader['status'] = 'review' if reasons else 'matched'
+            leader['reason'] = ' '.join(reasons) if reasons else 'One text block and one polygon containing the opposite endpoint.'
+            for key in candidates:
+                polygons[key]['blocks'].add(block_id)
+                polygons[key]['leaders'].add(leader['ref'])
+                if reasons:
+                    polygons[key]['review'].add(leader['reason'])
+
+    def _sink(self, parameters, name, fields, geometry_type, crs, context):
+        destination = self.parameterAsOutputLayer(parameters, name, context)
+        if destination.lower().split('|', 1)[0].endswith(('.shp', '.dbf')):
+            raise QgsProcessingException('Choose a GeoPackage or temporary output: Shapefile/DBF would truncate description text and field names.')
+        sink, destination = self.parameterAsSink(parameters, name, context, fields, geometry_type, crs)
+        if sink is None:
+            raise QgsProcessingException(f'Could not create output {name}. Choose an output destination.')
+        return sink, destination
+
+    def _validate_destinations(self, parameters, context, input_layers, output_names):
+        def file_key(uri, provider='ogr'):
+            decoded = QgsProviderRegistry.instance().decodeUri(provider, uri)
+            path = decoded.get('path')
+            if not path or str(path).startswith(('memory:', 'postgres:', '/vsi')):
+                return None
+            return os.path.normcase(os.path.realpath(os.path.abspath(str(path))))
+
+        inputs = {file_key(layer.source(), layer.providerType()) for layer in input_layers if layer is not None}
+        destinations = set()
+        for name in output_names:
+            destination = self.parameterAsOutputLayer(parameters, name, context)
+            if destination.lower().split('|', 1)[0].endswith(('.shp', '.dbf')):
+                raise QgsProcessingException('Choose a GeoPackage or temporary output: Shapefile/DBF would truncate description text and field names.')
+            key = file_key(destination)
+            if key is None:
+                continue
+            if key in inputs:
+                raise QgsProcessingException('An output points to an input data file. Choose a new GeoPackage to preserve the source layers.')
+            if key in destinations:
+                raise QgsProcessingException('Choose separate files or temporary layers for each output to avoid replacing another result.')
+            destinations.add(key)
+
+    @staticmethod
+    def _write(sink, fields, attributes, geometry):
+        feature = QgsFeature(fields)
+        feature.setAttributes(attributes)
+        if geometry and not geometry.isNull():
+            feature.setGeometry(geometry)
+        if not sink.addFeature(feature):
+            raise QgsProcessingException('Could not write an association output feature: ' + sink.lastError())
+
+    def processAlgorithm(self, parameters, context, feedback):
+        self._cancel(feedback)
+        source = self.parameterAsSource(parameters, self.TEXT, context)
+        if source is None:
+            raise QgsProcessingException(self.invalidSourceError(parameters, self.TEXT))
+        if not source.sourceCrs().isValid():
+            raise QgsProcessingException('The description point layer must have a valid CRS.')
+        text_field = self.parameterAsString(parameters, self.TEXT_FIELD, context)
+        if text_field not in source.fields().names():
+            raise QgsProcessingException('Select the field containing the description text.')
+        rotation = self._optional_field(source, self.parameterAsString(parameters, self.ROTATION_FIELD, context), 'label_rotation')
+        alignment = self._optional_field(source, self.parameterAsString(parameters, self.ALIGNMENT_FIELD, context), 'label_alignment')
+        if not rotation:
+            feedback.pushInfo('No rotation field: text is assumed horizontal in its source CRS.')
+        if not alignment:
+            feedback.pushInfo('No alignment field: text grouping uses anchor positions without justification metadata.')
+        working_crs = self._working_crs(source, self.parameterAsCrs(parameters, self.WORKING_CRS, context), context)
+        output_crs = source.sourceCrs()
+        feedback.pushInfo('Measurement CRS: ' + working_crs.authid() + '. Outputs use the description point CRS.')
+        transform = QgsCoordinateTransform(output_crs, working_crs, context.transformContext())
+        records, lines, text_index = self._read_text(source, text_field, rotation, alignment, transform, feedback)
+        positions = {line.key: QgsPointXY(line.x, line.y) for line in lines}
+        feedback.setProgress(15)
+        gap = self.parameterAsDouble(parameters, self.MAX_LINE_GAP, context)
+        anchor_tolerance = self.parameterAsDouble(parameters, self.ANCHOR_TOLERANCE, context)
+        boundary_tolerance = self.parameterAsDouble(parameters, self.BOUNDARY_TOLERANCE, context)
+        if any(not math.isfinite(value) or value < 0 for value in (gap, anchor_tolerance, boundary_tolerance)):
+            raise QgsProcessingException('Tolerances must be finite, non-negative distances in metres.')
+        reliable_gap = True
+        if gap == 0:
+            gap, reliable_gap, message = estimate_line_gap(lines, self._pairs(lines, text_index, 0, feedback, nearest=True))
+            feedback.pushInfo(message)
+        leader_layers = self.parameterAsLayerList(parameters, self.LEADERS, context)
+        polygon_layers = self.parameterAsLayerList(parameters, self.POLYGONS, context)
+        output_names = [self.OUTPUT_LABELS]
+        if leader_layers:
+            output_names.append(self.OUTPUT_CHECKS)
+        if polygon_layers:
+            output_names.append(self.OUTPUT_POLYGONS)
+        self._validate_destinations(parameters, context,
+                                    [self.parameterAsVectorLayer(parameters, self.TEXT, context)] + leader_layers + polygon_layers,
+                                    output_names)
+        leaders, anchored = self._read_leaders(leader_layers, working_crs, output_crs, text_index,
+                                              positions, anchor_tolerance, context, feedback)
+        blocks = assemble_blocks(lines, self._pairs(lines, text_index, max(gap, 1e-6), feedback), gap,
+                                 anchored, reliable_gap, lambda: self._cancel(feedback))
+        for key, record in records.items():
+            if record['error']:
+                blocks.append(TextBlock((key,), key, record['text'], 'review', record['error']))
+        blocks.sort(key=lambda block: min(block.members))
+        feedback.setProgress(40)
+        polygon_fields, polygons, polygon_index = self._read_polygons(
+            polygon_layers, working_crs, output_crs, context, feedback)
+        feedback.setProgress(65)
+        self._associate(leaders, blocks, polygons, polygon_index, boundary_tolerance, feedback)
+        result = self._outputs(parameters, context, feedback, source, records, blocks, leaders, polygons,
+                               polygon_fields, output_crs, bool(polygon_layers), bool(leader_layers))
+        feedback.pushInfo('Text blocks: ' + ', '.join(f'{name}={count}' for name, count in sorted(Counter(b.status for b in blocks).items())))
+        feedback.pushInfo('Leader checks: ' + ', '.join(f'{name}={count}' for name, count in sorted(Counter(row['status'] for row in leaders).items())))
+        feedback.pushWarning('Experimental: statuses describe geometric evidence, not verified soil interpretation. Review candidate_text and reasons before use.')
+        feedback.setProgress(100)
+        return result
+
+    def postProcessAlgorithm(self, context, feedback):
+        # QgsProcessingAlgorithm.run() destroys its execution clone before the
+        # GUI loads outputs. C++ owns the postprocessor, but its Python override
+        # also needs a live wrapper. Retain it on the final (main-thread) context,
+        # not the temporary background context or a shared singleton.
+        processor = getattr(self, '_label_postprocessor', None)
+        if processor is not None:
+            if not hasattr(context, '_subsea_annotation_postprocessors'):
+                context._subsea_annotation_postprocessors = []
+            context._subsea_annotation_postprocessors.append(processor)
+        return {}
+
+    def _outputs(self, parameters, context, feedback, source, records, blocks, leaders, polygons,
+                 polygon_fields, crs, have_polygons, have_leaders):
+        result = {}
+        block_names = {i: f'B{i + 1:06d}' for i in range(len(blocks))}
+        block_links = defaultdict(list)
+        for leader in leaders:
+            for block_id in leader['candidate_blocks']:
+                block_links[block_id].append(leader)
+        fields = _fields([(name, FIELD_TYPE_STRING) for name in
+                          ('block_id', 'assembled_text', 'candidate_text', 'text_status', 'text_reason',
+                           'target_status', 'polygon_refs', 'source_layer', 'source_fids')]
+                         + [('fragment_count', FIELD_TYPE_INT), ('label_rotation', FIELD_TYPE_DOUBLE)])
+        sink, dest = self._sink(parameters, self.OUTPUT_LABELS, fields, WKB_POINT, crs, context)
+        result[self.OUTPUT_LABELS] = dest
+        for i, block in enumerate(blocks):
+            self._cancel(feedback)
+            links = block_links[i]
+            refs = sorted({polygons[key]['ref'] for link in links for key in link['polygons']})
+            target_status = ('not_requested' if not have_polygons else 'unmatched')
+            if any(link['status'] == 'review' for link in links):
+                target_status = 'review'
+            elif any(link['status'] == 'matched' for link in links):
+                target_status = 'matched' if len(refs) == 1 else 'multiple_targets'
+                if any(link['status'] != 'matched' for link in links):
+                    target_status = 'partial'
+            record = records[block.anchor]
+            self._write(sink, fields, [block_names[i], block.text if block.status != 'review' else None,
+                                      block.text, block.status, block.reason, target_status, _json(refs),
+                                      source.sourceName(), _json(list(block.members)), len(block.members), record['rotation']],
+                        record['geometry'])
+        if context.willLoadLayerOnCompletion(dest):
+            # Retain the Python wrapper until Processing has applied it.
+            self._label_postprocessor = _LabelPoints()
+            context.layerToLoadOnCompletionDetails(dest).setPostProcessor(self._label_postprocessor)
+        if have_polygons:
+            specification = [(name, FIELD_TYPE_STRING) for name in
+                             ('soil_description', 'candidate_text', 'description_status', 'match_reason',
+                              'polygon_ref', 'source_layer', 'source_layer_id', 'source_feature_id', 'block_ids', 'leader_refs')]
+            generated = [_new_field(polygon_fields, name, kind) for name, kind in specification]
+            feedback.pushInfo('Polygon result fields: ' + ', '.join(generated))
+            output_type = QgsWkbTypes.MultiPolygon
+            if any(QgsWkbTypes.hasZ(row['geometry'].wkbType()) for row in polygons):
+                output_type = QgsWkbTypes.addZ(output_type)
+            if any(QgsWkbTypes.hasM(row['geometry'].wkbType()) for row in polygons):
+                output_type = QgsWkbTypes.addM(output_type)
+            sink, dest = self._sink(parameters, self.OUTPUT_POLYGONS, polygon_fields, output_type, crs, context)
+            result[self.OUTPUT_POLYGONS] = dest
+            statuses = Counter()
+            for polygon in polygons:
+                self._cancel(feedback)
+                ids = sorted(polygon['blocks'])
+                unique = {}
+                for i in ids:
+                    unique.setdefault(normalized_text(blocks[i].text), blocks[i].text)
+                candidate = '\n\n'.join(unique.values()) or None
+                notes = sorted(polygon['review'])
+                if polygon['error']:
+                    notes.append(polygon['error'])
+                status = 'review' if notes else ('multiple_descriptions' if len(unique) > 1 else 'matched' if ids else 'unmatched')
+                if status == 'multiple_descriptions':
+                    notes.append('Different descriptions point to this polygon; review the candidate blocks.')
+                elif status == 'unmatched':
+                    notes.append('No accepted leader association; no nearest-label guess made.')
+                statuses[status] += 1
+                self._write(sink, polygon_fields, polygon['attrs'] + [candidate if status == 'matched' else None,
+                            candidate, status, ' '.join(notes), polygon['ref'], polygon['layer'], polygon['layer_id'], str(polygon['fid']),
+                            _json([block_names[i] for i in ids]), _json(sorted(polygon['leaders']))], polygon['geometry'])
+            feedback.pushInfo('Polygon results: ' + ', '.join(f'{name}={count}' for name, count in sorted(statuses.items())))
+        if have_leaders:
+            fields = _fields([(name, FIELD_TYPE_STRING) for name in
+                              ('leader_ref', 'source_layer', 'source_layer_id', 'source_feature_id', 'block_id', 'candidate_block_ids',
+                               'polygon_refs', 'match_status', 'match_reason')]
+                             + [('part_number', FIELD_TYPE_INT), ('anchor_gap_m', FIELD_TYPE_DOUBLE), ('boundary_gap_m', FIELD_TYPE_DOUBLE)])
+            sink, dest = self._sink(parameters, self.OUTPUT_CHECKS, fields, WKB_LINESTRING, crs, context)
+            result[self.OUTPUT_CHECKS] = dest
+            for row in leaders:
+                self._cancel(feedback)
+                self._write(sink, fields, [row['ref'], row['layer'], row['layer_id'], str(row['fid']), block_names.get(row['block']),
+                            _json([block_names[i] for i in row['candidate_blocks']]),
+                            _json([polygons[key]['ref'] for key in row['polygons']]), row['status'], row['reason'],
+                            row['part'], row['gap'], row['target_gap']], row['geometry'])
+        return result

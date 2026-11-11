@@ -100,6 +100,7 @@ class SubseaCableProcessingProvider(QgsProcessingProvider):
         safe_add('merge_mbes_rasters_algorithm', 'MergeMBESRastersAlgorithm')
 
         # --- Other Tools ---
+        safe_add('attach_seabed_descriptions_algorithm', 'AttachSeabedDescriptionsAlgorithm')
         safe_add('dynamic_buffer_lay_corridor_algorithm', 'DynamicBufferLayCorridorAlgorithm')
         safe_add('export_kp_section_chartlets_algorithm', 'ExportKPSectionChartletsAlgorithm')
         safe_add('extract_lines_intersecting_polygons_algorithm', 'ExtractLinesIntersectingPolygonsAlgorithm')
