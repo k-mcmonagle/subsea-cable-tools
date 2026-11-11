@@ -4,6 +4,7 @@ from collections import Counter, defaultdict
 import json
 import math
 import os
+import re
 
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
@@ -16,7 +17,7 @@ from qgis.core import (
     QgsRectangle, QgsSpatialIndex, QgsVectorLayerSimpleLabeling,
     QgsPalLayerSettings, QgsTextFormat, QgsWkbTypes, QgsCategorizedSymbolRenderer,
     QgsMarkerSymbol, QgsRendererCategory, QgsProperty,
-    QgsProviderRegistry,
+    QgsProviderRegistry, Qgis, QgsProcessingParameterDefinition,
 )
 
 from .algorithm_base import SubseaCableAlgorithm
@@ -169,8 +170,8 @@ class AttachSeabedDescriptionsAlgorithm(SubseaCableAlgorithm):
         self.addParameter(QgsProcessingParameterFeatureSource(
             self.TEXT, self.tr('Description text points'), [QgsProcessing.TypeVectorPoint]))
         self.addParameter(QgsProcessingParameterField(
-            self.TEXT_FIELD, self.tr('Description text field'), defaultValue='label_text',
-            parentLayerParameterName=self.TEXT, type=PROCESSING_FIELD_ANY))
+            self.TEXT_FIELD, self.tr('Text field (leave empty to detect automatically)'),
+            parentLayerParameterName=self.TEXT, type=PROCESSING_FIELD_ANY, optional=True))
         self.addParameter(QgsProcessingParameterField(
             self.ROTATION_FIELD, self.tr('Text rotation field (optional; auto-detect label_rotation, counter-clockwise degrees)'),
             parentLayerParameterName=self.TEXT, type=PROCESSING_FIELD_NUMERIC, optional=True))
@@ -193,7 +194,7 @@ class AttachSeabedDescriptionsAlgorithm(SubseaCableAlgorithm):
             self.BOUNDARY_TOLERANCE, self.tr('Flag targets this close to polygon boundaries for review (metres)'),
             type=PROCESSING_NUMBER_DOUBLE, defaultValue=0.5, minValue=0))
         self.addParameter(QgsProcessingParameterCrs(
-            self.WORKING_CRS, self.tr('Projected CRS for measurements (metres; optional, automatic for local data)'), optional=True))
+            self.WORKING_CRS, self.tr('Measurement CRS preference (optional; geographic CRSs handled automatically)'), optional=True))
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUTPUT_LABELS, self.tr('Assembled description points'), type=QgsProcessing.TypeVectorPoint))
         self.addParameter(QgsProcessingParameterFeatureSink(
@@ -202,11 +203,24 @@ class AttachSeabedDescriptionsAlgorithm(SubseaCableAlgorithm):
         self.addParameter(QgsProcessingParameterFeatureSink(
             self.OUTPUT_CHECKS, self.tr('Leader association checks'),
             type=QgsProcessing.TypeVectorLine, optional=True, createByDefault=True))
+        try:
+            advanced = Qgis.ProcessingParameterFlag.Advanced
+        except AttributeError:
+            advanced = QgsProcessingParameterDefinition.FlagAdvanced
+        for name in (self.ROTATION_FIELD, self.ALIGNMENT_FIELD, self.MAX_LINE_GAP,
+                     self.ANCHOR_TOLERANCE, self.BOUNDARY_TOLERANCE, self.WORKING_CRS):
+            parameter = self.parameterDefinition(name)
+            parameter.setFlags(parameter.flags() | advanced)
 
     def shortHelpString(self):
-        return '''<p>Optional post-import tool. Select the imported description points and their
-text field (usually <b>label_text</b>). Leaders and soil polygons are optional: leave them empty
-to create one label point per proposed text block. Source layers are never edited.</p>
+        return '''<p><b>Quick start:</b> select the description point layer and run. The text field
+is detected automatically for normal MDB imports. Leaders and soil polygons are optional: add
+them to attach descriptions to polygons, or leave them empty to assemble labels only.
+Source layers are never edited. Inputs may use geographic coordinates (such as EPSG:4326),
+projected coordinates or different CRSs; no manual reprojection is needed for local surveys.</p>
+<p>If several possible text fields are present, choose the correct field explicitly. Rotation,
+alignment, spacing, distance tolerances and a CRS preference are under <b>Advanced parameters</b>.
+The normal defaults require no CRS selection.</p>
 <p>Aligned lines with compatible rotations, alignment and consistent spacing are assembled in
 reading order, with newlines preserved. Zero line gap estimates a limit from repeated local
 spacing; small or mixed-scale samples require review or an explicit limit. The rule is geometric,
@@ -229,9 +243,12 @@ association. Only matched polygons receive <b>soil_description</b>; proposals re
 attributes are copied; generated names gain a suffix if they would overwrite an existing field.
 The source layer, feature IDs and block IDs permit tracing results back to the input.</p>
 <p>The leader-check layer explains each association, including rejected leaders. Use it with
-the original annotation layers to review results. All distances are measured in a projected
-metre CRS, not degrees. Automatic CRS selection requires local data; specify a suitable CRS
-for larger areas. Outputs use the text layer's CRS. Select only relevant soil and leader layers;
+the original annotation layers to review results. The tool measures internally in metres and
+keeps outputs in the text layer's original CRS. If a geographic or non-metre CRS preference is
+selected, a local metre-based CRS is chosen automatically; the preference never relabels input
+coordinates or changes the output CRS. Automatic selection requires local data; for larger
+areas, use a suitable projected metre CRS under Advanced parameters or process smaller sections.
+Select only relevant soil and leader layers;
 this tool does not classify soil, infer ground conditions, or change MDB import behaviour.
 Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the long text and field names.</p>'''
 
@@ -242,9 +259,10 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
 
     @staticmethod
     def _working_crs(source, requested, context):
-        if requested.isValid():
-            if requested.isGeographic() or requested.mapUnits() != DISTANCE_METERS:
-                raise QgsProcessingException('Choose a projected working CRS whose units are metres.')
+        # A geographic preference is common when the dialog inherits a map CRS.
+        # It must not prevent geographic input from following the automatic path.
+        # All geometry still gets transformed from its actual source CRS.
+        if requested.isValid() and not requested.isGeographic() and requested.mapUnits() == DISTANCE_METERS:
             return requested
         crs = source.sourceCrs()
         if not crs.isValid():
@@ -257,10 +275,38 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
         if (not all(math.isfinite(v) for v in (extent.xMinimum(), extent.yMinimum(), extent.xMaximum(), extent.yMaximum()))
                 or extent.width() > 6 or extent.height() > 6
                 or extent.yMinimum() < -80 or extent.yMaximum() > 84):
-            raise QgsProcessingException('Automatic working CRS needs a local survey area. Choose a suitable projected CRS in metres.')
+            raise QgsProcessingException('This area is too large or outside the supported latitude range for automatic measurement CRS selection. '
+                                         'Process smaller sections, or choose a suitable projected metre CRS under Advanced parameters.')
         centre = extent.center()
         zone = max(1, min(60, int((centre.x() + 180) // 6) + 1))
         return QgsCoordinateReferenceSystem(f'EPSG:{(32600 if centre.y() >= 0 else 32700) + zone}')
+
+    @staticmethod
+    def _text_field(source, selected):
+        names = {field.name().casefold(): field.name() for field in source.fields()}
+        if selected:
+            if selected.casefold() not in names:
+                raise QgsProcessingException(f'Text field {selected} does not exist in the description layer.')
+            return names[selected.casefold()]
+        # The MDB importer prefixes generated fields on collisions. Do not guess
+        # whether the source label_text or a generated gm_label_text is intended.
+        candidates = [name for key, name in names.items()
+                      if key == 'label_text' or re.fullmatch(r'gm_label_text(?:_\d+)?', key)]
+        if not candidates:
+            if 'assembled_text' in names:
+                return names['assembled_text']  # never auto-select review-only candidate_text
+            candidates = [names[key] for key in ('text', 'description', 'label', 'notes') if key in names]
+        if not candidates:
+            metadata = {'source', 'source_layer', 'source_layer_id', 'geometry_source', 'fid', 'id', 'id1',
+                        'candidate_text', 'text_status', 'text_reason', 'target_status', 'source_fids', 'polygon_refs'}
+            candidates = [field.name() for field in source.fields()
+                          if field.type() == FIELD_TYPE_STRING and field.name().casefold() not in metadata]
+        if len(candidates) == 1:
+            return candidates[0]
+        if candidates:
+            raise QgsProcessingException('Several possible text fields were found: ' + ', '.join(candidates)
+                                         + '. Choose the description text field explicitly.')
+        raise QgsProcessingException('No description text field could be detected. Choose the text field explicitly.')
 
     @staticmethod
     def _optional_field(source, selected, automatic):
@@ -568,17 +614,19 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
             raise QgsProcessingException(self.invalidSourceError(parameters, self.TEXT))
         if not source.sourceCrs().isValid():
             raise QgsProcessingException('The description point layer must have a valid CRS.')
-        text_field = self.parameterAsString(parameters, self.TEXT_FIELD, context)
-        if text_field not in source.fields().names():
-            raise QgsProcessingException('Select the field containing the description text.')
+        text_field = self._text_field(source, self.parameterAsString(parameters, self.TEXT_FIELD, context))
+        feedback.pushInfo('Description text field: ' + text_field)
         rotation = self._optional_field(source, self.parameterAsString(parameters, self.ROTATION_FIELD, context), 'label_rotation')
         alignment = self._optional_field(source, self.parameterAsString(parameters, self.ALIGNMENT_FIELD, context), 'label_alignment')
         if not rotation:
             feedback.pushInfo('No rotation field: text is assumed horizontal in its source CRS.')
         if not alignment:
             feedback.pushInfo('No alignment field: text grouping uses anchor positions without justification metadata.')
-        working_crs = self._working_crs(source, self.parameterAsCrs(parameters, self.WORKING_CRS, context), context)
+        preference = self.parameterAsCrs(parameters, self.WORKING_CRS, context)
+        working_crs = self._working_crs(source, preference, context)
         output_crs = source.sourceCrs()
+        if preference.isValid() and (preference.isGeographic() or preference.mapUnits() != DISTANCE_METERS):
+            feedback.pushInfo('The selected CRS preference does not use projected metres; a measurement CRS was chosen automatically.')
         feedback.pushInfo('Measurement CRS: ' + working_crs.authid() + '. Outputs use the description point CRS.')
         transform = QgsCoordinateTransform(output_crs, working_crs, context.transformContext())
         records, lines, text_index = self._read_text(source, text_field, rotation, alignment, transform, feedback)

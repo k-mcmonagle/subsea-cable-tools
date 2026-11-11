@@ -82,10 +82,11 @@ Find these in the QGIS Processing Toolbox under **Subsea Cable Tools**.
 ## Seabed description assembly (experimental)
 
 After importing an MDB, open **Other Tools → Attach descriptions to seabed polygons (experimental)**.
-Select the description point layer and its text field (normally `label_text`). Select the relevant
-leader lines and soil polygon layers if you want polygon descriptions; both are optional for
-creating assembled labels alone. Start with automatic line spacing, then inspect the results at
-the drawing scale. Use GeoPackage or temporary outputs to preserve full descriptions.
+Select the description point layer and run to create assembled labels. The text field is detected
+automatically for normal MDB imports; select it explicitly if several possible fields are present.
+Add the relevant leader lines and soil polygon layers if you also want polygon descriptions.
+Inspect the results at the drawing scale. Use GeoPackage or temporary outputs to preserve full
+descriptions. Rotation, alignment, spacing and distance tolerances are under **Advanced parameters**.
 
 The tool creates copies and leaves the imported layers unchanged:
 
@@ -104,8 +105,12 @@ The tool creates copies and leaves the imported layers unchanged:
 Certainty describes geometric evidence, not confirmation of the soil interpretation. The tool
 never assigns a polygon merely because it is nearest. Ambiguous text grouping, insufficient
 spacing evidence and invalid geometry are explicit; no source text is silently discarded.
-Measurements use a projected CRS in metres. Large survey extents require a suitable working CRS
-chosen by the user. This optional tool does not change general-purpose MDB importing.
+Geographic inputs (such as EPSG:4326) and layers with different CRSs are supported without manual
+reprojection. Measurements use a suitable projected CRS in metres automatically, while outputs
+keep the text layer's CRS. A geographic or non-metre measurement CRS preference also uses this
+automatic selection. For large survey extents or polar regions, process smaller sections or
+choose a suitable projected metre CRS under **Advanced parameters**. This optional tool does not
+change general-purpose MDB importing.
 
 ## Map and dock tools
 

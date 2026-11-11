@@ -186,7 +186,7 @@ def test_layout_only_group_does_not_gain_polygon_certainty_from_loose_anchor_tol
     assert polygon['description_status'] == 'review' and absent(polygon['soil_description'])
 
 
-def test_different_layer_crs_is_transformed_and_geographic_working_crs_rejected():
+def test_different_layer_crs_and_geographic_preference_are_supported():
     text, line, poly = labels(), leaders(), polygons()
     to_wgs84 = QgsCoordinateTransform(line.crs(), QgsCoordinateReferenceSystem('EPSG:4326'), QgsProject.instance())
     changed = []
@@ -197,12 +197,9 @@ def test_different_layer_crs_is_transformed_and_geographic_working_crs_rejected(
     line = layer('MultiLineString', 'Geographic leaders', changed, crs='EPSG:4326')
     outputs, context, project, _ = run(text, [line], [poly])
     assert rows(outputs['OUTPUT_POLYGONS'])[0]['description_status'] == 'matched'
-    algorithm = AttachSeabedDescriptionsAlgorithm()
-    algorithm.initAlgorithm()
-    feedback = Feedback()
-    result, ok = algorithm.run({algorithm.TEXT: text, algorithm.TEXT_FIELD: 'label_text',
-                                algorithm.WORKING_CRS: 'EPSG:4326'}, QgsProcessingContext(), feedback)
-    assert not ok and any('metres' in message for message in feedback.messages)
+    outputs, context, project, _ = run(text, [line], [poly], WORKING_CRS='EPSG:4326')
+    assert rows(outputs['OUTPUT_POLYGONS'])[0]['description_status'] == 'matched'
+    assert outputs['OUTPUT_LABELS'].crs() == text.crs()
 
 
 def test_output_label_postprocessor_lifetime_and_name():
