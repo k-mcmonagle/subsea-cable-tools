@@ -5,7 +5,9 @@ Built on a GDAL virtual raster (gdalbuildvrt -resolution highest) rather
 than gdal_merge, which silently resamples every input to the FIRST file's
 resolution — merging a 0.25 m grid into a 1 m grid used to throw the fine
 detail away depending on selection order. The VRT is then materialised to
-a tiled GeoTIFF, so depth values pass through untouched.
+a tiled GeoTIFF, so depth values pass through untouched. GDAL runs inside
+QGIS through its Python bindings (:mod:`gdal_inprocess`), not as separate
+programs, which some Windows policies refuse to start.
 """
 
 from qgis.PyQt.QtCore import QCoreApplication
@@ -14,7 +16,6 @@ import math
 import os
 import uuid
 from qgis.core import (
-    QgsApplication,
     QgsProcessingException,
     QgsProcessingParameterBoolean,
     QgsProcessingParameterEnum,
@@ -23,9 +24,9 @@ from qgis.core import (
     QgsRasterLayer,
     QgsRectangle,
 )
-from .algorithm_base import SubseaCableAlgorithm, gdal_creation_options
+from . import gdal_inprocess
+from .algorithm_base import SubseaCableAlgorithm
 from ..qgis_compat import PROCESSING_SOURCE_RASTER, processing_temp_folder
-from qgis import processing
 
 
 class MergeMBESRastersAlgorithm(SubseaCableAlgorithm):
@@ -77,19 +78,6 @@ class MergeMBESRastersAlgorithm(SubseaCableAlgorithm):
             self.ALLOW_LARGE, self.tr('Allow a physical mosaic exceeding one billion cells'), defaultValue=False))
 
     def processAlgorithm(self, parameters, context, feedback):
-        def alg_available(algorithm_id: str) -> bool:
-            try:
-                return QgsApplication.processingRegistry().algorithmById(algorithm_id) is not None
-            except Exception:
-                return False
-
-        for required in ('gdal:buildvirtualraster', 'gdal:translate'):
-            if not alg_available(required):
-                raise QgsProcessingException(
-                    f"Required Processing algorithm '{required}' is not available. "
-                    'This usually means the GDAL Processing provider is not installed or not enabled.'
-                )
-
         raster_layers = self.parameterAsLayerList(parameters, self.INPUTS, context)
         if not raster_layers or len(raster_layers) < 2:
             raise QgsProcessingException('Please select at least two raster layers to merge.')
@@ -178,44 +166,30 @@ class MergeMBESRastersAlgorithm(SubseaCableAlgorithm):
         # --- build the VRT mosaic at the highest resolution ---
         vrt_path = final_output if virtual else os.path.join(
             processing_temp_folder(context), f'mbes_merge_{uuid.uuid4().hex[:8]}.vrt')
-        result = processing.run('gdal:buildvirtualraster', {
-            'INPUT': input_files,
-            'RESOLUTION': 1,          # highest — never degrade a fine grid
-            'SEPARATE': False,
-            'PROJ_DIFFERENCE': False,
-            'ADD_ALPHA': False,
-            'ASSIGN_CRS': None,
-            # 0 nearest (values pass through untouched), 1 bilinear (coarser
-            # inputs upsampled smoothly instead of as blocks).
-            'RESAMPLING': 1 if resampling == 1 else 0,
-            'SRC_NODATA': None,       # respect each file's own NoData metadata
-            'OUTPUT': vrt_path,
-        }, context=context, feedback=feedback, is_child_algorithm=True)
-        if not result or not result.get('OUTPUT'):
-            raise QgsProcessingException('Raster merge (buildvirtualraster) failed. '
-                                         'Check the processing log for more details.')
+        # Highest resolution: never degrade a fine grid. Nearest passes values
+        # through untouched; bilinear upsamples coarser inputs smoothly instead
+        # of as blocks. No -srcnodata: each file's own NoData metadata applies.
+        result = {'OUTPUT': gdal_inprocess.run('buildvrt', vrt_path, input_files, [
+            '-resolution', 'highest', '-r', 'bilinear' if resampling == 1 else 'nearest'], feedback)}
 
         if feedback.isCanceled():
             return {}
         if virtual:
             result2 = result
         else:
-            # --- materialise to GeoTIFF ---
-            options = 'COMPRESS=LZW|TILED=YES|BIGTIFF=IF_SAFER' if compress else 'TILED=YES|BIGTIFF=IF_SAFER'
-            result2 = processing.run('gdal:translate', {
-                'INPUT': result['OUTPUT'],
-                'OUTPUT': final_output,
-                **gdal_creation_options('gdal:translate', options),
-                'EXTRA': '--config GDAL_CACHEMAX 256',
-                'DATA_TYPE': 0,           # keep the source data type
-            }, context=context, feedback=feedback, is_child_algorithm=True)
-            if not result2 or not result2.get('OUTPUT'):
-                raise QgsProcessingException('Writing the merged raster (gdal:translate) failed. '
-                                             'Check the processing log for more details.')
+            # --- materialise to GeoTIFF (the source data type is kept) ---
+            driver = gdal_inprocess.driver_for(final_output)
+            arguments = ['-of', driver]
+            if driver == 'GTiff':
+                arguments += (['-co', 'COMPRESS=LZW'] if compress else []) + \
+                    ['-co', 'TILED=YES', '-co', 'BIGTIFF=IF_SAFER']
             try:
-                os.remove(vrt_path)
-            except OSError:
-                pass
+                result2 = {'OUTPUT': gdal_inprocess.run('translate', final_output, vrt_path, arguments, feedback)}
+            finally:
+                try:
+                    os.remove(vrt_path)
+                except OSError:
+                    pass
         from ..bathymetry_sampling import MANIFEST_VERSION, layer_options, expand_rasters
         native = expand_rasters(valid_layers)
         manifest_path = str(result2['OUTPUT']) + '.sources.json'

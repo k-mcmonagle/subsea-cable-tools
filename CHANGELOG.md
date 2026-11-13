@@ -40,6 +40,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **Route Comments — images on the map:** images in map labels are now found beside the register the layer reads, so they keep showing when a project is opened from another folder or by another user (for example a synced folder under each user's own name) and before the dock is opened; labels made earlier are updated when the dock opens, keeping other label changes. Details and images now show at their own scale (a map set to 1:50,000), and an import that puts images on the map now offers to update labels that cannot show them and to zoom in.
 - **Route Comments — route references:** comments no longer show *Route unavailable* when the project and its route file are opened from another user's or computer's folder.
+- **Create Raster from XYZ / Merge MBES Rasters:** these tools now run GDAL inside QGIS instead of starting GDAL's separate programs, so they work on Windows computers whose application control policy blocks those programs (they failed with "gdal_translate failed to start" or "No rasters were created"). Outputs are unchanged.
 
 ## [2.0.0] - 2026-10-23
 

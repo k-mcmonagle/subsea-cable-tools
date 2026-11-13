@@ -285,11 +285,53 @@ def test_bin_average_end_to_end() -> bool:
                    f"mean={mean_cell} single={single} filled={filled}")
 
 
+def test_idw_end_to_end() -> bool:
+    """IDW on a gridded tile: the same grid as direct rasterisation, north up,
+    values at the grid nodes kept (the nearest point dominates)."""
+    if np is None:
+        return _result("IDW end to end", False, "NumPy unavailable")
+    if not _init_processing():
+        return _result("IDW end to end", True, "skipped: processing framework unavailable")
+    folder = tempfile.mkdtemp(prefix="mbes_idw_")
+    tile = os.path.join(folder, "tile.xyz")
+    _write_tile(tile, 500000.0, 6000000.0, 10, 1.0, lambda i, j: -(10.0 + i + 0.1 * j))
+    algorithm = CreateMBESRasterFromXYZAlgorithm()
+    algorithm.initAlgorithm()
+    context = QgsProcessingContext()
+    context.setProject(QgsProject.instance())
+    from qgis import processing
+    processing.run(algorithm, {
+        "INPUT_XYZ": [tile], "CRS": "EPSG:32631", "GRID_SIZE": 0.0, "MAX_DISTANCE": 0.0,
+        "METHOD": 1, "FILL_DISTANCE": 0, "OUTPUT": os.path.join(folder, "rasters"), "COMPRESS": False,
+    }, context=context, feedback=QgsProcessingFeedback())
+    raster = os.path.join(folder, "rasters", "tile.tif")
+    layer, south = _sample(raster, 500003.0, 6000001.0)    # i=3, j=1
+    _, north = _sample(raster, 500003.0, 6000008.0)        # i=3, j=8
+    ok = layer is not None and abs(layer.rasterUnitsPerPixelX() - 1.0) < 1e-6 and \
+        layer.width() == 10 and layer.height() == 10
+    ok = ok and south is not None and abs(south - (-(10.0 + 3 + 0.1))) < 1e-3
+    ok = ok and north is not None and abs(north - (-(10.0 + 3 + 0.8))) < 1e-3
+    return _result("IDW end to end (grid, orientation, node values)", ok, f"south={south} north={north}")
+
+
+def test_no_gdal_programs() -> bool:
+    """The MBES tools run GDAL inside QGIS (its Python bindings), never as
+    separate programs, which some Windows policies refuse to start."""
+    import inspect
+
+    from ..processing import create_mbes_raster_from_xyz_algorithm as create
+    from ..processing import merge_mbes_rasters_algorithm as merge
+    offenders = [m.__name__ for m in (create, merge) if "processing.run(" in inspect.getsource(m)]
+    return _result("MBES tools start no GDAL programs", not offenders, ", ".join(offenders))
+
+
 def run_all():
     return [
         test_pure_helpers(),
         test_multifile_create_and_merge(),
         test_bin_average_end_to_end(),
+        test_idw_end_to_end(),
+        test_no_gdal_programs(),
     ]
 
 

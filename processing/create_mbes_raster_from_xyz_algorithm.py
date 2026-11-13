@@ -5,11 +5,12 @@ One raster per input file, so each file keeps its own native resolution;
 grid size auto-detects per file (or one explicit override for all). The
 point cloud is bridged to GDAL through a temporary CSV + VRT pair, which
 avoids the format quirks of feeding XYZ text straight into GDAL tools.
+GDAL runs inside QGIS through its Python bindings (:mod:`gdal_inprocess`),
+not as separate programs, which some Windows policies refuse to start.
 """
 
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
-    QgsApplication,
     QgsProcessing,
     QgsProcessingContext,
     QgsProcessingException,
@@ -20,13 +21,13 @@ from qgis.core import (
     QgsProcessingParameterNumber,
     QgsRectangle,
 )
-from .algorithm_base import SubseaCableAlgorithm, gdal_creation_options
+from . import gdal_inprocess
+from .algorithm_base import SubseaCableAlgorithm
 from .file_list_parameter import FileListParameter
 from ..qgis_compat import (
     PROCESSING_NUMBER_DOUBLE, PROCESSING_NUMBER_INTEGER,
     processing_temp_folder,
 )
-from qgis import processing
 try:
     import numpy as np
 except Exception:  # pragma: no cover
@@ -256,12 +257,6 @@ class CreateMBESRasterFromXYZAlgorithm(SubseaCableAlgorithm):
                 'Please install/enable NumPy for your QGIS Python environment.'
             )
 
-        def alg_available(algorithm_id: str) -> bool:
-            try:
-                return QgsApplication.processingRegistry().algorithmById(algorithm_id) is not None
-            except Exception:
-                return False
-
         # --- 1. Parameters ---
         xyz_paths = self._input_paths(parameters, context)
         if not xyz_paths:
@@ -284,21 +279,6 @@ class CreateMBESRasterFromXYZAlgorithm(SubseaCableAlgorithm):
                 processing_temp_folder(context), 'xyz_rasters_' + uuid.uuid4().hex[:8])
         os.makedirs(output_folder, exist_ok=True)
 
-        required = {
-            self.METHOD_DIRECT: ('gdal:rasterize',),
-            self.METHOD_IDW: ('gdal:gridinversedistancenearestneighbor',
-                              'gdal:gridinversedistance'),
-        }.get(method_index, ())
-        if required and not any(alg_available(a) for a in required):
-            raise QgsProcessingException(
-                'Required Processing algorithm %s is not available. This '
-                'usually means the GDAL Processing provider is not installed '
-                'or not enabled.' % ' / '.join(required))
-        if fill_cells > 0 and not alg_available('gdal:fillnodata'):
-            raise QgsProcessingException(
-                "Gap filling requested but 'gdal:fillnodata' is not available. "
-                'Enable the GDAL Processing provider or set gap filling to 0.')
-
         file_list_str = ', '.join(os.path.basename(p) for p in xyz_paths)
         feedback.pushInfo(f'Starting processing for {len(xyz_paths)} file(s): {file_list_str}')
 
@@ -315,7 +295,7 @@ class CreateMBESRasterFromXYZAlgorithm(SubseaCableAlgorithm):
                 output_paths.append(self._process_one(
                     xyz_path, target_crs, grid_size_param, max_distance_param,
                     method_index, fill_cells, output_folder, compress,
-                    context, feedback, alg_available))
+                    context, feedback))
             except QgsProcessingException as exc:
                 if len(xyz_paths) == 1:
                     raise
@@ -336,8 +316,7 @@ class CreateMBESRasterFromXYZAlgorithm(SubseaCableAlgorithm):
 
     def _process_one(self, xyz_path, target_crs, grid_size_param,
                      max_distance_param, method_index, fill_cells,
-                     output_folder, compress, context, feedback,
-                     alg_available):
+                     output_folder, compress, context, feedback):
         base_name = os.path.splitext(os.path.basename(xyz_path))[0]
 
         # --- read ---
@@ -477,21 +456,16 @@ class CreateMBESRasterFromXYZAlgorithm(SubseaCableAlgorithm):
         try:
             # --- rasterize ---
             if method_index == self.METHOD_DIRECT:
-                feedback.pushInfo('Using direct rasterization (gdal:rasterize)...')
-                result = processing.run('gdal:rasterize', {
-                    'INPUT': vrt_path,
-                    'FIELD': 'z',
-                    'UNITS': 1,               # georeferenced units
-                    'WIDTH': grid_x,
-                    'HEIGHT': grid_y,
-                    'EXTENT': extent,
-                    'NODATA': -9999.0,
+                feedback.pushInfo('Using direct rasterization (gdal_rasterize)...')
+                result = {'OUTPUT': gdal_inprocess.run('rasterize', output_raster_path, vrt_path, [
+                    '-l', 'points', '-a', 'z',
+                    '-tr', repr(float(grid_x)), repr(float(grid_y)),   # georeferenced units
                     # Pre-fill the band: without -init, unwritten cells rely
                     # on GDAL initialising to the nodata value.
-                    'INIT': -9999.0,
-                    'DATA_TYPE': 5,           # Float32
-                    'OUTPUT': output_raster_path,
-                }, context=context, feedback=feedback, is_child_algorithm=True)
+                    '-init', '-9999.0', '-a_nodata', '-9999.0',
+                    '-te', repr(extent.xMinimum()), repr(extent.yMinimum()),
+                    repr(extent.xMaximum()), repr(extent.yMaximum()),
+                    '-ot', 'Float32', '-of', 'GTiff'], feedback)}
             elif method_index == self.METHOD_AVERAGE:
                 result = self._run_average(
                     data, grid_x, grid_y, extent, width, height, target_crs,
@@ -499,7 +473,7 @@ class CreateMBESRasterFromXYZAlgorithm(SubseaCableAlgorithm):
             else:
                 result = self._run_idw(
                     vrt_path, extent, width, height, max_distance,
-                    output_raster_path, context, feedback, alg_available)
+                    output_raster_path, feedback)
 
             if not result or not result.get('OUTPUT'):
                 raise QgsProcessingException(
@@ -510,40 +484,18 @@ class CreateMBESRasterFromXYZAlgorithm(SubseaCableAlgorithm):
             if fill_cells > 0:
                 feedback.pushInfo(
                     f'Filling no-data gaps up to {fill_cells} cell(s) '
-                    '(gdal:fillnodata)...')
+                    '(gdal_fillnodata)...')
                 fill_path = (os.path.join(temp_folder, f'xyz_{token}_fill.tif')
                              if compress else final_output)
-                fill_result = processing.run('gdal:fillnodata', {
-                    'INPUT': output_raster_path,
-                    'BAND': 1,
-                    'DISTANCE': fill_cells,
-                    'ITERATIONS': 0,
-                    'NO_MASK': False,
-                    'OUTPUT': fill_path,
-                }, context=context, feedback=feedback, is_child_algorithm=True)
-                if not fill_result or not fill_result.get('OUTPUT'):
-                    raise QgsProcessingException(
-                        f'Gap filling (gdal:fillnodata) failed for {os.path.basename(xyz_path)}.')
-                result = fill_result
+                result = {'OUTPUT': gdal_inprocess.fill_nodata(
+                    output_raster_path, fill_path, fill_cells, feedback)}
 
             # --- compress ---
             if compress:
-                feedback.pushInfo('Applying LZW compression (gdal:translate)...')
-                if not alg_available('gdal:translate'):
-                    raise QgsProcessingException(
-                        "Compression requested but 'gdal:translate' is not available. "
-                        'Enable the GDAL Processing provider or disable compression.')
-                result2 = processing.run('gdal:translate', {
-                    'INPUT': result['OUTPUT'],
-                    'OUTPUT': final_output,
-                    **gdal_creation_options(
-                        'gdal:translate', 'COMPRESS=LZW|TILED=YES|BIGTIFF=IF_SAFER'),
-                    'DATA_TYPE': 0,           # keep source type (Float32)
-                }, context=context, feedback=feedback, is_child_algorithm=True)
-                if not result2 or not result2.get('OUTPUT'):
-                    raise QgsProcessingException(
-                        f'Compression (gdal:translate) failed for {os.path.basename(xyz_path)}.')
-                output_path = result2['OUTPUT']
+                feedback.pushInfo('Applying LZW compression (gdal_translate)...')
+                output_path = gdal_inprocess.run('translate', final_output, result['OUTPUT'], [
+                    '-of', 'GTiff', '-co', 'COMPRESS=LZW', '-co', 'TILED=YES',
+                    '-co', 'BIGTIFF=IF_SAFER'], feedback)   # source type kept (Float32)
             else:
                 output_path = result['OUTPUT']
         finally:
@@ -565,51 +517,31 @@ class CreateMBESRasterFromXYZAlgorithm(SubseaCableAlgorithm):
         return output_path
 
     @staticmethod
-    def _grid_extra(extent, width, height):
-        """gdal_grid has no EXTENT/SIZE parameters in Processing; pass the
-        cell-centred extent and exact raster size through EXTRA so the output
-        aligns with the direct-rasterization grid."""
-        return (f'-txe {extent.xMinimum()} {extent.xMaximum()} '
-                f'-tye {extent.yMinimum()} {extent.yMaximum()} '
-                f'-outsize {width} {height}')
+    def _grid_extent(extent, width, height):
+        """The cell-centred extent and exact raster size, so the gdal_grid
+        output aligns with the direct-rasterization grid."""
+        return ['-txe', repr(extent.xMinimum()), repr(extent.xMaximum()),
+                '-tye', repr(extent.yMinimum()), repr(extent.yMaximum()),
+                '-outsize', str(int(width)), str(int(height))]
 
     def _run_idw(self, vrt_path, extent, width, height, max_distance,
-                 output_raster_path, context, feedback, alg_available):
-        # 'gdal:grididw' (used by earlier plugin versions) never existed in
-        # QGIS Processing, so IDW silently fell back to a broken
-        # native:idwinterpolation call. These are the real algorithm ids.
-        if alg_available('gdal:gridinversedistancenearestneighbor'):
-            feedback.pushInfo(
-                'Using IDW interpolation '
-                '(gdal:gridinversedistancenearestneighbor)...')
-            return processing.run('gdal:gridinversedistancenearestneighbor', {
-                'INPUT': vrt_path,
-                'Z_FIELD': 'z',
-                'POWER': 2.0,
-                'SMOOTHING': 0.0,
-                'RADIUS': max_distance,
-                'MAX_POINTS': 12,
-                'MIN_POINTS': 1,
-                'NODATA': -9999.0,
-                'DATA_TYPE': 5,           # Float32
-                'EXTRA': self._grid_extra(extent, width, height),
-                'OUTPUT': output_raster_path,
-            }, context=context, feedback=feedback, is_child_algorithm=True)
-        feedback.pushInfo('Using IDW interpolation (gdal:gridinversedistance)...')
-        return processing.run('gdal:gridinversedistance', {
-            'INPUT': vrt_path,
-            'Z_FIELD': 'z',
-            'POWER': 2.0,
-            'SMOOTHING': 0.0,
-            'RADIUS_1': max_distance,
-            'RADIUS_2': max_distance,
-            'MAX_POINTS': 12,
-            'MIN_POINTS': 1,
-            'NODATA': -9999.0,
-            'DATA_TYPE': 5,               # Float32
-            'EXTRA': self._grid_extra(extent, width, height),
-            'OUTPUT': output_raster_path,
-        }, context=context, feedback=feedback, is_child_algorithm=True)
+                 output_raster_path, feedback):
+        # Inverse distance to a power with nearest-neighbour searching
+        # (gdal_grid invdistnn, GDAL 2.1+); plain invdist with the same
+        # radius in both directions on older GDAL.
+        from osgeo import gdal
+        radius = repr(float(max_distance))
+        if int(gdal.VersionInfo('VERSION_NUM')) >= 2010000:
+            feedback.pushInfo('Using IDW interpolation (gdal_grid invdistnn)...')
+            algorithm = (f'invdistnn:power=2.0:smoothing=0.0:radius={radius}:max_points=12:'
+                         'min_points=1:nodata=-9999.0')
+        else:  # pragma: no cover - GDAL 2.0
+            feedback.pushInfo('Using IDW interpolation (gdal_grid invdist)...')
+            algorithm = (f'invdist:power=2.0:smoothing=0.0:radius1={radius}:radius2={radius}:angle=0.0:'
+                         'max_points=12:min_points=1:nodata=-9999.0')
+        return {'OUTPUT': gdal_inprocess.run('grid', output_raster_path, vrt_path, [
+            '-l', 'points', '-zfield', 'z', '-a', algorithm, '-ot', 'Float32', '-of', 'GTiff',
+            *self._grid_extent(extent, width, height)], feedback)}
 
     def _run_average(self, data, grid_x, grid_y, extent, width, height,
                      target_crs, output_raster_path, feedback):
