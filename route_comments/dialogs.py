@@ -270,7 +270,10 @@ class CommentForm(QWidget):
 
 # --------------------------------------------------------------------------- new comment
 class NewCommentDialog(QDialog):
-    """Quick entry: location (editable), then the comment. Ctrl+Enter saves."""
+    """Quick entry: location (editable), then the comment. Ctrl+Enter saves.
+
+    ``capture`` is the route (None for a map position without a route, or
+    a general comment, which has no location at all)."""
 
     def __init__(self, parent, values: Dict, capture, statuses: Sequence[str], priorities: Sequence[str],
                  fields: Sequence[model.CustomField], default_status: str, default_prio: str, set_name: str, *, canvas=None):
@@ -279,40 +282,20 @@ class NewCommentDialog(QDialog):
         self.capture = capture
         self.kind = values.get("ref_kind")
         self.initial = dict(values)
-        self.map_preview = PositionPreview(canvas, self) if canvas is not None else None
+        general = self.kind == model.REF_GENERAL
+        self.map_preview = PositionPreview(canvas, self) if canvas is not None and not general else None
         layout = QVBoxLayout(self)
-
-        box = QGroupBox(model.REF_LABELS.get(self.kind, "Location"))
-        form = QFormLayout(box)
-        form.setVerticalSpacing(3)
-        lo, hi = capture.start_kp_km, capture.end_kp_km
-        self.kp = self.kp_end = self.lat = self.lon = None
-        if self.kind in (model.REF_ROUTE_POINT, model.REF_KP_RANGE):
-            self.kp = self._kp_spin(-1e9, 1e9, values.get("kp_km"))
-            form.addRow("KP from" if self.kind == model.REF_KP_RANGE else "KP", self.kp)
-            if self.kind == model.REF_KP_RANGE:
-                self.kp_end = self._kp_spin(-1e9, 1e9, values.get("kp_end_km"))
-                form.addRow("KP to", self.kp_end)
+        self.kp = self.kp_end = self.lat = self.lon = self.near = None
+        self.editors: Dict[str, QDoubleSpinBox] = {}
+        self._displayed: Dict[str, float] = {}
+        if general:
+            note = QLabel("A general comment has no location: it is listed in the table but not drawn on the map. "
+                          "To give it one later, right-click it in the table and choose Place on the map.")
+            note.setWordWrap(True)
+            note.setStyleSheet("color: palette(mid);")
+            layout.addWidget(note)
         else:
-            self.lat = self._deg_spin(90.0, values.get("lat"))
-            self.lon = self._deg_spin(180.0, values.get("lon"))
-            row = QHBoxLayout()
-            row.addWidget(self.lat)
-            row.addWidget(QLabel("Lon"))
-            row.addWidget(self.lon)
-            form.addRow("Lat", row)
-            self.near = QLabel()
-            self.near.setWordWrap(True)
-            form.addRow("Nearest KP", self.near)
-        self.editors = {key: spin for key, spin in (("kp_km", self.kp), ("kp_end_km", self.kp_end),
-                                                   ("lat", self.lat), ("lon", self.lon)) if spin is not None}
-        self._displayed = {key: spin.value() for key, spin in self.editors.items()}
-        route = QLabel(f"{model.route_text(values) or values.get('route_name') or ''}  ·  KP start "
-                       f"{lo:.3f}, end {hi:.3f}  ·  {values.get('kp_basis') or ''}")
-        route.setWordWrap(True)
-        route.setStyleSheet("color: palette(mid);")
-        form.addRow("Route", route)
-        layout.addWidget(box)
+            self._build_location(layout, values, capture)
         if self.map_preview is not None:
             self.preview_controls = PreviewControls(self.map_preview, self)
             layout.addWidget(self.preview_controls)
@@ -345,6 +328,42 @@ class NewCommentDialog(QDialog):
         self._update_near()
         self.resize(460, self.sizeHint().height())
         self.form.text.setFocus()
+
+    def _build_location(self, layout, values: Dict, capture) -> None:
+        box = QGroupBox(model.REF_LABELS.get(self.kind, "Location"))
+        form = QFormLayout(box)
+        form.setVerticalSpacing(3)
+        self.near = None
+        if self.kind in (model.REF_ROUTE_POINT, model.REF_KP_RANGE):
+            self.kp = self._kp_spin(-1e9, 1e9, values.get("kp_km"))
+            form.addRow("KP from" if self.kind == model.REF_KP_RANGE else "KP", self.kp)
+            if self.kind == model.REF_KP_RANGE:
+                self.kp_end = self._kp_spin(-1e9, 1e9, values.get("kp_end_km"))
+                form.addRow("KP to", self.kp_end)
+        else:
+            self.lat = self._deg_spin(90.0, values.get("lat"))
+            self.lon = self._deg_spin(180.0, values.get("lon"))
+            row = QHBoxLayout()
+            row.addWidget(self.lat)
+            row.addWidget(QLabel("Lon"))
+            row.addWidget(self.lon)
+            form.addRow("Lat", row)
+            self.near = QLabel()
+            self.near.setWordWrap(True)
+            form.addRow("Nearest KP", self.near)
+        self.editors = {key: spin for key, spin in (("kp_km", self.kp), ("kp_end_km", self.kp_end),
+                                                   ("lat", self.lat), ("lon", self.lon)) if spin is not None}
+        self._displayed = {key: spin.value() for key, spin in self.editors.items()}
+        if capture is not None:
+            route = QLabel(f"{model.route_text(values) or values.get('route_name') or ''}  ·  KP start "
+                           f"{capture.start_kp_km:.3f}, end {capture.end_kp_km:.3f}  ·  {values.get('kp_basis') or ''}")
+        else:
+            route = QLabel("None: the position is kept without a KP. Set the KP Mouse Tool's reference line to "
+                           "measure KPs.")
+        route.setWordWrap(True)
+        route.setStyleSheet("color: palette(mid);")
+        form.addRow("Route", route)
+        layout.addWidget(box)
 
     @staticmethod
     def _kp_spin(lo: float, hi: float, value) -> QDoubleSpinBox:
@@ -380,7 +399,7 @@ class NewCommentDialog(QDialog):
             if self.lat is None:
                 return
             if values.get("kp_km") is None:
-                self.near.setText("—")
+                self.near.setText("— (no route)" if self.capture is None else "—")
             else:
                 self.near.setText(f"KP {values['kp_km']:.3f}, {values.get('dcc_m') or 0.0:,.0f} m off route "
                                   "(kept apart from the position)")
@@ -400,6 +419,9 @@ class NewCommentDialog(QDialog):
                   for key, spin in self.editors.items()}
         if self.kind in (model.REF_ROUTE_POINT, model.REF_KP_RANGE):
             return self.capture.values_at_kps(self.kind, values["kp_km"], values.get("kp_end_km"))
+        if self.capture is None:
+            from .route_ref import location_without_route
+            return location_without_route(values["lat"], values["lon"])
         return self.capture.location_from_wgs84(values["lat"], values["lon"])
 
     def result_values(self) -> Dict:
@@ -738,6 +760,152 @@ class FieldsDialog(QDialog):
         return out
 
 
+def unique_name(base: str, existing: Sequence[str]) -> str:
+    """``base``, or ``base 2``, ``base 3``… not among ``existing`` (case-insensitive)."""
+    taken = {str(n).casefold() for n in existing}
+    name, n = base, 1
+    while name.casefold() in taken:
+        n += 1
+        name = f"{base} {n}"
+    return name
+
+
+class DuplicateSetDialog(QDialog):
+    """Name the copy of a comment set and choose what it takes."""
+
+    def __init__(self, parent, set_name: str, existing_names: Sequence[str], comments: int, images: int):
+        super().__init__(parent)
+        self.setWindowTitle(f"Duplicate comment set — {set_name}")
+        self.existing = [str(n) for n in existing_names]
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.name = QLineEdit(unique_name(f"{set_name} (copy)", self.existing))
+        form.addRow("Name of the copy", self.name)
+        layout.addLayout(form)
+        self.everything = QRadioButton(f"Everything: its {comments} comment(s) with their replies"
+                                       + (f" and {images} image(s)" if images else ""))
+        self.setup = QRadioButton("Set-up only: statuses, priorities and custom fields, no comments")
+        self.everything.setChecked(True)
+        layout.addWidget(self.everything)
+        self.replies = QCheckBox("Replies")
+        self.replies.setChecked(True)
+        self.images = QCheckBox("Images (copied, so each set has its own)")
+        self.images.setChecked(True)
+        self.images.setEnabled(bool(images))
+        extras = QHBoxLayout()
+        extras.setContentsMargins(22, 0, 0, 0)
+        extras.addWidget(self.replies)
+        extras.addWidget(self.images)
+        extras.addStretch(1)
+        layout.addLayout(extras)
+        layout.addWidget(self.setup)
+        self.everything.toggled.connect(self.replies.setEnabled)
+        self.everything.toggled.connect(lambda on: self.images.setEnabled(on and bool(images)))
+        note = QLabel("The copy is a new set in this register. Copied comments keep their numbers, positions, "
+                      "route references and dates, and get new IDs; the original set is not changed.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: palette(mid);")
+        layout.addWidget(note)
+        self.error = QLabel()
+        self.error.setStyleSheet("color: #b00020;")
+        self.error.hide()
+        layout.addWidget(self.error)
+        buttons = QDialogButtonBox(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
+        buttons.button(BUTTON_BOX_OK).setText("Duplicate")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.resize(440, self.sizeHint().height())
+
+    def choices(self) -> Dict:
+        everything = self.everything.isChecked()
+        return {"name": self.name.text().strip(), "comments": everything,
+                "replies": everything and self.replies.isChecked(),
+                "images": everything and self.images.isEnabled() and self.images.isChecked()}
+
+    def accept(self) -> None:
+        name = self.name.text().strip()
+        problem = "The copy needs a name." if not name else (
+            f"There is already a set called '{name}'." if name.casefold() in {n.casefold() for n in self.existing}
+            else "")
+        if problem:
+            self.error.setText(problem)
+            self.error.show()
+            return
+        super().accept()
+
+
+class RenumberDialog(QDialog):
+    """Confirm renumbering a set by KP, with the new numbers previewed."""
+
+    MAX_ROWS = 2000
+
+    def __init__(self, parent, set_name: str, plan: Sequence):
+        super().__init__(parent)
+        self.setWindowTitle(f"Renumber by KP — {set_name}")
+        changed = sum(1 for _c, old, new in plan if old != new)
+        routes = len({model.route_key(c) for c, _o, _n in plan
+                      if c.get("kp_km") is not None and model.route_key(c)})
+        no_kp = sum(1 for c, _o, _n in plan if c.get("kp_km") is None)
+        layout = QVBoxLayout(self)
+        text = (f"<b>{changed} of the {len(plan)} comments in '{_html(set_name)}' get a new number</b>, so that "
+                "they run 1, 2, 3… in KP order (a KP range by its lower KP, a map location by its nearest KP; "
+                "equal KPs keep their order).")
+        if routes > 1:
+            text += f" The comments are on {routes} routes: they are numbered route by route."
+        if no_kp:
+            text += f" {no_kp} comment(s) without a KP (general comments, positions away from the route) come last."
+        text += ("<br><br><b>Numbers quoted elsewhere</b> (in replies, e-mails, exported spreadsheets or reports) "
+                 "<b>will no longer match.</b> Renumber before sending the comments out, and consider "
+                 "<i>Set ▸ Duplicate set…</i> or <i>Export</i> first. This cannot be undone.")
+        intro = QLabel(text)
+        intro.setWordWrap(True)
+        intro.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(intro)
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["No. now", "New No.", "KP", "Comment"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(self.table.fontMetrics().height() + 6)
+        self.table.setWordWrap(False)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        rows = list(plan)[: self.MAX_ROWS]
+        self.table.setRowCount(len(rows))
+        for row, (comment, old, new) in enumerate(rows):
+            cells = [model.ref_label(old), model.ref_label(new), model.kp_text(comment), model.summary(comment.get("text"), 70)]
+            for col, value in enumerate(cells):
+                item = QTableWidgetItem(value)
+                if old != new and col < 2:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                self.table.setItem(row, col, item)
+        layout.addWidget(self.table, 1)
+        self.keep = QCheckBox(f"Keep each comment's number before renumbering in the custom field "
+                              f"'{model.PREVIOUS_NUMBER_FIELD}'")
+        self.keep.setToolTip("The field is added to the set when it has none (its column can be shown from the "
+                             "table header's right-click menu)")
+        self.keep.setChecked(True)
+        layout.addWidget(self.keep)
+        buttons = QDialogButtonBox(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
+        ok = buttons.button(BUTTON_BOX_OK)
+        ok.setText(f"Renumber {changed} comment(s)")
+        ok.setAutoDefault(False)
+        ok.setDefault(False)
+        buttons.button(BUTTON_BOX_CANCEL).setDefault(True)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.resize(620, 520)
+
+    def keep_previous(self) -> bool:
+        return self.keep.isChecked()
+
+
+def _html(text) -> str:
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 # --------------------------------------------------------------------------- import
 class ImportDialog(QDialog):
     """Import new comments from CSV/XLSX with column mapping and validation.
@@ -818,6 +986,12 @@ class ImportDialog(QDialog):
         images.addWidget(folder_button)
         layout.addLayout(images)
         layout.addWidget(self.images_on_map)
+        self.general_rows = QCheckBox("Import rows without a location as general comments")
+        self.general_rows.setToolTip("A row with no KP and no latitude/longitude becomes a general comment (listed, "
+                                     "not on the map) instead of being skipped")
+        self.general_rows.setChecked(QSettings().value(f"{SETTINGS}/import_general", False, type=bool))
+        self.general_rows.toggled.connect(self._validate)
+        layout.addWidget(self.general_rows)
 
         self.preview = QTableWidget(0, 4)
         self.preview.setHorizontalHeaderLabels(["Row", "Import", "Comment", "Notes"])
@@ -829,7 +1003,8 @@ class ImportDialog(QDialog):
         self.summary.setWordWrap(True)
         layout.addWidget(self.summary)
         note = QLabel("Rows need comment text and a location: latitude and longitude (a map location), a KP (a "
-                      "route point) or KP and KP to (a KP range) on the route chosen above. IDs already in the "
+                      "route point) or KP and KP to (a KP range) on the route chosen above, unless rows without a "
+                      "location are imported as general comments. IDs already in the "
                       "register, or repeated in the file, are skipped. Image files named in an image column "
                       "(several separated by ;) are copied into the register's attachments folder. Replies are "
                       "not imported.")
@@ -925,7 +1100,8 @@ class ImportDialog(QDialog):
         self.checked = model.validate_import(data, self.current_mapping(), self.fields, self.statuses,
                                              self.priorities, self.existing, kp_range, first_line=start + 1,
                                              default_author=default_author(), default_date=today(),
-                                             image_folder=self.images_dir())
+                                             image_folder=self.images_dir(),
+                                             allow_general=self.general_rows.isChecked())
         self.preview.setRowCount(len(self.checked))
         for row, item in enumerate(self.checked):
             cells = [str(item.line), "Yes" if item.ok else "No", model.summary(item.values.get("text"), 60),
@@ -949,6 +1125,7 @@ class ImportDialog(QDialog):
             return
         on_map = self.images_on_map.isEnabled() and self.images_on_map.isChecked()
         QSettings().setValue(f"{SETTINGS}/import_images_on_map", self.images_on_map.isChecked())
+        QSettings().setValue(f"{SETTINGS}/import_general", self.general_rows.isChecked())
         for row in self.result_rows:
             row["attach_on_map"] = on_map
         super().accept()

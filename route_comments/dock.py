@@ -19,13 +19,14 @@ import hashlib
 import html
 import json
 import os
+from contextlib import contextmanager
 from typing import Callable, Dict, List, Optional
 
 from qgis.core import (QgsApplication, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsGeometry,
                        QgsProject, QgsRectangle)
 from qgis.PyQt.QtCore import (QBuffer, QByteArray, QIODevice, QItemSelection, QItemSelectionModel, QSettings, Qt,
                               QTimer, QUrl)
-from qgis.PyQt.QtGui import QDesktopServices, QIcon, QImage, QKeySequence
+from qgis.PyQt.QtGui import QCursor, QDesktopServices, QIcon, QImage, QKeySequence
 from qgis.PyQt.QtWidgets import (QAbstractItemView, QApplication, QColorDialog, QComboBox, QDockWidget,
                                  QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMenu,
                                  QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSplitter,
@@ -38,12 +39,15 @@ except ImportError:  # Qt5: QShortcut is in QtWidgets
 
 from ..plugin_log import log_exception
 from ..qgis_compat import (CONTEXT_MENU_POLICY_CUSTOM, MESSAGEBOX_NO, MESSAGEBOX_YES, MESSAGE_INFO, MESSAGE_SUCCESS,
-                           SELECTION_BEHAVIOR_SELECT_ROWS, SELECTION_MODE_EXTENDED, TOOLBUTTON_POPUP_MODE_INSTANT,
-                           WINDOW_HINT_CLOSE, WINDOW_HINT_CUSTOMIZE, WINDOW_HINT_MIN_MAX, WINDOW_HINT_TITLE,
-                           WINDOW_TYPE_WINDOW, qt_exec)
+                           MESSAGE_WARNING, SELECTION_BEHAVIOR_SELECT_ROWS, SELECTION_MODE_EXTENDED,
+                           TOOLBUTTON_POPUP_MODE_INSTANT, TOOLBUTTON_POPUP_MODE_MENU_BUTTON, WINDOW_HINT_CLOSE,
+                           WINDOW_HINT_CUSTOMIZE, WINDOW_HINT_MIN_MAX, WINDOW_HINT_TITLE, WINDOW_TYPE_WINDOW, QAction,
+                           qt_exec)
 from . import map_layers, model
-from .dialogs import (SETTINGS, ChoicesDialog, CommentForm, EditPositionDialog, ExportDialog, FieldsDialog, ImportDialog,
-                      LabelDialog, NewCommentDialog, default_author, remember_author)
+from .dialogs import (SETTINGS, ChoicesDialog, CommentForm, DuplicateSetDialog, EditPositionDialog, ExportDialog,
+                      FieldsDialog, ImportDialog, LabelDialog, NewCommentDialog, RenumberDialog, default_author,
+                      remember_author, unique_name)
+from .place import CommentPlaceTool
 from .preview import PositionPreview, TableKpPreview
 from .pictures import MAX_PIXELS, PicturePanel, ThumbnailCache, image_size, pictures_from_mime
 from .route_ref import POSITION_COLUMNS, CaptureRoute, ReferenceChecker, location_without_route
@@ -86,6 +90,27 @@ def unused_register_path(path: str) -> str:
     return candidate
 
 
+@contextmanager
+def _busy():
+    """A wait cursor while copying files or many rows."""
+    QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
+    try:
+        yield
+    finally:
+        QApplication.restoreOverrideCursor()
+
+
+def _numbers_text(numbers: List[int]) -> str:
+    """``#5–#7`` for a run, else ``#2, #5, #9`` (shortened past eight)."""
+    numbers = sorted(int(n) for n in numbers)
+    if not numbers:
+        return "nothing"
+    if len(numbers) > 1 and numbers == list(range(numbers[0], numbers[-1] + 1)):
+        return f"#{numbers[0]}–#{numbers[-1]}"
+    text = ", ".join(f"#{n}" for n in numbers[:8])
+    return text + (f" and {len(numbers) - 8} more" if len(numbers) > 8 else "")
+
+
 class RouteCommentsDock(QDockWidget):
     """Route Comments: one register, one comment set at a time."""
 
@@ -106,6 +131,9 @@ class RouteCommentsDock(QDockWidget):
         self.layers = map_layers.CommentLayers()
         self.highlight = map_layers.Highlight(iface.mapCanvas()) if iface else None
         self.pick_tool = None
+        self.place_tool: Optional[CommentPlaceTool] = None
+        self._place_target: Optional[str] = None    # a general comment being given a location
+        self._tool_before_place = None
         self._kp_preview = None
         self.current_id: Optional[str] = None
         self._loaded_version = None
@@ -130,6 +158,7 @@ class RouteCommentsDock(QDockWidget):
         project = QgsProject.instance()
         project.readProject.connect(self._on_project_changed)
         project.cleared.connect(self._on_project_changed)
+        project.aboutToBeCleared.connect(self._stop_placing)   # its route layer is about to go
         self._project_connected = True
         self._on_project_changed()
 
@@ -157,20 +186,47 @@ class RouteCommentsDock(QDockWidget):
         row1.addWidget(self.set_combo, 1)
         self.set_button = QToolButton()
         self.set_button.setText("Set")
-        self.set_button.setToolTip("Comment set: new, rename, delete, custom fields, statuses and priorities")
+        self.set_button.setToolTip("Comment set: new, duplicate, rename, delete, renumber, custom fields, statuses "
+                                   "and priorities")
         self.set_button.setPopupMode(TOOLBUTTON_POPUP_MODE_INSTANT)
         set_menu = QMenu(self.set_button)
         self.act_new_set = set_menu.addAction("New set…", self.new_set)
+        self.act_duplicate_set = set_menu.addAction("Duplicate set…", self.duplicate_set)
+        self.act_duplicate_set.setToolTip("A copy of this set: everything, or its statuses, priorities and custom "
+                                          "fields only")
         self.act_rename_set = set_menu.addAction("Rename set…", self.rename_set)
         self.act_delete_set = set_menu.addAction("Delete set…", self.delete_set)
         set_menu.addSeparator()
+        self.act_renumber = set_menu.addAction("Renumber by KP…", self.renumber_by_kp)
+        self.act_renumber.setToolTip("Number the comments 1, 2, 3… in KP order (asks first)")
+        set_menu.addSeparator()
         self.act_fields = set_menu.addAction("Custom fields…", self.edit_fields)
         self.act_choices = set_menu.addAction("Statuses and priorities…", self.edit_choices)
+        set_menu.setToolTipsVisible(True)
         self.set_button.setMenu(set_menu)
         row1.addWidget(self.set_button)
         outer.addLayout(row1)
 
         row2 = QHBoxLayout()
+        self.add_button = QToolButton()
+        self.add_button.setPopupMode(TOOLBUTTON_POPUP_MODE_MENU_BUTTON)
+        self.add_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.act_place = QAction(_theme_icon("/mActionAdd.svg"), "Add", self)
+        self.act_place.setCheckable(True)
+        self.act_place.setToolTip("Add comments by clicking the map: a click puts one on the route at the nearest "
+                                  "KP, Shift+click exactly where you click, a drag along the route over a KP range "
+                                  "(Esc stops). The arrow has more ways to add a comment.")
+        self.act_place.toggled.connect(self._toggle_place)
+        self.add_button.setDefaultAction(self.act_place)
+        add_menu = QMenu(self.add_button)
+        place_entry = add_menu.addAction("On the map (click, Shift+click or drag along the route)")
+        place_entry.triggered.connect(lambda: self.act_place.setChecked(True))
+        self.act_add_kp = add_menu.addAction("At a KP…", lambda: self.add_at_kp(model.REF_ROUTE_POINT))
+        self.act_add_range = add_menu.addAction("Over a KP range…", lambda: self.add_at_kp(model.REF_KP_RANGE))
+        add_menu.addSeparator()
+        self.act_add_general = add_menu.addAction("General comment (no location)…", self.add_general)
+        self.add_button.setMenu(add_menu)
+        row2.addWidget(self.add_button)
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search comments, replies, numbers (#12)…")
         self.search.setClearButtonEnabled(True)
@@ -510,6 +566,9 @@ class RouteCommentsDock(QDockWidget):
         menu = self.register_menu
         self._clear_menu(menu)
         menu.addAction("New register…", self.new_register)
+        duplicate = menu.addAction("Duplicate register…", self.duplicate_register)
+        duplicate.setEnabled(self.store is not None)
+        duplicate.setToolTip("Save a copy of this register, with its images, under a new name")
         menu.addAction("Open register…", lambda: self.open_register())
         recent = [p for p in self._recent()
                   if not self.store or os.path.normcase(p) != os.path.normcase(self.store.path)]
@@ -524,6 +583,7 @@ class RouteCommentsDock(QDockWidget):
             menu.addSeparator()
             menu.addAction("Show register folder", self._show_folder)
             menu.addAction("Close register", self.close_register)
+        menu.setToolTipsVisible(True)
 
     def _show_folder(self) -> None:
         if self.store is not None:
@@ -560,6 +620,50 @@ class RouteCommentsDock(QDockWidget):
             return False
         self._use_store(store)
         return True
+
+    def duplicate_register(self) -> Optional[str]:
+        """Save a copy of the register (with its images) under a new name, then
+        offer to use the copy in this project. Returns the copy's path."""
+        if self.store is None or not self._confirm_leave():
+            return None
+        store = self.store
+        suggested = unused_register_path(os.path.join(os.path.dirname(store.path), f"{store.name}_copy.gpkg"))
+        while True:
+            path, _f = QFileDialog.getSaveFileName(self, "Duplicate comment register", suggested,
+                                                   "GeoPackage (*.gpkg)",
+                                                   options=QFileDialog.Option.DontConfirmOverwrite)
+            if not path:
+                return None
+            if not path.lower().endswith(".gpkg"):
+                path += ".gpkg"
+            if not (os.path.exists(path) or os.path.exists(attachments_dir_for(path))):
+                break
+            QMessageBox.information(self, "Duplicate comment register", f"{os.path.basename(path)} (or its "
+                                    "attachments folder) is already there, and a register is never overwritten. "
+                                    "Choose another name.")
+            suggested = unused_register_path(path)
+        try:
+            with _busy():
+                info = store.save_copy(path)
+        except CommentStoreError as exc:
+            self._error("Duplicate register", exc)
+            return None
+        missing = f" ({info['missing']} image file(s) were missing and are not in the copy)" if info["missing"] else ""
+        box = QMessageBox(QMessageBox.Icon.Question, "Duplicate comment register",
+                          f"Saved a copy of {os.path.basename(store.path)} as {os.path.basename(info['path'])}, with "
+                          f"{info['images']} image file(s){missing}.\n\nUse the copy in this project? Its comment "
+                          "layers are then pointed at the copy; the original is not changed.", parent=self)
+        use = box.addButton("Use the copy", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Keep the original", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(use)
+        qt_exec(box)
+        if box.clickedButton() is use:
+            self.open_register(info["path"])
+        else:
+            self._remember(info["path"])
+            self._remember(store.path)
+            self._message(f"Copy saved: {info['path']} (Register ▸ Recent registers opens it).", MESSAGE_SUCCESS, 6)
+        return info["path"]
 
     def _ask_existing_register(self, path: str) -> str:
         """``"open"``, ``"rename"`` or ``""`` (cancel) for an existing register picked as a new one."""
@@ -615,6 +719,7 @@ class RouteCommentsDock(QDockWidget):
 
     def _on_project_changed(self, *_args) -> None:
         """Open the register the project names (or none)."""
+        self._stop_placing()
         self._close_previews()
         self._disconnect_layers()
         path, set_id = map_layers.project_register()
@@ -706,8 +811,8 @@ class RouteCommentsDock(QDockWidget):
         self._update_enabled()
         if self.store is None:
             self._show_banner("No comment register is open. <a href='new'>New register…</a> or "
-                              "<a href='open'>Open register…</a> Add comments from the KP Mouse Tool's "
-                              "right-click menu.")
+                              "<a href='open'>Open register…</a> Add comments with Add, or from the KP Mouse "
+                              "Tool's right-click menu.")
         else:
             self._show_banner("This register's image folder is missing. Move its _attachments folder beside "
                               "the GeoPackage as well." if self.store.attachments_folder_missing() else "")
@@ -730,6 +835,66 @@ class RouteCommentsDock(QDockWidget):
             self._error("New set", exc)
             return
         self._reload_sets(row["set_id"])
+
+    def duplicate_set(self) -> Optional[Dict]:
+        """Copy the current set (everything, or its set-up only) and show the copy."""
+        if self.set_row is None or self.store is None or not self._confirm_leave():
+            return None
+        source = self.set_row
+        try:
+            names = [s["name"] for s in self.store.list_sets()]
+        except CommentStoreError as exc:
+            self._error("Duplicate set", exc)
+            return None
+        images = sum(int(c.get("attachment_count") or 0) for c in self.comments)
+        dialog = DuplicateSetDialog(self, source["name"], names, len(self.comments), images)
+        if not qt_exec(dialog):
+            return None
+        choice = dialog.choices()
+        try:
+            with _busy():
+                new, info = self.store.duplicate_set(source["set_id"], choice["name"], comments=choice["comments"],
+                                                     replies=choice["replies"], images=choice["images"])
+        except CommentStoreError as exc:
+            self._error("Duplicate set", exc)
+            return None
+        self._reload_sets(new["set_id"])
+        missing = (f" {len(info['missing_images'])} image file(s) were missing and were not copied."
+                   if info.get("missing_images") else "")
+        self._show_banner(f"'{html.escape(source['name'])}' duplicated as '{html.escape(new['name'])}'.{missing} "
+                          f"<a href='set:{source['set_id']}'>Back to '{html.escape(source['name'])}'</a>")
+        return new
+
+    def renumber_by_kp(self) -> bool:
+        """Number the set's comments 1, 2, 3… in KP order, after a preview and confirmation."""
+        if self.set_row is None or self.store is None or not self._confirm_leave():
+            return False
+        plan = model.renumber_plan(self.comments)
+        if all(old == new for _c, old, new in plan):
+            QMessageBox.information(self, "Renumber by KP", "The comments are already numbered in KP order.")
+            return False
+        dialog = RenumberDialog(self, self.set_row["name"], plan)
+        if not qt_exec(dialog):
+            return False
+        keep = dialog.keep_previous()
+        try:
+            result = self.store.renumber_by_kp(self.set_row["set_id"], keep_previous=keep)
+        except CommentStoreError as exc:
+            self._error("Renumber by KP", exc)
+            return False
+        self._reload_sets(self.set_row["set_id"])
+        if keep:
+            self._show_column(f"cf:{next((f.field_id for f in self.fields if f.name == model.PREVIOUS_NUMBER_FIELD), '')}")
+        changed = sum(1 for _i, old, new in result if old != new)
+        self._message(f"Renumbered {changed} comment(s) in KP order"
+                      + (f"; their previous numbers are in '{model.PREVIOUS_NUMBER_FIELD}'." if keep else "."),
+                      MESSAGE_SUCCESS, 6)
+        return True
+
+    def _show_column(self, key: str) -> None:
+        keys = self.table_model.column_keys()
+        if key in keys:
+            self._set_column_shown(keys.index(key), True)
 
     def rename_set(self) -> None:
         if self.set_row is None:
@@ -1041,7 +1206,9 @@ class RouteCommentsDock(QDockWidget):
     def _on_double_click(self, index) -> None:
         key = self.table_model.key(self.proxy.mapToSource(index).column())
         comment = self.by_id.get(index.data(ID_ROLE), {})
-        if key == "kp" and comment.get("ref_kind") == model.REF_LOCATION:
+        if key == "kp" and comment.get("ref_kind") == model.REF_GENERAL:
+            self.place_on_map(comment.get("comment_id"))
+        elif key == "kp" and comment.get("ref_kind") == model.REF_LOCATION:
             self.edit_position()
         elif not self.table_model.is_editable(key, comment):
             self.zoom_to_selected()
@@ -1162,7 +1329,10 @@ class RouteCommentsDock(QDockWidget):
         menu = QMenu(self)
         menu.addAction(_theme_icon("/mActionZoomToSelected.svg"), "Zoom to", self.zoom_to_selected)
         if len(ids) == 1:
-            menu.addAction("Edit position…", self.edit_position)
+            if self.by_id.get(ids[0], {}).get("ref_kind") == model.REF_GENERAL:
+                menu.addAction("Place on the map…", lambda: self.place_on_map(ids[0]))
+            else:
+                menu.addAction("Edit position…", self.edit_position)
         status_menu = menu.addMenu("Set status")
         for name in self.statuses():
             status_menu.addAction(name, lambda n=name: self.bulk_update({"status": n}))
@@ -1170,11 +1340,93 @@ class RouteCommentsDock(QDockWidget):
         for name in self.priorities():
             prio_menu.addAction(name, lambda n=name: self.bulk_update({"priority": n}))
         menu.addSeparator()
+        what = "comment" if len(ids) == 1 else f"{len(ids)} comments"
+        others = []
+        try:
+            others = [s for s in self.store.list_sets() if s["set_id"] != (self.set_row or {}).get("set_id")]
+        except CommentStoreError:
+            pass
+        for title, move in ((f"Copy {what} to set", False), (f"Move {what} to set", True)):
+            sub = menu.addMenu(title)
+            for row in others:
+                sub.addAction(row["name"], lambda s=row["set_id"], m=move: self.copy_to_set(s, move=m))
+            if others:
+                sub.addSeparator()
+            sub.addAction("New set…", lambda m=move: self.copy_to_set(None, move=m))
+        menu.addSeparator()
         menu.addAction("Copy comment ID" + ("s" if len(ids) > 1 else ""),
                        lambda: QApplication.clipboard().setText("\n".join(ids)))
         menu.addAction("Delete…", self.delete_selected)
         qt_exec(menu, self.table.viewport().mapToGlobal(pos))
         menu.deleteLater()
+
+    def copy_to_set(self, target_set_id: Optional[str], move: bool = False, ids: Optional[List[str]] = None,
+                    new_name: Optional[str] = None) -> Optional[Dict]:
+        """Copy (or move) the selected comments to another set, or to a new set
+        (``target_set_id`` None) with this set's statuses, priorities and
+        custom fields. Copies get new IDs and copies of the replies and
+        images; moved comments keep theirs. Both are numbered after the
+        target's last comment."""
+        ids = list(ids if ids is not None else self.selected_ids())
+        if not ids or self.store is None or self.set_row is None:
+            return None
+        if not self._confirm_leave():
+            return None
+        source = self.set_row
+        verb = "Move" if move else "Copy"
+        created = None
+        try:
+            if target_set_id is None:
+                if new_name is None:
+                    names = [s["name"] for s in self.store.list_sets()]
+                    new_name, ok = QInputDialog.getText(
+                        self, f"{verb} to a new set", f"{verb} {len(ids)} comment(s) to a new set (with the statuses, "
+                        f"priorities and custom fields of '{source['name']}'), named:",
+                        text=unique_name(f"{source['name']} (selection)", names))
+                    if not ok or not new_name.strip():
+                        return None
+                created, _info = self.store.duplicate_set(source["set_id"], new_name.strip(), comments=False)
+                target_set_id = created["set_id"]
+            target = self.store.get_set(target_set_id)
+            if target is None:
+                raise CommentStoreError("That comment set no longer exists.")
+            if move and created is None:
+                labels = ", ".join(model.ref_label(self.by_id.get(c, {}).get("ref_no")) for c in ids[:8])
+                more = f" and {len(ids) - 8} more" if len(ids) > 8 else ""
+                answer = QMessageBox.question(
+                    self, "Move comments", f"Move {labels}{more} from '{source['name']}' to '{target['name']}'?\n\n"
+                    "They keep their replies, images and IDs, and are numbered after the last comment there.",
+                    MESSAGEBOX_YES | MESSAGEBOX_NO, MESSAGEBOX_YES)
+                if answer != MESSAGEBOX_YES:
+                    return None
+            with _busy():
+                result = (self.store.move_comments(ids, target_set_id) if move
+                          else self.store.copy_comments(ids, target_set_id))
+        except CommentStoreError as exc:
+            if created is not None:
+                try:
+                    self.store.delete_set(created["set_id"])
+                except CommentStoreError:
+                    pass
+            self._error(f"{verb} comments", exc)
+            if created is not None:
+                self._reload_sets(source["set_id"])
+            return None
+        if created is not None:
+            self._reload_sets(source["set_id"])
+        else:
+            self.reload(keep_selection=not move)
+        numbers = [new for _old, new, _id in result["numbers"]]
+        notes = []
+        if result.get("fields_added"):
+            notes.append("Custom field(s) added there: " + ", ".join(html.escape(n) for n in result["fields_added"])
+                         + ".")
+        if result.get("missing_images"):
+            notes.append(f"{len(result['missing_images'])} image file(s) were missing and were not copied.")
+        self._show_banner(f"{'Moved' if move else 'Copied'} {len(numbers)} comment(s) to "
+                          f"'{html.escape(target['name'])}' as {_numbers_text(numbers)}. " + " ".join(notes)
+                          + f" <a href='set:{target_set_id}'>Show '{html.escape(target['name'])}'</a>")
+        return result
 
     def bulk_update(self, changes: Dict) -> None:
         ids = self.selected_ids()
@@ -1339,6 +1591,9 @@ class RouteCommentsDock(QDockWidget):
         selected = len(self.selected_ids())
         if selected > 1:
             text += f" · {selected} selected"
+        general = sum(1 for c in self.comments if c.get("ref_kind") == model.REF_GENERAL)
+        if general:
+            text += f" · {general} general (not on the map)"
         if attention:
             text += f" · {attention} with a changed or unavailable route"
         self.status.setText(text if self.set_row is not None else "")
@@ -1382,11 +1637,12 @@ class RouteCommentsDock(QDockWidget):
         if comment is None:
             n = len(self.selected_ids())
             self.editor_title.setText(f"{n} comments selected — right-click the table to set their status or "
-                                      "priority." if n > 1 else
-                                      "Select a comment, or add one from the KP Mouse Tool's right-click menu "
-                                      "(Add Comment).")
+                                      "priority, or copy or move them to another set." if n > 1 else
+                                      "Select a comment, or add one with Add (or the KP Mouse Tool's right-click "
+                                      "menu, Add Comment).")
             self.condition_label.hide()
             self._set_quick(None)
+            self.position_button.setText("Edit position…")
             self.form.load({})
             self.form.setEnabled(False)
             self.thread.set_thread(None, [], "")
@@ -1398,8 +1654,13 @@ class RouteCommentsDock(QDockWidget):
             self._update_enabled()
             return
         self.form.setEnabled(True)
+        general = comment.get("ref_kind") == model.REF_GENERAL
+        self.position_button.setText("Place on the map…" if general else "Edit position…")
+        self.position_button.setToolTip("Give this general comment a location by clicking the map" if general else
+                                        "Change the KP, KP range or map coordinates and update the map")
         title = (f"<b>{model.ref_label(comment.get('ref_no'))}</b> · "
-                 f"{model.REF_LABELS.get(comment.get('ref_kind'), '')} · {model.location_text(comment)}")
+                 f"{model.location_text(comment) if general else model.REF_LABELS.get(comment.get('ref_kind'), '')}"
+                 + ("" if general else f" · {model.location_text(comment)}"))
         self.editor_title.setText(title)
         self.editor_title.setToolTip(model.location_text(comment))
         code, notes = self.table_model.conditions.get(cid) or (model.COND_NONE, [])
@@ -1500,6 +1761,9 @@ class RouteCommentsDock(QDockWidget):
         cid, store = self.current_id, self.store
         comment = dict(self.by_id.get(cid, {}))
         if not comment:
+            return False
+        if comment.get("ref_kind") == model.REF_GENERAL:
+            self.place_on_map(cid)      # a general comment has no position to edit: give it one
             return False
         self._show_comment(cid)  # Reflect any Details/thread edits saved or discarded above.
         dialog = None
@@ -1774,9 +2038,11 @@ class RouteCommentsDock(QDockWidget):
             self.act_show_map.setChecked(True)
         if not self.act_labels.isChecked():
             self.act_labels.setChecked(True)
+        self.layers.set_labels(True)       # also labels turned off in Layer Properties
         layers = self.layers.layers()
         settings = map_layers.label_settings_of(self.layers.find("points"))
-        if layers and (not settings.images or any(map_layers.labels_predate_images(x) for x in layers)):
+        if layers and (not settings.images or any(map_layers.labels_predate_images(x) for x in layers)
+                       or not all(map_layers.labels_show_images(x) for x in layers)):
             answer = QMessageBox.question(
                 self, "Route Comments", "The comment labels are not set to show images. Update them now? This "
                 "replaces label changes made in Layer Properties (Label contents… sets them again).",
@@ -1784,28 +2050,71 @@ class RouteCommentsDock(QDockWidget):
             if answer == MESSAGEBOX_YES:
                 settings.images = True
                 map_layers.apply_labels(layers, settings, True)
-        if self.iface is not None and self.iface.mapCanvas().scale() > settings.detail_scale:
-            self._message(f"The image shows in the comment's label when zoomed in beyond 1:{settings.detail_scale:,}.")
+        canvas = self.iface.mapCanvas() if self.iface is not None else None
+        if canvas is not None and canvas.scale() > settings.detail_scale * 1.001:
+            scale = int(settings.detail_scale)
+            self._message_with_button(
+                f"Images show in the comment labels from 1:{scale:,} (zoomed in further); the map is at "
+                f"1:{int(round(canvas.scale())):,}. Label contents… changes that scale.", "Zoom in",
+                lambda: canvas.zoomScale(scale))
+
+    def _message_with_button(self, text: str, button_text: str, slot, duration: int = 10) -> None:
+        """A message bar note with one button (falls back to a plain note)."""
+        try:
+            bar = self.iface.messageBar()
+            item = bar.createMessage("Route Comments", text)
+            button = QPushButton(button_text, item)
+            button.clicked.connect(slot)
+            button.clicked.connect(lambda: bar.popWidget(item))
+            item.layout().addWidget(button)
+            bar.pushWidget(item, MESSAGE_INFO, duration)
+        except Exception:  # noqa: BLE001 - no message bar (tests)
+            self._message(text)
 
     def _open_file(self, path: str) -> None:
         if path and os.path.isfile(path):
             QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
     # ------------------------------------------------------------------ capture
-    def add_comment_from_capture(self, kind: str, capture: CaptureRoute, data: Dict) -> Optional[Dict]:
-        """Add a comment captured with the KP Mouse Tool (asks for its text)."""
+    def _capture_values(self, kind: str, capture: Optional[CaptureRoute], data: Dict) -> Dict:
+        """The location columns for a captured position (``data`` as the KP Mouse
+        Tool's hook gives it). Without a route a map position has no KP."""
+        if kind == model.REF_GENERAL:
+            return model.general_values()
+        if capture is None:
+            if kind != model.REF_LOCATION:
+                raise ValueError("A KP needs a route: set the KP Mouse Tool's reference line.")
+            lat, lon = self._wgs84(data["point"])
+            return location_without_route(lat, lon)
+        if kind == model.REF_ROUTE_POINT:
+            return capture.point_values(data["kp_km"])
+        if kind == model.REF_KP_RANGE:
+            return capture.range_values(*data["kps"])
+        return capture.location_values(data["point"])
+
+    def _wgs84(self, map_point):
+        """``(lat, lon)`` of a point in the map CRS."""
+        crs = self.iface.mapCanvas().mapSettings().destinationCrs()
+        xform = QgsCoordinateTransform(crs, QgsCoordinateReferenceSystem("EPSG:4326"), QgsProject.instance())
+        point = xform.transform(map_point)
+        if not (abs(point.y()) <= 90.0 and abs(point.x()) <= 180.0):
+            raise ValueError("That position is outside latitude/longitude limits.")
+        return float(point.y()), float(point.x())
+
+    def add_comment_from_capture(self, kind: str, capture: Optional[CaptureRoute], data: Dict) -> Optional[Dict]:
+        """Add a comment captured with the KP Mouse Tool, the map (Add) or typed
+        (asks for its text). ``capture`` None: a map position without a route,
+        or a general comment."""
         if not self._confirm_leave() or not self.ensure_register():
             return None
         try:
-            if kind == model.REF_ROUTE_POINT:
-                values = capture.point_values(data["kp_km"])
-            elif kind == model.REF_KP_RANGE:
-                values = capture.range_values(*data["kps"])
-            else:
-                values = capture.location_values(data["point"])
-        except (ValueError, KeyError) as exc:
+            values = self._capture_values(kind, capture, data)
+        except (ValueError, KeyError, RuntimeError) as exc:
             self._error("New comment", exc)
             return None
+        return self._new_comment(values, capture)
+
+    def _new_comment(self, values: Dict, capture: Optional[CaptureRoute]) -> Optional[Dict]:
         statuses, priorities = self.statuses(), self.priorities()
         dialog = NewCommentDialog(self, values, capture, statuses, priorities, self.fields,
                                   statuses[0] if statuses else "", model.default_priority(priorities),
@@ -1828,6 +2137,171 @@ class RouteCommentsDock(QDockWidget):
                       MESSAGE_SUCCESS, 3)
         return comment
 
+    def add_at_kp(self, kind: str = model.REF_ROUTE_POINT) -> Optional[Dict]:
+        """A new comment at a KP (or over a KP range) typed in the form, starting
+        from the route position nearest the map centre."""
+        if not self._confirm_leave() or not self.ensure_register():
+            return None
+        try:
+            capture = self._route_capture()
+            if capture is None:
+                QMessageBox.information(self, "Route Comments", "A comment at a KP needs a route: choose the "
+                                        "reference line in the KP Mouse Tool's settings first. Without one you can "
+                                        "still add a comment on the map, or a general comment.")
+                return None
+            try:
+                kp = capture.nearest(self.iface.mapCanvas().center())[0]
+            except Exception:  # noqa: BLE001 - start at the beginning of the route instead
+                kp = capture.start_kp_km
+            if kind == model.REF_KP_RANGE:
+                lo = capture.clamp(kp - 0.05)
+                hi = capture.clamp(lo + 0.1)
+                lo = capture.clamp(hi - 0.1)
+                values = capture.range_values(lo, hi)
+            else:
+                values = capture.point_values(kp)
+        except (ValueError, RuntimeError) as exc:
+            self._error("New comment", exc)
+            return None
+        return self._new_comment(values, capture)
+
+    def add_general(self) -> Optional[Dict]:
+        """A new comment with no location (listed, not drawn on the map)."""
+        if not self._confirm_leave() or not self.ensure_register():
+            return None
+        return self._new_comment(model.general_values(), None)
+
+    # ------------------------------------------------------------------ add on the map
+    def _route_capture(self) -> Optional[CaptureRoute]:
+        """The KP Mouse Tool's reference line, measured as it measures it, in
+        the map CRS (None when there is none; ValueError when unmeasurable)."""
+        layer = self.reference_layer() if self.reference_layer else None
+        if layer is None or self.iface is None:
+            return None
+        start = self.start_kp_for(layer) if self.start_kp_for else None
+        return CaptureRoute.from_layer(layer, self.iface.mapCanvas().mapSettings().destinationCrs(), start)
+
+    def _status_hint(self, text: str) -> None:
+        try:
+            bar = self.iface.mainWindow().statusBar()
+            if text:
+                bar.showMessage(text)
+            else:
+                bar.clearMessage()
+        except Exception:  # noqa: BLE001 - no status bar (tests)
+            pass
+
+    def _connect_map_tool_signal(self) -> None:
+        if not getattr(self, "_map_tool_connected", False) and self.iface is not None:
+            self.iface.mapCanvas().mapToolSet.connect(self._on_map_tool_set)
+            self._map_tool_connected = True
+
+    def _toggle_place(self, on: bool) -> None:
+        """The Add button: the map tool that adds comments where you click."""
+        if self.iface is None:
+            return
+        canvas = self.iface.mapCanvas()
+        if on:
+            if not self._confirm_leave() or not self.ensure_register():
+                self._set_place_checked(False)
+                self._place_target = None      # the next Add is an ordinary one
+                return
+            if not self.act_show_map.isChecked():
+                self.act_show_map.setChecked(True)
+            if self.place_tool is None:
+                self.place_tool = CommentPlaceTool(canvas, self._route_capture, self._status_hint)
+                self.place_tool.placed.connect(self._on_placed)
+                self.place_tool.stopped.connect(self._stop_placing)
+                self._connect_map_tool_signal()
+            if canvas.mapTool() is not self.place_tool:
+                self._tool_before_place = canvas.mapTool()
+                canvas.setMapTool(self.place_tool)
+            self._place_banner()
+            if self.place_tool.capture is None and not self._place_target:
+                self._message("There is no KP reference line" + (f" ({self.place_tool.problem})"
+                              if self.place_tool.problem else "") + ": comments go where you click, without a KP. "
+                              "Set the reference line in the KP Mouse Tool to place them by KP.", MESSAGE_WARNING, 6)
+            return
+        self._place_target = None
+        if self.place_tool is not None and canvas.mapTool() is self.place_tool:
+            previous = self._tool_before_place
+            from ..qgis_compat import is_deleted
+            if previous is not None and not is_deleted(previous) and previous is not self.place_tool:
+                canvas.setMapTool(previous)
+            else:
+                canvas.unsetMapTool(self.place_tool)
+        self._tool_before_place = None
+        if self.banner.property("placing"):
+            self._show_banner("")
+
+    def _place_banner(self) -> None:
+        target = self.by_id.get(self._place_target or "")
+        what = f"comment {model.ref_label(target.get('ref_no'))}" if target else "comments"
+        self._show_banner(f"<b>Click the map to place {what}</b>: a click puts it on the route at the nearest KP, "
+                          "Shift+click exactly where you click, a drag along the route over a KP range. "
+                          "<a href='stop'>Stop</a> (Esc)")
+        self.banner.setProperty("placing", True)
+
+    def _set_place_checked(self, on: bool) -> None:
+        self.act_place.blockSignals(True)
+        self.act_place.setChecked(bool(on))
+        self.act_place.blockSignals(False)
+
+    def _stop_placing(self, *_args) -> None:
+        if self.act_place.isChecked():
+            self.act_place.setChecked(False)
+        else:
+            self._place_target = None
+
+    def place_on_map(self, comment_id: Optional[str] = None) -> None:
+        """Give a general comment a location: the next click on the map places it."""
+        cid = comment_id or self.current_id
+        if cid not in self.by_id:
+            return
+        self._place_target = cid
+        if self.act_place.isChecked():
+            self._place_banner()
+        else:
+            self.act_place.setChecked(True)
+
+    def _on_placed(self, kind: str, data) -> None:
+        capture = self.place_tool.capture if self.place_tool is not None else None
+        if not self.isVisible():
+            self.show()
+        if self._place_target:
+            self._assign_location(self._place_target, kind, capture, data)
+        else:
+            self.add_comment_from_capture(kind, capture, data)
+
+    def _assign_location(self, cid: str, kind: str, capture, data) -> bool:
+        """Place a (general) comment where the map was clicked, after asking."""
+        comment = self.by_id.get(cid)
+        if comment is None or self.store is None:
+            self._stop_placing()
+            return False
+        try:
+            values = self._capture_values(kind, capture, data)
+        except (ValueError, KeyError, RuntimeError) as exc:
+            self._error("Place comment", exc)
+            return False
+        label = model.ref_label(comment.get("ref_no"))
+        answer = QMessageBox.question(self, "Place comment", f"Place comment {label} here?\n\n"
+                                      f"{model.location_text(values)}", MESSAGEBOX_YES | MESSAGEBOX_NO, MESSAGEBOX_YES)
+        if answer != MESSAGEBOX_YES:
+            return False
+        changes = {key: values.get(key) for key in set(model.ROUTE_COLUMNS) | set(POSITION_COLUMNS)}
+        try:
+            self.store.update_comment(cid, changes, expected_version=comment.get("version"))
+        except CommentStoreError as exc:
+            self._error("Place comment", exc)
+            return False
+        self._stop_placing()
+        self.checker.clear()
+        self.reload()
+        self._select_ids([cid])
+        self._message(f"Comment {label} placed: {model.location_text(values)}.", MESSAGE_SUCCESS, 4)
+        return True
+
     # ------------------------------------------------------------------ import / export
     def import_comments(self) -> None:
         if not self.ensure_register():
@@ -1849,11 +2323,14 @@ class RouteCommentsDock(QDockWidget):
                 return None
 
         def build(rows, layer):
-            route = route_for(layer) if layer is not None else None
+            route = route_for(layer) if layer is not None and any(r.kind != model.REF_GENERAL for r in rows) \
+                else None
             out = []
             for row in rows:
                 values = dict(row.values)
-                if row.kind == model.REF_LOCATION:
+                if row.kind == model.REF_GENERAL:
+                    ref = model.general_values()
+                elif row.kind == model.REF_LOCATION:
                     ref = route.location_from_wgs84(values["lat"], values["lon"]) if route else \
                         location_without_route(values["lat"], values["lon"])
                 elif row.kind == model.REF_KP_RANGE:
@@ -1870,7 +2347,8 @@ class RouteCommentsDock(QDockWidget):
         if not qt_exec(dialog):
             return
         try:
-            added = self.store.add_comments(self.set_row["set_id"], dialog.result_rows)
+            with _busy():
+                added = self.store.add_comments(self.set_row["set_id"], dialog.result_rows)
         except CommentStoreError as exc:
             self._error("Import", exc)
             return
@@ -1881,6 +2359,9 @@ class RouteCommentsDock(QDockWidget):
         self._message(f"Imported {len(added)} comment(s) into '{self.set_row['name']}'"
                       + (f" with {images} image(s)" if images else "")
                       + (f"; {skipped} row(s) skipped." if skipped else "."), MESSAGE_SUCCESS, 5)
+        if any(c.get("map_image") for c in added):
+            # The same checks as ticking Show on map: labels on and able to hold images, and the scale.
+            self._prepare_map_images()
 
     def export_comments(self) -> None:
         if self.store is None or self.set_row is None:
@@ -1956,7 +2437,7 @@ class RouteCommentsDock(QDockWidget):
             if self.pick_tool is None:
                 self.pick_tool = map_layers.CommentPickTool(canvas, self.layers.layers, self._describe)
                 self.pick_tool.picked.connect(self._on_picked)
-                canvas.mapToolSet.connect(self._on_map_tool_set)
+                self._connect_map_tool_signal()
             canvas.setMapTool(self.pick_tool)
         elif self.pick_tool is not None and canvas.mapTool() is self.pick_tool:
             canvas.unsetMapTool(self.pick_tool)
@@ -1966,6 +2447,13 @@ class RouteCommentsDock(QDockWidget):
             self.act_pick.blockSignals(True)
             self.act_pick.setChecked(False)
             self.act_pick.blockSignals(False)
+        if self.place_tool is not None and new_tool is not self.place_tool and self.act_place.isChecked():
+            # Another map tool took over: adding on the map has stopped.
+            self._set_place_checked(False)
+            self._place_target = None
+            self._tool_before_place = None
+            if self.banner.property("placing"):
+                self._show_banner("")
 
     def _describe(self, cid: str) -> str:
         comment = self.by_id.get(cid, {})
@@ -1985,6 +2473,7 @@ class RouteCommentsDock(QDockWidget):
 
     # ------------------------------------------------------------------ misc
     def _show_banner(self, markup: str) -> None:
+        self.banner.setProperty("placing", False)
         self.banner.setText(markup)
         self.banner.setVisible(bool(markup))
 
@@ -1995,6 +2484,13 @@ class RouteCommentsDock(QDockWidget):
             self.open_register()
         elif link == "clear":
             self.clear_filters()
+        elif link == "stop":
+            self._stop_placing()
+        elif link.startswith("set:"):
+            index = self.set_combo.findData(link[4:])
+            if index >= 0 and self._confirm_leave():
+                self._show_banner("")
+                self.set_combo.setCurrentIndex(index)
         elif link == "reload":
             self._dirty = False
             self._show_banner("")
@@ -2021,8 +2517,9 @@ class RouteCommentsDock(QDockWidget):
         for widget in (self.search, self.filter_button, self.map_button, self.pick_button):
             widget.setEnabled(has_set)
         for action in (self.act_rename_set, self.act_delete_set, self.act_fields, self.act_choices,
-                       self.act_export):
+                       self.act_export, self.act_duplicate_set):
             action.setEnabled(has_set)
+        self.act_renumber.setEnabled(has_set and len(self.comments) > 1)
         self.act_import.setEnabled(self.store is not None)
         self.set_combo.setEnabled(self.store is not None)
         self.position_button.setEnabled(has_comment)
@@ -2059,19 +2556,31 @@ class RouteCommentsDock(QDockWidget):
         self._search_timer.stop()
         if self._project_connected:
             project = QgsProject.instance()
-            for signal in (project.readProject, project.cleared):
+            for signal, slot in ((project.readProject, self._on_project_changed),
+                                 (project.cleared, self._on_project_changed),
+                                 (project.aboutToBeCleared, self._stop_placing)):
                 try:
-                    signal.disconnect(self._on_project_changed)
+                    signal.disconnect(slot)
                 except (TypeError, RuntimeError):
                     pass
             self._project_connected = False
         self._disconnect_layers()
-        if self.iface is not None and self.pick_tool is not None:
-            canvas = self.iface.mapCanvas()
+        if self.iface is not None and getattr(self, "_map_tool_connected", False):
             try:
-                canvas.mapToolSet.disconnect(self._on_map_tool_set)
+                self.iface.mapCanvas().mapToolSet.disconnect(self._on_map_tool_set)
             except (TypeError, RuntimeError):
                 pass
+            self._map_tool_connected = False
+        if self.iface is not None and self.place_tool is not None:
+            canvas = self.iface.mapCanvas()
+            if canvas.mapTool() is self.place_tool:
+                canvas.unsetMapTool(self.place_tool)
+            self.place_tool.dispose()
+            self.place_tool.deleteLater()
+            self.place_tool = None
+            self._status_hint("")
+        if self.iface is not None and self.pick_tool is not None:
+            canvas = self.iface.mapCanvas()
             if canvas.mapTool() is self.pick_tool:
                 canvas.unsetMapTool(self.pick_tool)
             self.pick_tool.deleteLater()

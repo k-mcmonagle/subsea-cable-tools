@@ -26,6 +26,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **Translate KPs and Ranges Between RPLs:** translate KP fields, non-spatial tables, pasted lists or point/line geometry, preserving attributes and reporting ranges that need review; optionally rebuild accepted points and ranges on the new route. Available in Processing and from the KP Mouse Tool's right-click menu; numeric inputs must use the selected old route's measured KP basis, common pasted KP headers are detected automatically, and the log explains empty map outputs with feature counts and exclusion reasons.
 
+- **Route Comments — adding, copying and renumbering:** an **Add** button in the dock adds comments by clicking the map (on the route at the nearest KP, Shift+click exactly there, drag along the route for a KP range) without the KP Mouse Tool, at a typed KP or KP range, or as a general comment with no location that can be placed on the map later. Selected comments can be copied or moved to another set or a new one; sets and whole registers can be duplicated; and *Renumber by KP* renumbers a set in KP order after a preview and confirmation, keeping the old numbers in a *Previous No.* field. Registers stay readable by earlier versions, which list general comments without showing them on the map.
+
 - **Burial Planner — Ground Model horizons (beta - check outputs):** import interpreted horizons from 2D DXF sections, calibrate their KP and depth references, and show, rename, recolour or edit their vertices over the ground plot. Horizons are saved with the plan without changing soil classes or burial calculations; check the import preview and reference warnings before use.
 
 ### Improved
@@ -33,6 +35,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Route Comments — KP editing:** KP values use 3 decimal places (1 m), and table KPs can be edited with route validation and an old/new confirmation; derived nearest KPs open coordinate editing instead. New-comment forms, position dialogs and table KP edits preview unsaved points and ranges in blue on the map, with **Zoom to preview** in the dialogs; untouched position precision, existing registers and saved table layouts are preserved.
 
 - **Route Comments:** edit an existing comment's KP, KP range or map coordinates through **Details ▸ Edit position…** or the table's right-click menu. Saving updates its map geometry and labels automatically; map locations also recalculate their nearest KP and distance off route. Edits keep the saved KP basis, untouched coordinate precision, IDs, replies and images, with no register schema changes or new dependencies. Changed or unavailable routes and concurrent comment edits are checked before saving.
+
+### Fixed
+
+- **Route Comments — images on the map:** images in map labels are now found beside the register the layer reads, so they keep showing when a project is opened from another folder or by another user (for example a synced folder under each user's own name) and before the dock is opened; labels made earlier are updated when the dock opens, keeping other label changes. Details and images now show at their own scale (a map set to 1:50,000), and an import that puts images on the map now offers to update labels that cannot show them and to zoom in.
+- **Route Comments — route references:** comments no longer show *Route unavailable* when the project and its route file are opened from another user's or computer's folder.
 
 ## [2.0.0] - 2026-10-23
 

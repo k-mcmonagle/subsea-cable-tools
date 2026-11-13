@@ -102,6 +102,20 @@ def _source_path(source: str) -> str:
     return str(source or "").split("|", 1)[0]
 
 
+def _same_file_elsewhere(saved: str, current: str) -> bool:
+    """Whether ``current`` (a project layer's source) is the saved route source
+    opened from another folder: the saved file is not there on this computer,
+    and the file name and layer options are the same. A project and its data
+    in a synced or shared folder open under each user's own path (another
+    user name, drive letter or share), while the project keeps the layer ID."""
+    saved_path, _sep, saved_rest = str(saved or "").partition("|")
+    path, _sep2, rest = str(current or "").partition("|")
+    if not saved_path or not path or os.path.exists(saved_path):
+        return False
+    name = lambda p: os.path.normcase(os.path.basename(p.replace("\\", "/")))  # noqa: E731
+    return name(saved_path) == name(path) and saved_rest.lower() == rest.lower()
+
+
 def workbench_rpl_info(layer, store=None) -> Dict:
     """``{rpl_id, rpl_name, rpl_rev, rpl_route_id, rpl_source_file}`` when
     ``layer`` is a Cable Route Workbench RPL lines layer, else ``{}``."""
@@ -369,7 +383,8 @@ class ReferenceChecker:
         source = _norm_source(resolved_source)
         layer = self.project.mapLayer(layer_id) if layer_id else None
         if isinstance(layer, QgsVectorLayer) and layer.isValid() and \
-                (not source or _norm_source(layer.source()) == source):
+                (not source or _norm_source(layer.source()) == source
+                 or _same_file_elsewhere(resolved_source, layer.source())):
             return layer, "project"
         if source:
             for candidate in self.project.mapLayers().values():

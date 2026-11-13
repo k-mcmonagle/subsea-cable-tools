@@ -670,8 +670,204 @@ def test_export_rows() -> bool:
     return _result("export rows: every column, custom fields of every set", not failed, ", ".join(failed))
 
 
+def _image(folder: str, name: str = "page.png") -> str:
+    path = os.path.join(folder, name)
+    with open(path, "wb") as handle:
+        handle.write(b"\x89PNG\r\n\x1a\n" + name.encode("ascii"))
+    return path
+
+
+def test_general_comments() -> bool:
+    """A general comment has no location (NULL geometry, no KP), can be given
+    one later and taken back to general; import can make rows without a
+    location general comments when asked."""
+    path = os.path.join(_folder(), "reg.gpkg")
+    store = CommentStore.create(path)
+    try:
+        set_id = store.list_sets()[0]["set_id"]
+        general = store.add_comment(set_id, dict(model.general_values(), text="Title block revision is wrong",
+                                                 kp_km=4.0, route_name="stray"))
+        cid = general["comment_id"]
+        conn = sqlite3.connect(path)
+        try:
+            geom_null = conn.execute("SELECT geom IS NULL FROM rc_comment WHERE comment_id = ?", (cid,)).fetchone()[0]
+        finally:
+            conn.close()
+        ok = (general["ref_kind"] == model.REF_GENERAL and general["wkt"] == "" and general["kp_km"] is None
+              and general["route_name"] is None and geom_null == 1
+              and model.location_text(general) == "General comment (no location)" and model.kp_text(general) == "")
+        placed = store.update_comment(cid, {"ref_kind": model.REF_ROUTE_POINT, "kp_km": 2.5, "wkt": "POINT(3 55)"})
+        back = store.update_comment(cid, dict(model.general_values()))
+        ok = ok and placed["wkt"] == "POINT(3.0 55.0)" and placed["kp_km"] == 2.5 and back["wkt"] == "" \
+            and back["kp_km"] is None and back["version"] == 3
+        try:
+            store.add_comment(set_id, _point(wkt=""))       # a route point still needs its geometry
+            refused = False
+        except CommentStoreError:
+            refused = True
+        rows = [["General remark", "", "", ""], ["Range end only", "", "7.0", ""], ["Bad lat", "", "", "abc"]]
+        mapping = {"text": 0, "kp_km": 1, "kp_end_km": 2, "lat": 3}
+        strict = model.validate_import(rows, mapping, kp_range=(0.0, 10.0))
+        loose = model.validate_import(rows, mapping, kp_range=(0.0, 10.0), allow_general=True)
+        ok = ok and refused and [r.ok for r in strict] == [False, False, False] and \
+            [r.ok for r in loose] == [True, False, False] and loose[0].kind == model.REF_GENERAL and \
+            any("general comment" in w for w in loose[0].warnings)
+    finally:
+        store.close()
+    return _result("general comments: no location, placed later, imported when asked", ok)
+
+
+def test_copy_move_duplicate() -> bool:
+    """Copy and move comments between sets (custom fields matched by name, a
+    missing one added; replies and images copied as independent files; a
+    moved comment keeps its ID); duplicate a set with or without comments;
+    a failed copy leaves nothing behind."""
+    folder = _folder()
+    path = os.path.join(folder, "reg.gpkg")
+    store = CommentStore.create(path)
+    try:
+        a = store.list_sets()[0]
+        b = store.create_set("Client", statuses=[{"name": "New"}, {"name": "Done", "closed": True}])
+        a_fields = store.save_fields(a["set_id"], [model.CustomField("", "Discipline", model.FIELD_CHOICE,
+                                                                     ["Route", "Geotech"]),
+                                                   model.CustomField("", "Survey line", model.FIELD_TEXT)])
+        b_fields = store.save_fields(b["set_id"], [model.CustomField("", "discipline", model.FIELD_TEXT)])
+        disc, line = a_fields[0].field_id, a_fields[1].field_id
+        c1 = store.add_comments(a["set_id"], [dict(_point(), custom_json=model.dump_custom({disc: "Route"}),
+                                                   attach_paths=[_image(folder)], attach_on_map=True)])[0]
+        c2 = store.add_comment(a["set_id"], dict(model.general_values(), text="General"))
+        c3 = store.add_comment(a["set_id"], _point(text="Third", custom_json=model.dump_custom({line: "L12"})))
+        store.add_reply(c1["comment_id"], "B", "Agreed")
+        store.add_comment(b["set_id"], _point(text="Already in the client set"))
+        copied = store.copy_comments([c3["comment_id"], c1["comment_id"]], b["set_id"])
+        new1 = store.get_comment(copied["numbers"][0][2])
+        new3 = store.get_comment(copied["numbers"][1][2])
+        b_fields_after = {f.name: f.field_id for f in store.list_fields(b["set_id"])}
+        old_image = store.list_attachments(c1["comment_id"])[0]
+        new_image = store.list_attachments(new1["comment_id"])[0]
+        ok = ([(o, n) for o, n, _i in copied["numbers"]] == [(1, 2), (3, 3)] and copied["fields_added"] ==
+              ["Survey line"] and new1["comment_id"] != c1["comment_id"] and new1["set_id"] == b["set_id"]
+              and model.load_custom(new1) == {b_fields[0].field_id: "Route"}
+              and model.load_custom(new3) == {b_fields_after["Survey line"]: "L12"}
+              and [r["text"] for r in store.list_replies(new1["comment_id"])] == ["Agreed"]
+              and new_image["file_name"] != old_image["file_name"] and os.path.isfile(store.attachment_path(new_image))
+              and new1["map_image"] == new_image["file_name"] and new_image["original_name"] == "page.png"
+              and new1["wkt"] == c1["wkt"] and new1["created_utc"] == c1["created_utc"] and new1["version"] == 1
+              and store.get_comment(c1["comment_id"])["set_id"] == a["set_id"])
+        store.delete_comments([c1["comment_id"]])
+        ok = ok and os.path.isfile(store.attachment_path(new_image))        # the copy has its own file
+        moved = store.move_comments([c2["comment_id"]], b["set_id"])
+        after = store.get_comment(c2["comment_id"])
+        ok = ok and moved["numbers"] == [(2, 4, c2["comment_id"])] and after["set_id"] == b["set_id"] \
+            and after["ref_no"] == 4 and after["version"] == c2["version"] + 1 and after["ref_kind"] == model.REF_GENERAL
+        before_files = set(os.listdir(store.attachments_dir))
+        try:   # new1 has an image: its staged copy must be removed again
+            store.copy_comments([new1["comment_id"], "no-such-comment"], a["set_id"])
+            conflict = False
+        except ConflictError:
+            conflict = True
+        ok = ok and conflict and set(os.listdir(store.attachments_dir)) == before_files and \
+            len(store.list_comments(a["set_id"])) == 1 and len(store.list_comments(b["set_id"])) == 4
+        dup, info = store.duplicate_set(b["set_id"], "Client rev B")
+        dup_rows = store.list_comments(dup["set_id"])
+        dup_fields = {f.name: f.field_id for f in store.list_fields(dup["set_id"])}
+        dup_image = [store.list_attachments(c["comment_id"]) for c in dup_rows if c["attachment_count"]]
+        ok = ok and [c["ref_no"] for c in dup_rows] == [1, 2, 3, 4] and info["missing_images"] == [] and \
+            store.statuses_of(dup) == store.statuses_of(b) and set(dup_fields) == {"discipline", "Survey line"} and \
+            not set(dup_fields.values()) & set(b_fields_after.values()) and \
+            model.load_custom(next(c for c in dup_rows if c["ref_no"] == 2)) == {dup_fields["discipline"]: "Route"} \
+            and len(dup_image) == 1 and dup_image[0][0]["file_name"] not in (new_image["file_name"],) and \
+            not {c["comment_id"] for c in dup_rows} & {c["comment_id"] for c in store.list_comments(b["set_id"])}
+        shell, _info = store.duplicate_set(b["set_id"], "Client empty", comments=False)
+        try:
+            store.duplicate_set(b["set_id"], "client REV b")
+            dup_refused = False
+        except CommentStoreError:
+            dup_refused = True
+        ok = ok and store.list_comments(shell["set_id"]) == [] and len(store.list_fields(shell["set_id"])) == 2 \
+            and dup_refused
+    finally:
+        store.close()
+    return _result("copy / move between sets; duplicate a set; a failed copy leaves nothing", ok)
+
+
+def test_renumber_by_kp() -> bool:
+    """Renumbering follows KP route by route (ranges by their lower KP, map
+    locations by nearest KP, ties by number), comments without a KP last;
+    the old numbers go in a Previous No. field; a second run changes nothing."""
+    path = os.path.join(_folder(), "reg.gpkg")
+    store = CommentStore.create(path)
+    try:
+        set_id = store.list_sets()[0]["set_id"]
+        on_a = {"rpl_id": "rpl-a"}
+        specs = [dict(_point(kp_km=5.0), **on_a),
+                 dict(_point(ref_kind=model.REF_KP_RANGE, kp_km=1.0, kp_end_km=2.0,
+                             wkt="LINESTRING(3 55, 3.1 55)"), **on_a),
+                 dict(_point(ref_kind=model.REF_LOCATION, kp_km=3.0, dcc_m=120.0), **on_a),
+                 dict(model.general_values(), text="General"),
+                 dict(_point(kp_km=1.0), **on_a),
+                 dict(_point(kp_km=0.5), rpl_id="rpl-b")]
+        made = store.add_comments(set_id, specs)
+        old_to_id = {c["ref_no"]: c["comment_id"] for c in made}
+        plan = model.renumber_plan(store.list_comments(set_id))
+        result = store.renumber_by_kp(set_id)
+        after = {c["comment_id"]: c for c in store.list_comments(set_id)}
+        field = next(f for f in store.list_fields(set_id) if f.name == model.PREVIOUS_NUMBER_FIELD)
+        expected = {2: 1, 5: 2, 3: 3, 1: 4, 6: 5, 4: 6}
+        ok = ([(old, new) for _c, old, new in plan] == sorted(expected.items(), key=lambda kv: kv[1])
+              and all(after[old_to_id[old]]["ref_no"] == new for old, new in expected.items())
+              and all(model.load_custom(after[old_to_id[old]])[field.field_id] == f"#{old}" for old in expected)
+              and all(after[old_to_id[old]]["version"] == 2 for old in expected)
+              and [(o, n) for _i, o, n in result] == [(o, n) for _c, o, n in plan])
+        again = store.renumber_by_kp(set_id)
+        ok = ok and all(o == n for _i, o, n in again) and \
+            all(c["version"] == 2 for c in store.list_comments(set_id)) and \
+            len([f for f in store.list_fields(set_id) if f.name == model.PREVIOUS_NUMBER_FIELD]) == 1
+    finally:
+        store.close()
+    return _result("renumber by KP: route by route, no-KP last, previous numbers kept", ok)
+
+
+def test_save_copy() -> bool:
+    """Duplicate a register: a consistent copy with its image files, which
+    opens as a register on its own; an existing file is never overwritten."""
+    folder = _folder()
+    path = os.path.join(folder, "reg.gpkg")
+    store = CommentStore.create(path)
+    try:
+        set_id = store.list_sets()[0]["set_id"]
+        comment = store.add_comments(set_id, [dict(_point(), attach_paths=[_image(folder)], attach_on_map=True)])[0]
+        target = os.path.join(folder, "copies", "reg copy.gpkg")
+        info = store.save_copy(target)
+        copy = CommentStore(target).open()
+        try:
+            again = copy.get_comment(comment["comment_id"])
+            image = copy.list_attachments(comment["comment_id"])[0]
+            ok = (info == {"path": target, "images": 1, "missing": 0} and is_register(target)
+                  and again["text"] == comment["text"] and again["map_image"] == comment["map_image"]
+                  and os.path.isfile(copy.attachment_path(image))
+                  and copy.attachments_dir == os.path.join(folder, "copies", "reg copy_attachments")
+                  and copy.meta().get("copied_from") == "reg.gpkg"
+                  and store.meta().get("copied_from") is None)
+        finally:
+            copy.close()
+        try:
+            store.save_copy(target)
+            overwrite_refused = False
+        except CommentStoreError:
+            overwrite_refused = True
+        ok = ok and overwrite_refused and os.path.getsize(target) > 0
+    finally:
+        store.close()
+    return _result("duplicate a register with its images; never overwrites", ok)
+
+
 def run_all() -> list:
     return [
+        test_general_comments(),
+        test_copy_move_duplicate(),
+        test_renumber_by_kp(),
+        test_save_copy(),
         test_gpkg_structure_and_geometry(),
         test_sets_comments_numbering(),
         test_batch_is_atomic_and_validated(),

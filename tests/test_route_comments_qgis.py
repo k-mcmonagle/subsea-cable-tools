@@ -399,8 +399,9 @@ def test_dense_map_layers(folder):
         rules = points.labeling().rootRule().children()
         default = map_layers.LabelSettings()
         scales = [(r.minimumScale(), r.maximumScale()) for r in rules]
+        inc = map_layers._inclusive   # each step includes its own scale (1:50,000 shows the details)
         checks["labels grow as you zoom in"] = [r.description() for r in rules] == ["Number", "Short", "Details"] \
-            and scales == [(2000000, 250000), (250000, 50000), (50000, 0)] and \
+            and scales == [(inc(2000000), inc(250000)), (inc(250000), inc(50000)), (inc(50000), 0)] and \
             (default.number_scale, default.summary_scale, default.detail_scale) == (2000000, 250000, 50000)
         short = QgsExpression(default.summary_expression())
         context = QgsExpressionContext(QgsExpressionContextUtils.globalProjectLayerScopes(points))
@@ -948,9 +949,10 @@ def test_review_panel(folder):
         context = QgsExpressionContext(QgsExpressionContextUtils.globalProjectLayerScopes(points))
         context.setFeature(feature)
         html = str(QgsExpression(settings.label_expression()).evaluate(context) or "")
-        checks["label HTML: image, text escaped"] = html.startswith('<div><img src="file:///') and \
-            "%20%26%20co" in html and comment["map_image"] in html and "&lt;b&gt;&amp;&lt;/b&gt;" in html \
-            and "<b>" not in html
+        # The image is found beside the file the layer reads (an HTML-escaped path, not a stored URL).
+        checks["label HTML: image, text escaped"] = html.startswith('<div><img src="') and \
+            ("review folder &amp; co/review_attachments/" + comment["map_image"]) in html and \
+            "&lt;b&gt;&amp;&lt;/b&gt;" in html and "<b>" not in html
         image = _render_comment(points, comment["wkt"])
         checks["image drawn in the map label"] = _red_pixels(image) > 300
         image.save(os.path.join(folder, "label.png"))

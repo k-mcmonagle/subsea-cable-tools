@@ -28,7 +28,14 @@ A comment can show one of its images at the top of its detail tag: the
 label is HTML (QGIS draws ``<img>``), with the comment's own text escaped
 so it is never read as markup, and the image named only by the register
 (``map_image``, a file name checked by pattern) inside the attachments
-folder (the ``@route_comments_attachments`` project variable, a file URL).
+folder beside the file the layer reads. That folder is found when the
+label is drawn, from the layer's own data source as QGIS resolved it for
+this user and computer, so labels keep their images when the project and
+register are opened from another place (a synced folder under another
+user name, another drive letter) without the dock being opened. The
+``@route_comments_attachments`` project variable (a file URL, set by the
+dock) is the fallback, and what labels made by earlier versions used:
+:func:`upgrade_labels` moves those to the layer's source.
 
 Overlapping or clustered comments stay reachable: :class:`CommentPickTool`
 lists every comment under the cursor, and selecting features on these
@@ -40,6 +47,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -49,7 +57,7 @@ from qgis.core import (Qgis, QgsCallout, QgsCategorizedSymbolRenderer, QgsCoordi
                        QgsPointClusterRenderer, QgsPointXY, QgsProject, QgsProperty, QgsRectangle,
                        QgsRendererCategory, QgsRuleBasedLabeling, QgsSimpleLineCallout, QgsSimpleLineSymbolLayer,
                        QgsTextBackgroundSettings, QgsTextBufferSettings, QgsTextFormat, QgsUnitTypes,
-                       QgsVectorLayer)
+                       QgsVectorLayer, QgsVectorLayerSimpleLabeling)
 from qgis.gui import QgsMapTool, QgsRubberBand
 from qgis.PyQt.QtCore import QSettings, QSizeF, Qt, QUrl, pyqtSignal
 from qgis.PyQt.QtGui import QColor, QCursor, QFont
@@ -57,7 +65,7 @@ from qgis.PyQt.QtWidgets import QMenu
 
 from ..maptools.canvas_items import remove_canvas_item
 from ..qgis_compat import FEATURE_REQUEST_NO_GEOMETRY, GEOMETRY_LINE, GEOMETRY_POINT, qt_exec
-from .store import attachments_dir_for, is_register
+from .store import ATTACHMENTS_SUFFIX, attachments_dir_for, is_register
 
 LAYER_PROP = "subsea_cable_tools/route_comments"          # "points" | "ranges"
 LABELS_PROP = "subsea_cable_tools/route_comments_labels"   # LabelSettings JSON
@@ -202,13 +210,95 @@ def html_text(expression: str) -> str:
     return f"replace({out}, '\\n', '<br>')"
 
 
+# The file the layer reads, as QGIS resolved it here (forward slashes), and the
+# attachments folder beside it ('' when the layer is not file based).
+_LAYER_FILE = "replace(coalesce(layer_property(@layer, 'path'), ''), '\\\\', '/')"
+_LAYER_ATTACHMENTS = (f"CASE WHEN @rc_file = '' THEN '' ELSE "
+                      f"regexp_replace(@rc_file, '[.][^./]*$', '') || '{ATTACHMENTS_SUFFIX}' END")
+
+
+def _html_attribute(expression: str) -> str:
+    """``expression``'s value escaped for a double-quoted HTML attribute."""
+    out = expression
+    for char, entity in (("&", "&amp;"), ('"', "&quot;"), ("<", "&lt;"), (">", "&gt;")):
+        out = f"replace({out}, '{char}', '{entity}')"
+    return out
+
+
+def _image_html_pt(width: int) -> str:
+    tag = f"'\" width=\"{int(width)}\">'"
+    return (f"with_variable('rc_file', {_LAYER_FILE}, with_variable('rc_dir', {_LAYER_ATTACHMENTS}, "
+            f"CASE WHEN regexp_match({_MAP_IMAGE}, '{IMAGE_NAME_PATTERN}') = 0 THEN '' "
+            f"WHEN @rc_dir <> '' THEN '<img src=\"' || {_html_attribute('@rc_dir')} || '/' || {_MAP_IMAGE} || {tag} "
+            f"WHEN @{VAR_ATTACHMENTS} IS NOT NULL THEN '<img src=\"' || @{VAR_ATTACHMENTS} || '/' || {_MAP_IMAGE} "
+            f"|| {tag} ELSE '' END))")
+
+
 def image_html(width_mm: float) -> str:
     """An ``<img>`` of the comment's map image ``width_mm`` wide (height by its
-    shape), or '' when it has none. QGIS reads an HTML image width in points."""
-    width = max(1, int(round(float(width_mm) * PT_PER_MM)))
+    shape), or '' when it has none. QGIS reads an HTML image width in points.
+    The image is looked up beside the layer's own file (see the module notes)."""
+    return _image_html_pt(max(1, int(round(float(width_mm) * PT_PER_MM))))
+
+
+def _legacy_image_html_pt(width: str) -> str:
+    """The image part of labels made by versions that read the folder from the
+    project variable only (kept to recognise and upgrade them)."""
     return (f"CASE WHEN @{VAR_ATTACHMENTS} IS NOT NULL AND regexp_match({_MAP_IMAGE}, '{IMAGE_NAME_PATTERN}') > 0 "
             f"THEN '<img src=\"' || @{VAR_ATTACHMENTS} || '/' || {_MAP_IMAGE} || '\" width=\"{width}\">' "
             "ELSE '' END")
+
+
+_LEGACY_IMAGE = re.compile(re.escape(_legacy_image_html_pt("999999")).replace("999999", r"(\d+)"))
+
+
+def upgraded_expression(expression: str) -> str:
+    """``expression`` with the image part of older labels replaced by the current one."""
+    return _LEGACY_IMAGE.sub(lambda match: _image_html_pt(int(match.group(1))), str(expression or ""))
+
+
+def upgrade_labels(layer: Optional[QgsVectorLayer]) -> bool:
+    """Bring labels made by earlier versions up to date, changing nothing else:
+    images are found beside the layer's own source instead of through the
+    project variable, and the tool's own steps (Number, Short, Details) whose
+    scales are still the ones it set include their scale (:func:`_inclusive`).
+    Other changes made in Layer Properties are kept. Returns whether
+    anything changed."""
+    current = layer.labeling() if layer is not None else None
+    if current is None:
+        return False
+    labeling = current.clone()      # owns the rules and settings changed below
+    changed = False
+    if isinstance(labeling, QgsRuleBasedLabeling):
+        settings = label_settings_of(layer)
+        exact = {int(settings.number_scale), int(settings.summary_scale), int(settings.detail_scale)}
+        pending = list(labeling.rootRule().children())
+        while pending:
+            rule = pending.pop()
+            pending.extend(rule.children())
+            if rule.description() in ("Number", "Short", "Details") and \
+                    str(layer.customProperty(LABELS_PROP, "") or ""):
+                for get, put in ((rule.minimumScale, rule.setMinimumScale), (rule.maximumScale, rule.setMaximumScale)):
+                    if get() and float(get()).is_integer() and int(get()) in exact:
+                        put(_inclusive(int(get())))
+                        changed = True
+            pal = rule.settings()
+            if pal is not None and pal.isExpression and upgraded_expression(pal.fieldName) != pal.fieldName:
+                copy = QgsPalLayerSettings(pal)
+                copy.fieldName = upgraded_expression(pal.fieldName)
+                rule.setSettings(copy)
+                changed = True
+    elif isinstance(labeling, QgsVectorLayerSimpleLabeling):
+        pal = labeling.settings()
+        if pal.isExpression and upgraded_expression(pal.fieldName) != pal.fieldName:
+            copy = QgsPalLayerSettings(pal)
+            copy.fieldName = upgraded_expression(pal.fieldName)
+            labeling.setSettings(copy)
+            changed = True
+    if changed:
+        layer.setLabeling(labeling)
+        layer.triggerRepaint()
+    return changed
 
 
 @dataclass
@@ -391,23 +481,31 @@ def _pal(expression: str, settings: LabelSettings, line: bool, bold: bool = True
     return pal
 
 
+def _inclusive(scale: int) -> float:
+    """A step's scale limit with a little room, so the step shows at that very
+    scale: a map set to 1:50,000 computes its scale as 50,000.000…1."""
+    return float(scale) * 1.001
+
+
 def build_labeling(settings: LabelSettings, line: bool) -> QgsRuleBasedLabeling:
     """Rule-based labels that grow as the map zooms in: the number far out,
     then a short line, then the details (each step taking over from the last;
-    a step whose range is empty is left out)."""
+    a step whose range is empty is left out). Each step includes its own
+    scale (the details "from 1:50,000" show at 1:50,000)."""
     root = QgsRuleBasedLabeling.Rule(None)
     detail = max(1, int(settings.detail_scale))
     rules = []
     inner = detail
     if settings.summary and int(settings.summary_scale) > detail:
         rules.append(QgsRuleBasedLabeling.Rule(_pal(settings.summary_expression(), settings, line, bold=False),
-                                               detail, int(settings.summary_scale), "", "Short"))
+                                               _inclusive(detail), _inclusive(int(settings.summary_scale)), "",
+                                               "Short"))
         inner = int(settings.summary_scale)
     if settings.numbers and int(settings.number_scale) > inner:
-        rules.insert(0, QgsRuleBasedLabeling.Rule(_pal(LABEL_PARTS[0][2], settings, line), inner,
-                                                  int(settings.number_scale), "", "Number"))
+        rules.insert(0, QgsRuleBasedLabeling.Rule(_pal(LABEL_PARTS[0][2], settings, line), _inclusive(inner),
+                                                  _inclusive(int(settings.number_scale)), "", "Number"))
     rules.append(QgsRuleBasedLabeling.Rule(_pal(settings.label_expression(), settings, line, bold=False,
-                                                html=settings.images), 0, detail, "", "Details"))
+                                                html=settings.images), 0, _inclusive(detail), "", "Details"))
     for rule in rules:
         root.appendChild(rule)
     return QgsRuleBasedLabeling(root)
@@ -423,6 +521,25 @@ def apply_labels(layers: Sequence[QgsVectorLayer], settings: LabelSettings, on: 
 
 def label_settings_of(layer: Optional[QgsVectorLayer]) -> LabelSettings:
     return LabelSettings.from_json(str(layer.customProperty(LABELS_PROP, "") or "")) if layer else LabelSettings()
+
+
+def labels_show_images(layer: Optional[QgsVectorLayer]) -> bool:
+    """Whether any of the layer's label expressions draws an image (False for
+    labels replaced in Layer Properties by ones without images)."""
+    labeling = layer.labeling() if layer is not None else None
+    if labeling is None:
+        return False
+    expressions = []
+    if isinstance(labeling, QgsRuleBasedLabeling):
+        pending = list(labeling.rootRule().children())
+        while pending:
+            rule = pending.pop()
+            pending.extend(rule.children())
+            if rule.settings() is not None:
+                expressions.append(rule.settings().fieldName)
+    elif isinstance(labeling, QgsVectorLayerSimpleLabeling):
+        expressions.append(labeling.settings().fieldName)
+    return any("<img src=" in str(e or "") for e in expressions)
 
 
 def labels_predate_images(layer: Optional[QgsVectorLayer]) -> bool:
@@ -552,6 +669,7 @@ class CommentLayers:
                 if layer.name().startswith(TITLES[kind] + " — ") or layer.name() == TITLES[kind]:
                     if layer.name() != name:
                         layer.setName(name)
+                upgrade_labels(layer)
                 layer.reload()
                 layer.updateExtents()
                 layer.triggerRepaint()

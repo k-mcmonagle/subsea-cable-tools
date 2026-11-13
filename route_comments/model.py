@@ -4,7 +4,8 @@
 A comment belongs to a named *comment set*. It has free text, an author, a
 date, a status and a priority (choices kept per set, no enforced
 transitions), optional tags and optional per-set custom field values, and a
-*reference*: a route point, a route KP range or a free map location.
+*reference*: a route point, a route KP range, a free map location, or none
+(a *general* comment, listed but not drawn on the map).
 
 Plain dicts are used throughout (the store's column names), so the store,
 the import/export code, the UI and the tests share one shape.
@@ -24,8 +25,25 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 REF_ROUTE_POINT = "route_point"
 REF_KP_RANGE = "kp_range"
 REF_LOCATION = "location"
-REF_KINDS = (REF_ROUTE_POINT, REF_KP_RANGE, REF_LOCATION)
-REF_LABELS = {REF_ROUTE_POINT: "Route point", REF_KP_RANGE: "KP range", REF_LOCATION: "Map location"}
+# No location: e.g. a remark on the whole route or document. No geometry (NULL),
+# so it is not on the map; earlier versions list it with an empty type.
+REF_GENERAL = "general"
+REF_KINDS = (REF_ROUTE_POINT, REF_KP_RANGE, REF_LOCATION, REF_GENERAL)
+SPATIAL_KINDS = (REF_ROUTE_POINT, REF_KP_RANGE, REF_LOCATION)
+REF_LABELS = {REF_ROUTE_POINT: "Route point", REF_KP_RANGE: "KP range", REF_LOCATION: "Map location",
+              REF_GENERAL: "General"}
+# The location columns of a comment (``route_ref.POSITION_COLUMNS`` plus the route identity).
+ROUTE_COLUMNS = ("route_name", "route_layer_id", "route_source", "route_provider", "route_crs", "rpl_id",
+                 "rpl_name", "rpl_rev", "rpl_route_id", "rpl_source_file", "route_hash", "route_length_m",
+                 "start_kp_km", "kp_convention", "kp_basis")
+
+
+def general_values() -> Dict:
+    """The location columns of a general comment: no route, KP or geometry."""
+    values = {key: None for key in ROUTE_COLUMNS}
+    values.update(ref_kind=REF_GENERAL, kp_km=None, kp_end_km=None, dcc_m=None, lat=None, lon=None, wkt="",
+                  geom_wkt="", geom_crs="")
+    return values
 
 # Reference conditions (route_ref.ReferenceChecker sets them).
 COND_OK = "ok"
@@ -407,6 +425,8 @@ def route_text(comment: Dict) -> str:
 def location_text(comment: Dict) -> str:
     """One line describing where a comment is, as captured."""
     kind = comment.get("ref_kind")
+    if kind == REF_GENERAL:
+        return "General comment (no location)"
     route = route_text(comment)
     on = f" on {route}" if route else ""
     kp, end = comment.get("kp_km"), comment.get("kp_end_km")
@@ -426,6 +446,60 @@ def location_text(comment: Dict) -> str:
             near += f", {float(dcc):,.0f} m off route"
         parts.append(near + on)
     return "; ".join(parts) or "Map location"
+
+
+# --------------------------------------------------------------------------- numbering
+PREVIOUS_NUMBER_FIELD = "Previous No."
+
+
+def route_key(comment: Dict) -> str:
+    """Which route a comment's KP is measured on ('' when it has none)."""
+    for key in ("rpl_id", "route_layer_id", "route_hash", "route_source", "route_name"):
+        if comment.get(key):
+            return f"{key}:{comment[key]}"
+    return ""
+
+
+def kp_order(comments: Sequence[Dict]) -> List[Dict]:
+    """``comments`` in KP order, for renumbering.
+
+    KPs of different routes cannot be compared, so comments are taken route
+    by route (the route of the lowest current number first), each by KP: a
+    range by its lower KP, a map location by its nearest KP. Comments
+    without a KP (general comments, positions away from any route) follow,
+    in their current order. Equal KPs keep their current order.
+    """
+    def number(c):
+        try:
+            return int(c.get("ref_no") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def low_kp(c):
+        values = [float(v) for v in (c.get("kp_km"), c.get("kp_end_km") if c.get("ref_kind") == REF_KP_RANGE
+                                     else None) if v is not None]
+        return min(values) if values else None
+
+    with_kp = [c for c in comments if low_kp(c) is not None]
+    first_number: Dict[str, int] = {}
+    for c in with_kp:
+        key = route_key(c)
+        first_number[key] = min(first_number.get(key, number(c)), number(c))
+    with_kp.sort(key=lambda c: (first_number[route_key(c)], route_key(c), low_kp(c), number(c)))
+    without = sorted((c for c in comments if low_kp(c) is None), key=number)
+    return with_kp + without
+
+
+def renumber_plan(comments: Sequence[Dict], start: int = 1) -> List[Tuple[Dict, int, int]]:
+    """``[(comment, old number, new number)]`` in the new order."""
+    out = []
+    for offset, comment in enumerate(kp_order(comments)):
+        try:
+            old = int(comment.get("ref_no") or 0)
+        except (TypeError, ValueError):
+            old = 0
+        out.append((comment, old, start + offset))
+    return out
 
 
 # --------------------------------------------------------------------------- search & filters
@@ -619,13 +693,16 @@ def _uuid_like(text: str) -> bool:
 def validate_import(data_rows: Sequence[Sequence], mapping: Dict[str, int], fields: Sequence[CustomField] = (),
                     statuses=None, priorities=None, existing_ids: Iterable[str] = (),
                     kp_range: Optional[Tuple[float, float]] = None, first_line: int = 2,
-                    default_author: str = "", default_date: str = "", image_folder: str = "") -> List[ImportRow]:
+                    default_author: str = "", default_date: str = "", image_folder: str = "",
+                    allow_general: bool = False) -> List[ImportRow]:
     """Check every data row and turn it into comment values.
 
     A row needs comment text and a location: latitude and longitude (a map
     location), a KP (a route point) or KP and KP to (a KP range). KPs need a
     route: ``kp_range`` is that route's ``(start KP, end KP)``; without one,
-    KP-only rows are errors. An ID equal to a comment already in the
+    KP-only rows are errors. With ``allow_general`` a row with no location
+    at all becomes a general comment (noted) instead of an error; a location
+    that is given but cannot be read stays an error. An ID equal to a comment already in the
     register (``existing_ids``: comment IDs and external IDs), or repeated
     in the file, is a duplicate and the row is not imported. An ID that is a
     comment UUID (e.g. from an export) keeps that UUID; any other ID is kept
@@ -736,7 +813,14 @@ def validate_import(data_rows: Sequence[Sequence], mapping: Dict[str, int], fiel
                 for label, value in (("KP", kp), ("KP to", kp_end if item.kind == REF_KP_RANGE else None)):
                     if value is not None and not (lo - 1e-9 <= value <= hi + 1e-9):
                         item.errors.append(f"{label} {value:.3f} is off the route (KP {lo:.3f} – {hi:.3f})")
-        elif not any(e for e in item.errors if "not understood" in e):
+        elif any(e for e in item.errors if "not understood" in e):
+            pass
+        elif (lat_raw is None) != (lon_raw is None):
+            item.errors.append("a position needs both latitude and longitude")
+        elif allow_general and kp_end_raw is None:
+            item.kind = REF_GENERAL
+            item.warnings.append("no location: imported as a general comment")
+        else:
             item.errors.append("no location: give latitude and longitude, or a KP")
 
         custom = {}

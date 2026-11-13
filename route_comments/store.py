@@ -2,9 +2,10 @@
 """The comment register: one GeoPackage, plus an attachments folder beside it.
 
 ``<name>.gpkg`` holds named comment sets and their comments; images added
-to comments are copied into ``<name>_attachments/`` and referenced by a
-relative file name, so the register can be moved or shared as the pair.
-Several QGIS projects (or sessions) can open the same register.
+to comments are copied into ``<name>_attachments/`` and referenced by
+their file name only (never a full path), so the register can be moved,
+shared or synced as the pair, whatever the folder is called on each
+computer. Several QGIS projects (or sessions) can open the same register.
 
 Tables (written with plain SQL in transactions; no QGIS needed):
 
@@ -12,7 +13,8 @@ Tables (written with plain SQL in transactions; no QGIS needed):
 * ``rc_set``         comment sets: name, status and priority choices (JSON)
 * ``rc_field``       per-set custom fields (text, number, date, yes/no, choice)
 * ``rc_comment``     comments; a GeoPackage feature table (geometry ``geom``
-                     in EPSG:4326, Point or LineString) that QGIS can open
+                     in EPSG:4326, Point or LineString; NULL for a general
+                     comment, which has no location) that QGIS can open
 * ``rc_reply``       chronological replies (``status_to``: the status the
                      reply set, e.g. *Send & close*, ``status_from`` the one
                      it replaced; ``edited_utc`` when its text was edited)
@@ -91,6 +93,9 @@ COMMENT_NAMES = [name for name, _t in COMMENT_COLUMNS]
 # the map image only through set_map_image, so it always names one of the comment's images).
 EDITABLE = set(COMMENT_NAMES) - {"comment_id", "set_id", "ref_no", "created_utc", "updated_utc", "version",
                                  "map_image"}
+# Cleared on a general comment (it has no location).
+_LOCATION_NAMES = set(model.ROUTE_COLUMNS) | {"kp_km", "kp_end_km", "dcc_m", "lat", "lon", "geom_crs", "geom_wkt"}
+_IN_CHUNK = 400   # IDs per "IN (...)" (well under SQLite's variable limit)
 
 _Q = gpkg_sql.quote_ident
 
@@ -514,9 +519,10 @@ class CommentStore:
 
     def add_comments(self, set_id: str, rows: Sequence[Dict]) -> List[Dict]:
         """Add comments in one transaction (all or none). Each needs ``text``,
-        ``ref_kind`` and ``wkt`` (EPSG:4326); a given ``comment_id`` must be new.
-        ``attach_paths`` (image files) are copied in and attached, the first
-        one shown on the map with ``attach_on_map``."""
+        ``ref_kind`` and ``wkt`` (EPSG:4326; none for a general comment); a
+        given ``comment_id`` must be new. ``attach_paths`` (image files) are
+        copied in and attached, the first one shown on the map with
+        ``attach_on_map``."""
         if self.get_set(set_id) is None:
             raise CommentStoreError("The comment set no longer exists.")
         for values in rows:
@@ -529,10 +535,15 @@ class CommentStore:
             if not row["text"]:
                 raise CommentStoreError("A comment needs some text.")
             if row.get("ref_kind") not in model.REF_KINDS:
-                raise CommentStoreError("A comment needs a location (route point, KP range or map location).")
-            blob = gpkg_blob(values.get("wkt") or "")
-            if blob is None:
-                raise CommentStoreError("The comment's location geometry is missing or invalid.")
+                raise CommentStoreError("A comment needs a location (route point, KP range or map location), "
+                                        "or to be a general comment.")
+            if row["ref_kind"] == model.REF_GENERAL:
+                row.update({name: None for name in _LOCATION_NAMES})
+                blob = None
+            else:
+                blob = gpkg_blob(values.get("wkt") or "")
+                if blob is None:
+                    raise CommentStoreError("The comment's location geometry is missing or invalid.")
             row.update(comment_id=str(values.get("comment_id") or new_id()), set_id=set_id,
                        created_utc=values.get("created_utc") or now, updated_utc=now, version=1, map_image="")
             prepared.append((row, blob))
@@ -576,9 +587,10 @@ class CommentStore:
 
     def update_comment(self, comment_id: str, changes: Dict, expected_version: Optional[int] = None) -> Dict:
         """Save ``changes`` (editable columns, ``wkt``). With ``expected_version``,
-        raises :class:`ConflictError` when the comment changed since it was read."""
+        raises :class:`ConflictError` when the comment changed since it was read.
+        An empty ``wkt`` on a general comment clears its geometry."""
         with self._write("save the comment") as conn:
-            current = conn.execute(f"SELECT version FROM {_Q(T_COMMENT)} WHERE comment_id = ?",
+            current = conn.execute(f"SELECT version, ref_kind FROM {_Q(T_COMMENT)} WHERE comment_id = ?",
                                    (comment_id,)).fetchone()
             if current is None:
                 raise ConflictError("The comment was deleted elsewhere (another project or QGIS) after you "
@@ -592,7 +604,12 @@ class CommentStore:
                 raise CommentStoreError("A comment needs some text.")
             assignments = [f"{_Q(k)} = ?" for k in sets]
             params = [gpkg_sql._coerce(v) for v in sets.values()]
-            if "wkt" in changes:
+            kind = sets.get("ref_kind", current[1])
+            if kind not in model.REF_KINDS and "ref_kind" in sets:
+                raise CommentStoreError("The comment's location type is not known.")
+            if "wkt" in changes and kind == model.REF_GENERAL and not changes.get("wkt"):
+                assignments.append("geom = NULL")
+            elif "wkt" in changes:
                 blob = gpkg_blob(changes.get("wkt") or "")
                 if blob is None:
                     raise CommentStoreError("The comment's location geometry is invalid.")
@@ -619,6 +636,295 @@ class CommentStore:
 
     def _touch(self, conn, comment_id: str) -> None:
         conn.execute(f"UPDATE {_Q(T_COMMENT)} SET updated_utc = ? WHERE comment_id = ?", (utc_now_iso(), comment_id))
+
+    # -- copy, move, renumber, duplicate ----------------------------------------------
+    def _rows_in(self, table: str, specs, ids: Sequence[str], extra: str = "") -> List[Dict]:
+        """Rows of ``table`` whose ``comment_id`` is one of ``ids`` (``extra``: more columns)."""
+        out: List[Dict] = []
+        ids = list(dict.fromkeys(str(i) for i in ids))
+        for start in range(0, len(ids), _IN_CHUNK):
+            part = ids[start:start + _IN_CHUNK]
+            marks = ", ".join("?" for _i in part)
+            sql = (f"SELECT {self._select_list(table, specs, 't')}{extra} FROM {_Q(table)} t "
+                   f"WHERE t.comment_id IN ({marks}) ORDER BY t.fid")
+            out += [dict(r) for r in self._read(sql, part)]
+        return out
+
+    def _comment_rows(self, ids: Sequence[str]) -> List[Dict]:
+        """The register's rows of these comments with their raw geometry, by number."""
+        rows = self._rows_in(T_COMMENT, COMMENT_COLUMNS, ids, ", t.geom AS geom")
+        return sorted(rows, key=lambda r: (int(r.get("ref_no") or 0), str(r.get("created_utc") or "")))
+
+    def _fields_for(self, conn, rows: Sequence[Dict], target_set_id: str) -> Tuple[Dict[str, str], List[str]]:
+        """``({source field id: target field id}, names of fields added to the target)``.
+
+        A custom field is matched by name (case-insensitive). One the target
+        set lacks is added to it, with its type and choices, when any of
+        ``rows`` has a value in it, so no value is hidden by a copy or move."""
+        target = [model.CustomField.from_row(dict(r)) for r in conn.execute(
+            f"SELECT {_cols(FIELD_COLUMNS)} FROM {_Q(T_FIELD)} WHERE set_id = ?", (target_set_id,))]
+        by_name = {f.name.casefold(): f for f in target}
+        seq = max([f.seq for f in target], default=-1) + 1
+        used = set()
+        for row in rows:
+            used.update(model.load_custom(row))
+        mapping: Dict[str, str] = {}
+        added: List[str] = []
+        for set_id in dict.fromkeys(str(r.get("set_id") or "") for r in rows):
+            if set_id == target_set_id:
+                continue
+            fields = sorted((model.CustomField.from_row(dict(r)) for r in conn.execute(
+                f"SELECT {_cols(FIELD_COLUMNS)} FROM {_Q(T_FIELD)} WHERE set_id = ?", (set_id,))),
+                key=lambda f: (f.seq, f.name.casefold()))
+            for fld in fields:
+                match = by_name.get(fld.name.casefold())
+                if match is None:
+                    if fld.field_id not in used:
+                        continue
+                    match = model.CustomField(new_id(), fld.name, fld.kind, list(fld.choices), seq)
+                    seq += 1
+                    _insert(conn, T_FIELD, FIELD_COLUMNS, [match.to_row(target_set_id)])
+                    by_name[match.name.casefold()] = match
+                    added.append(match.name)
+                mapping[fld.field_id] = match.field_id
+        return mapping, added
+
+    @staticmethod
+    def _remap_custom(text, mapping: Dict[str, str]) -> str:
+        values = model.load_custom({"custom_json": text})
+        return model.dump_custom({mapping.get(key, key): value for key, value in values.items()})
+
+    def _stage_copies(self, attachments: Sequence[Dict], written: List[str]) -> Tuple[Dict[str, Dict], List[str]]:
+        """Copy attachment files under new names: ``({old attachment id: new row}, names of missing files)``."""
+        present, items, missing = [], [], []
+        for row in attachments:
+            path = self.attachment_path(row)
+            if not os.path.isfile(path):
+                missing.append(str(row.get("original_name") or row.get("file_name") or ""))
+                continue
+            present.append(row)
+            items.append((path, os.path.splitext(str(row.get("file_name") or ""))[1].lower() or ".png",
+                          str(row.get("original_name") or "")))
+        staged, _files = self._stage(items, written) if items else ([], [])
+        out = {}
+        for old, new in zip(present, staged):
+            new.update(caption=old.get("caption") or "", created_utc=old.get("created_utc") or new["created_utc"],
+                       comment_id=old.get("comment_id"), _old_file=old.get("file_name"))
+            out[str(old.get("attachment_id"))] = new
+        return out, missing
+
+    def _insert_copies(self, conn, rows: Sequence[Dict], target_set_id: str, mapping: Dict[str, str],
+                       keep_numbers: bool, replies: Sequence[Dict], staged: Dict[str, Dict]) -> List[Tuple[int, int, str]]:
+        """Insert copies of ``rows`` (raw, with ``geom``) into the target set, under
+        new IDs, with copies of their ``replies`` and ``staged`` images:
+        ``[(old number, new number, new comment id)]``."""
+        now = utc_now_iso()
+        next_no = (conn.execute(f"SELECT MAX(ref_no) FROM {_Q(T_COMMENT)} WHERE set_id = ?",
+                                (target_set_id,)).fetchone()[0] or 0) + 1
+        new_ids: Dict[str, str] = {}
+        out = []
+        names = COMMENT_NAMES + ["geom"]
+        sql = (f"INSERT INTO {_Q(T_COMMENT)} ({', '.join(_Q(n) for n in names)}) VALUES "
+               f"({', '.join('?' for _n in names)})")
+        images = {}
+        for item in staged.values():
+            images[(str(item["comment_id"]), str(item.get("_old_file") or ""))] = item["file_name"]
+        for row in rows:
+            old_id = str(row["comment_id"])
+            copy = {n: row.get(n) for n in COMMENT_NAMES}
+            copy.update(comment_id=new_id(), set_id=target_set_id, updated_utc=now, version=1,
+                        custom_json=self._remap_custom(row.get("custom_json"), mapping),
+                        map_image=images.get((old_id, str(row.get("map_image") or "")), ""))
+            if not keep_numbers:
+                copy["ref_no"] = next_no
+                next_no += 1
+            new_ids[old_id] = copy["comment_id"]
+            conn.execute(sql, [gpkg_sql._coerce(copy.get(n)) for n in COMMENT_NAMES] + [row.get("geom")])
+            out.append((int(row.get("ref_no") or 0), int(copy["ref_no"] or 0), copy["comment_id"]))
+        reply_rows = []
+        for reply in replies:
+            if str(reply.get("comment_id")) in new_ids:
+                reply_rows.append(dict(reply, reply_id=new_id(), comment_id=new_ids[str(reply["comment_id"])]))
+        _insert(conn, T_REPLY, REPLY_COLUMNS, reply_rows)
+        _insert(conn, T_ATTACH, ATTACH_COLUMNS, [dict(item, comment_id=new_ids[str(item["comment_id"])])
+                                                 for item in staged.values() if str(item["comment_id"]) in new_ids])
+        _touch_contents(conn)
+        return out
+
+    def copy_comments(self, comment_ids: Sequence[str], target_set_id: str, replies: bool = True,
+                      images: bool = True) -> Dict:
+        """Copy comments into another set (all or none) as new comments,
+        numbered after the target's last, with their replies and images (the
+        image files copied). Returns ``{"numbers": [(old, new, new id)],
+        "fields_added": [...], "missing_images": [...]}``."""
+        ids = [str(i) for i in comment_ids]
+        if not ids:
+            return {"numbers": [], "fields_added": [], "missing_images": []}
+        written: List[str] = []
+        staged, missing = self._stage_copies(self._rows_in(T_ATTACH, ATTACH_COLUMNS, ids) if images else [], written)
+        reply_rows = self._rows_in(T_REPLY, REPLY_COLUMNS, ids) if replies else []
+        try:
+            with self._write("copy the comments") as conn:
+                if self.get_set(target_set_id) is None:
+                    raise CommentStoreError("The comment set to copy to no longer exists.")
+                rows = self._comment_rows(ids)
+                if len(rows) != len(set(ids)):
+                    raise ConflictError("A comment to copy was deleted elsewhere (another project or QGIS); "
+                                        "nothing was copied.")
+                mapping, added = self._fields_for(conn, rows, target_set_id)
+                numbers = self._insert_copies(conn, rows, target_set_id, mapping, False, reply_rows, staged)
+        except CommentStoreError:
+            self._remove_paths(written)
+            raise
+        return {"numbers": numbers, "fields_added": added, "missing_images": missing}
+
+    def move_comments(self, comment_ids: Sequence[str], target_set_id: str) -> Dict:
+        """Move comments to another set (all or none). They keep their IDs,
+        replies and images, and are numbered after the target's last.
+        Returns ``{"numbers": [(old, new, id)], "fields_added": [...]}``."""
+        ids = [str(i) for i in comment_ids]
+        with self._write("move the comments") as conn:
+            if self.get_set(target_set_id) is None:
+                raise CommentStoreError("The comment set to move to no longer exists.")
+            found = self._comment_rows(ids)
+            if len(found) != len(set(ids)):
+                raise ConflictError("A comment to move was deleted elsewhere (another project or QGIS); "
+                                    "nothing was moved.")
+            rows = [r for r in found if r.get("set_id") != target_set_id]
+            mapping, added = self._fields_for(conn, rows, target_set_id)
+            next_no = (conn.execute(f"SELECT MAX(ref_no) FROM {_Q(T_COMMENT)} WHERE set_id = ?",
+                                    (target_set_id,)).fetchone()[0] or 0) + 1
+            now = utc_now_iso()
+            numbers = []
+            for row in rows:
+                conn.execute(f"UPDATE {_Q(T_COMMENT)} SET set_id = ?, ref_no = ?, custom_json = ?, updated_utc = ?, "
+                             "version = version + 1 WHERE comment_id = ?",
+                             (target_set_id, next_no, self._remap_custom(row.get("custom_json"), mapping), now,
+                              row["comment_id"]))
+                numbers.append((int(row.get("ref_no") or 0), next_no, row["comment_id"]))
+                next_no += 1
+            _touch_contents(conn)
+        return {"numbers": numbers, "fields_added": added}
+
+    def duplicate_set(self, set_id: str, name: str, comments: bool = True, replies: bool = True,
+                      images: bool = True) -> Tuple[Dict, Dict]:
+        """A new set named ``name`` with this set's statuses, priorities and
+        custom fields and, with ``comments``, copies of its comments (same
+        numbers, new IDs), their replies and images. One transaction.
+        Returns ``(new set row, {"missing_images": [...]})``."""
+        source = self.get_set(set_id)
+        if source is None:
+            raise CommentStoreError("The comment set no longer exists.")
+        name = str(name or "").strip()
+        if not name:
+            raise CommentStoreError("A comment set needs a name.")
+        if any(s["name"].casefold() == name.casefold() for s in self.list_sets()):
+            raise CommentStoreError(f"There is already a comment set called '{name}'.")
+        ids = [c["comment_id"] for c in self.list_comments(set_id)] if comments else []
+        written: List[str] = []
+        staged, missing = self._stage_copies(
+            self._rows_in(T_ATTACH, ATTACH_COLUMNS, ids) if ids and images else [], written)
+        reply_rows = self._rows_in(T_REPLY, REPLY_COLUMNS, ids) if ids and replies else []
+        try:
+            with self._write("duplicate the comment set") as conn:
+                new = self.create_set(name, statuses=self.statuses_of(source), priorities=self.priorities_of(source),
+                                      description=source.get("description") or "")
+                mapping = {}
+                fields = []
+                for fld in self.list_fields(set_id):
+                    copy = model.CustomField(new_id(), fld.name, fld.kind, list(fld.choices), fld.seq)
+                    mapping[fld.field_id] = copy.field_id
+                    fields.append(copy.to_row(new["set_id"]))
+                _insert(conn, T_FIELD, FIELD_COLUMNS, fields)
+                if ids:
+                    self._insert_copies(conn, self._comment_rows(ids), new["set_id"], mapping, True, reply_rows, staged)
+        except CommentStoreError:
+            self._remove_paths(written)
+            raise
+        return new, {"missing_images": missing}
+
+    def renumber_by_kp(self, set_id: str, keep_previous: bool = True) -> List[Tuple[str, int, int]]:
+        """Number the set's comments 1, 2, 3… in KP order (:func:`model.kp_order`),
+        in one transaction. With ``keep_previous`` each comment's number before
+        this renumbering goes in the set's *Previous No.* custom field (added
+        when missing). Returns ``[(comment id, old number, new number)]``."""
+        with self._write("renumber the comments") as conn:
+            if self.get_set(set_id) is None:
+                raise CommentStoreError("The comment set no longer exists.")
+            rows = [dict(r) for r in self._read(f"SELECT {self._select_list(T_COMMENT, COMMENT_COLUMNS, 'c')} "
+                                                f"FROM {_Q(T_COMMENT)} c WHERE c.set_id = ?", (set_id,))]
+            plan = model.renumber_plan(rows)
+            changed = any(old != new for _c, old, new in plan)
+            field = None
+            if keep_previous and changed:
+                fields = self.list_fields(set_id)
+                field = next((f for f in fields if f.name.casefold() == model.PREVIOUS_NUMBER_FIELD.casefold()), None)
+                if field is None:
+                    field = model.CustomField(new_id(), model.PREVIOUS_NUMBER_FIELD, model.FIELD_TEXT, [],
+                                              max([f.seq for f in fields], default=-1) + 1)
+                    _insert(conn, T_FIELD, FIELD_COLUMNS, [field.to_row(set_id)])
+            now = utc_now_iso()
+            for comment, old, new in (plan if changed else []):
+                custom = comment.get("custom_json")
+                if field is not None:
+                    values = model.load_custom(comment)
+                    values[field.field_id] = old if field.kind == model.FIELD_NUMBER else model.ref_label(old)
+                    custom = model.dump_custom(values)
+                elif old == new:
+                    continue
+                conn.execute(f"UPDATE {_Q(T_COMMENT)} SET ref_no = ?, custom_json = ?, updated_utc = ?, "
+                             "version = version + 1 WHERE comment_id = ?", (new, custom, now, comment["comment_id"]))
+            if changed:
+                _touch_contents(conn)
+        return [(c["comment_id"], old, new) for c, old, new in plan]
+
+    def save_copy(self, target_path: str) -> Dict:
+        """Copy the register (a consistent snapshot) and its image files to
+        ``target_path`` and its own attachments folder. Never overwrites:
+        an existing file or folder there is refused. Returns ``{"path",
+        "images", "missing"}``; on failure nothing is left behind."""
+        target = os.path.abspath(target_path)
+        target_dir = attachments_dir_for(target)
+        if os.path.normcase(target) == os.path.normcase(self.path):
+            raise CommentStoreError("Choose another file name for the copy.")
+        if os.path.exists(target) or os.path.exists(target_dir):
+            raise CommentStoreError(f"{os.path.basename(target)} (or its attachments folder) already exists. A "
+                                    "register is never overwritten: choose another name.")
+        files = [os.path.basename(str(r["file_name"] or "")) for r in
+                 self._read(f"SELECT file_name FROM {_Q(T_ATTACH)}") if r["file_name"]]
+        copied = missing = 0
+        try:
+            folder = os.path.dirname(target)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            out = sqlite3.connect(target, timeout=10.0)
+            try:
+                self._conn().backup(out)
+                out.execute("PRAGMA journal_mode=DELETE")
+                with out:
+                    _set_meta(out, "copied_from", os.path.basename(self.path))
+                    _set_meta(out, "copied_utc", utc_now_iso())
+            finally:
+                out.close()
+            for name in dict.fromkeys(files):
+                source = os.path.join(self.attachments_dir, name)
+                if not os.path.isfile(source):
+                    missing += 1
+                    continue
+                destination = os.path.join(target_dir, name)
+                if os.name == "nt" and len(destination) > WINDOWS_MAX_PATH:
+                    raise OSError(f"the path is too long for Windows ({len(destination)} characters, at most "
+                                  f"{WINDOWS_MAX_PATH}); choose a folder with a shorter path")
+                os.makedirs(target_dir, exist_ok=True)
+                shutil.copy2(source, destination)
+                copied += 1
+        except (OSError, sqlite3.Error) as exc:
+            close_connection(target)
+            for leftover in (target, target + "-journal", target + "-wal", target + "-shm"):
+                self._remove_paths([leftover])
+            shutil.rmtree(target_dir, ignore_errors=True)
+            raise _friendly(exc, target, "duplicate the comment register") from exc
+        return {"path": target, "images": copied, "missing": missing}
 
     # -- replies --------------------------------------------------------------------
     def list_replies(self, comment_id: str) -> List[Dict]:
