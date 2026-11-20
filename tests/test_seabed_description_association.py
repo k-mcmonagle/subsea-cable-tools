@@ -214,6 +214,10 @@ def test_output_label_postprocessor_lifetime_and_name():
     postprocessor.postProcessLayer(output, context, QgsProcessingFeedback())
     assert output.labelsEnabled() and output.labeling().settings().fieldName == 'assembled_text'
     assert output.renderer().classAttribute() == 'text_status'
+    settings = output.labeling().settings()
+    assert settings.autoWrapLength == 36
+    assert settings.format().size() == 9 and settings.format().buffer().enabled()
+    assert settings.format().buffer().size() == 0.6
     assert algorithm.groupId() == 'other_tools' and algorithm.displayName().endswith('(experimental)')
 
 
@@ -401,3 +405,51 @@ def test_skipping_optional_outputs_keeps_association_in_label_output():
     outputs, context, project, _ = run(labels(), [leaders()], [polygons()], OUTPUT_CHECKS='', OUTPUT_POLYGONS='SKIP_OUTPUT')
     assert set(outputs) == {'OUTPUT_LABELS'}
     assert rows(outputs['OUTPUT_LABELS'])[0]['target_status'] == 'matched'
+
+
+def test_soil_terms_and_append_modes_preserve_raw_candidates():
+    note = 'CABLE CROSSING AT ROCK BERM'
+    soil = 'SILTY CLAY with shell fragments'
+    text = labels([('Point(100 110)', [note, 0, 'left']), ('Point(200 110)', [soil, 0, 'left'])])
+    line = leaders(['LineString(100 110,10 10)', 'LineString(200 110,12 10)'])
+    expected = (
+        (False, False, 'multiple_descriptions', None),
+        (True, False, 'matched_by_keyword', soil),
+        (False, True, 'combined_candidates', f'{note}\n\n{soil}'),
+        (True, True, 'matched_by_keyword', f'{soil}\n\nOther linked annotations:\n{note}'),
+    )
+    for prefer, append, status, description in expected:
+        outputs, context, project, _ = run(text, [line], [polygons()],
+                                           PREFER_SOIL_KEYWORDS=prefer, APPEND_CANDIDATES=append)
+        result = rows(outputs['OUTPUT_POLYGONS'])[0]
+        assert result['description_status'] == status
+        assert result['candidate_text'] == f'{note}\n\n{soil}'
+        if description is None:
+            assert absent(result['soil_description'])
+        else:
+            assert result['soil_description'] == description
+        if status == 'matched_by_keyword':
+            assert 'clay, shell fragments, silty' in result['match_reason']
+
+
+def test_keyword_mode_keeps_equal_or_missing_evidence_in_review():
+    for proposals in [('Fine SAND', 'Gravelly MUD'), ('KP 12.5 SAND WAVE', 'CLAY PIPE CROSSING')]:
+        text = labels([('Point(100 110)', [proposals[0], 0, 'left']),
+                       ('Point(200 110)', [proposals[1], 0, 'left'])])
+        line = leaders(['LineString(100 110,10 10)', 'LineString(200 110,12 10)'])
+        outputs, context, project, _ = run(text, [line], [polygons()],
+                                           PREFER_SOIL_KEYWORDS=True, APPEND_CANDIDATES=True)
+        result = rows(outputs['OUTPUT_POLYGONS'])[0]
+        assert result['description_status'] == 'multiple_descriptions'
+        assert absent(result['soil_description'])
+
+
+def test_conflict_options_do_not_override_boundary_review():
+    text = labels([('Point(100 110)', ['Fine SAND', 0, 'left']),
+                   ('Point(200 110)', ['Survey limit', 0, 'left'])])
+    line = leaders(['LineString(100 110,0 10)', 'LineString(200 110,12 10)'])
+    outputs, context, project, _ = run(text, [line], [polygons()],
+                                       PREFER_SOIL_KEYWORDS=True, APPEND_CANDIDATES=True)
+    result = rows(outputs['OUTPUT_POLYGONS'])[0]
+    assert result['description_status'] == 'review' and absent(result['soil_description'])
+    assert 'Fine SAND' in result['candidate_text']

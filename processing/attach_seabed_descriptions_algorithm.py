@@ -5,9 +5,11 @@ import json
 import math
 import os
 import re
+from time import perf_counter
 from uuid import uuid4
 
 from qgis.PyQt.QtCore import QCoreApplication
+from qgis.PyQt.QtGui import QColor
 from qgis.core import (
     NULL, QgsCoordinateTransform, QgsFeature,
     QgsField, QgsFields, QgsGeometry, QgsPointXY, QgsProcessing,
@@ -16,12 +18,13 @@ from qgis.core import (
     QgsProcessingParameterFeatureSource, QgsProcessingParameterField,
     QgsProcessingParameterMultipleLayers, QgsProcessingParameterNumber,
     QgsVectorLayerSimpleLabeling,
-    QgsPalLayerSettings, QgsTextFormat, QgsWkbTypes, QgsCategorizedSymbolRenderer,
+    QgsPalLayerSettings, QgsTextBufferSettings, QgsTextFormat, QgsUnitTypes, QgsWkbTypes, QgsCategorizedSymbolRenderer,
     QgsMarkerSymbol, QgsRendererCategory, QgsProperty,
     QgsProviderRegistry, Qgis, QgsProcessingParameterDefinition,
 )
 
 from .algorithm_base import SubseaCableAlgorithm
+from .soil_annotation_keywords import soil_terms
 from .annotation_blocks import TextBlock, TextLine, assemble_blocks, estimate_line_gap, normalized_text
 from .annotation_geodesy import (
     BOUNDARY_MARGIN, EllipsoidalMetric, GlobalPointIndex, GlobalPolygonIndex, LocalPolygon, geographic,
@@ -95,8 +98,21 @@ class _LabelPoints(QgsProcessingLayerPostProcessorInterface):
         settings.fieldName = 'assembled_text'
         settings.isExpression = False
         settings.wrapChar = '\n'
+        settings.autoWrapLength = 36
+        settings.useMaxLineLengthForAutoWrap = True
         text_format = QgsTextFormat()
         text_format.setSize(9)
+        buffer = QgsTextBufferSettings()
+        buffer.setEnabled(True)
+        buffer.setColor(QColor('white'))
+        buffer.setSize(0.6)
+        if hasattr(Qgis, 'RenderUnit'):
+            text_format.setSizeUnit(Qgis.RenderUnit.Points)
+            buffer.setSizeUnit(Qgis.RenderUnit.Millimeters)
+        else:
+            text_format.setSizeUnit(QgsUnitTypes.RenderPoints)
+            buffer.setSizeUnit(QgsUnitTypes.RenderMillimeters)
+        text_format.setBuffer(buffer)
         settings.setFormat(text_format)
         properties = settings.dataDefinedProperties()
         scope = getattr(QgsPalLayerSettings, 'Property', QgsPalLayerSettings)
@@ -131,6 +147,8 @@ class AttachSeabedDescriptionsAlgorithm(SubseaCableAlgorithm):
     ANCHOR_TOLERANCE = 'ANCHOR_TOLERANCE'
     BOUNDARY_TOLERANCE = 'BOUNDARY_TOLERANCE'
     ALLOW_MULTIPLE_ANCHORS = 'ALLOW_MULTIPLE_ANCHORS'
+    PREFER_SOIL_KEYWORDS = 'PREFER_SOIL_KEYWORDS'
+    APPEND_CANDIDATES = 'APPEND_CANDIDATES'
     OUTPUT_LABELS = 'OUTPUT_LABELS'
     OUTPUT_POLYGONS = 'OUTPUT_POLYGONS'
     OUTPUT_CHECKS = 'OUTPUT_CHECKS'
@@ -183,6 +201,12 @@ class AttachSeabedDescriptionsAlgorithm(SubseaCableAlgorithm):
         self.addParameter(QgsProcessingParameterBoolean(
             self.ALLOW_MULTIPLE_ANCHORS,
             self.tr('Allow leaders to start on different lines of one description'), defaultValue=False))
+        self.addParameter(QgsProcessingParameterBoolean(
+            self.PREFER_SOIL_KEYWORDS,
+            self.tr('Resolve conflicts when only one candidate has soil keywords'), defaultValue=False))
+        self.addParameter(QgsProcessingParameterBoolean(
+            self.APPEND_CANDIDATES,
+            self.tr('Append other linked candidates to the polygon description'), defaultValue=False))
         self.addParameter(QgsProcessingParameterCrs(
             self.WORKING_CRS, self.tr('Legacy measurement CRS (ignored; measurements are now ellipsoidal)'), optional=True))
         self.addParameter(QgsProcessingParameterFeatureSink(
@@ -200,7 +224,8 @@ class AttachSeabedDescriptionsAlgorithm(SubseaCableAlgorithm):
             advanced = QgsProcessingParameterDefinition.FlagAdvanced
             hidden = QgsProcessingParameterDefinition.FlagHidden
         for name in (self.ROTATION_FIELD, self.ALIGNMENT_FIELD, self.MAX_LINE_GAP,
-                     self.ANCHOR_TOLERANCE, self.BOUNDARY_TOLERANCE, self.ALLOW_MULTIPLE_ANCHORS, self.WORKING_CRS):
+                     self.ANCHOR_TOLERANCE, self.BOUNDARY_TOLERANCE, self.ALLOW_MULTIPLE_ANCHORS,
+                     self.PREFER_SOIL_KEYWORDS, self.APPEND_CANDIDATES, self.WORKING_CRS):
             parameter = self.parameterDefinition(name)
             parameter.setFlags(parameter.flags() | advanced)
         legacy_crs = self.parameterDefinition(self.WORKING_CRS)
@@ -237,10 +262,19 @@ boundary hits, invalid polygons and uncertain text are flagged. Invalid polygons
 only in a working copy for candidate searches; output geometries preserve the originals.</p>
 <p><b>Polygon status:</b> matched = one distinct accepted description; multiple_descriptions =
 different descriptions target the same polygon; review = uncertain evidence; unmatched = no
-association. Only matched polygons receive <b>soil_description</b>; proposals remain in
-<b>candidate_text</b>. Identical repeated descriptions are deduplicated. All original polygon
+association. The <b>Advanced parameters</b> can resolve conflicts between geometrically
+confirmed candidates. The soil keyword option selects a description only when exactly one candidate
+has recognised material terms. The append option combines all candidates when used alone or appends
+the other annotations after a unique keyword match when used together. When the keyword option is
+on, conflicts with zero or several keyword candidates still require review. Both options leave
+uncertain geometry and text assembly flagged. <b>candidate_text</b> retains all distinct proposals.
+Keyword and append decisions are recorded in <b>description_status</b> and <b>match_reason</b>.
+Identical repeated descriptions are deduplicated. All original polygon
 attributes are copied; generated names gain a suffix if they would overwrite an existing field.
 The source layer, feature IDs and block IDs permit tracing results back to the input.</p>
+<p>Assembled point labels use nine-point text, line wrapping and a light buffer. Adjust
+the font, buffer, placement and scale-based visibility under the output layer's standard
+<b>Labels</b> settings to suit the alignment chart.</p>
 <p>Open <b>Seabed Description Review</b> from the plugin menu to inspect flagged polygons,
 text blocks and leaders on the map and save decisions to the output layers. The leader-check
 layer records the upstream part of a split path. Text spacing and leader-anchor distances are
@@ -362,6 +396,8 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
 
     def _read_leaders(self, layers, metric, output_crs, text_index, anchor_positions, tolerance, context, feedback):
         leaders, anchored = [], set()
+        nearby_text = {}
+        radius = max(tolerance, 1e-6)
         for layer_number, layer in enumerate(layers, 1):
             if not layer.crs().isValid():
                 raise QgsProcessingException(f'Leader layer {layer.name()} has no valid CRS.')
@@ -403,9 +439,10 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
                         row['ends'] = ends
                         row['nodes'] = [(layer_number, p.x(), p.y()) for p in (part[0], part[-1])]
                         for point in ends:
-                            radius = max(tolerance, 1e-6)
-                            close = text_index.near(point, radius)
-                            row['near'].append(close)
+                            location = (point.x(), point.y())
+                            if location not in nearby_text:
+                                nearby_text[location] = text_index.near(point, radius)
+                            row['near'].append(nearby_text[location])
                         # A seed is only evidence when one end has one distinct
                         # text position. Ambiguous seeds do not strengthen groups.
                         active = [close for close in row['near'] if close]
@@ -417,8 +454,8 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
                         row['error'] = str(exc) if isinstance(exc, ValueError) else 'Leader geometry could not be transformed.'
         return leaders, anchored
 
-    def _read_polygons(self, layers, output_crs, context, feedback):
-        fields, maps, records, index = QgsFields(), [], [], GlobalPolygonIndex(EllipsoidalMetric(context))
+    def _read_polygons(self, layers, output_crs, metric, context, feedback):
+        fields, maps, records, index = QgsFields(), [], [], GlobalPolygonIndex(metric)
         # Preserve attributes, including case/type conflicts and existing soil
         # descriptions. Source fid columns must not become a sink's primary key.
         for layer in layers:
@@ -455,14 +492,13 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
                         raise QgsProcessingException('Soil inputs must be polygon layers.')
                     if not _safe_coordinates(original, lambda: self._cancel(feedback)):
                         raise ValueError('Unsafe polygon coordinates; output geometry omitted.')
-                    output = QgsGeometry(original)
-                    output.convertToStraightSegment()
+                    working = QgsGeometry(original)
+                    working.convertToStraightSegment()
+                    output = QgsGeometry(working)
                     _transform_geometry(output, to_output, lambda: self._cancel(feedback))
                     output.convertToMultiType()
                     row['geometry'] = output
-                    working = QgsGeometry(original)
-                    working.convertToStraightSegment()
-                    local = LocalPolygon(working, layer.crs(), context, lambda: self._cancel(feedback))
+                    local = LocalPolygon(working, layer.crs(), context, lambda: self._cancel(feedback), metric=metric)
                     row['local'] = local
                     # Validate at a local point without interpreting a geographic
                     # date-line/polar ring as a flat longitude/latitude polygon.
@@ -493,10 +529,10 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
                 search, repaired = polygon['local'].at(target)
                 if repaired:
                     polygon['error'] = 'Invalid polygon; repaired only for candidate search. Review geometry and match.'
-                boundary = QgsGeometry(search.constGet().boundary())
-                distances[key] = boundary.distance(point)
                 if search.contains(point):
                     inside.append(key)
+                    boundary = QgsGeometry(search.constGet().boundary())
+                    distances[key] = boundary.distance(point)
                 elif search.distance(point) <= radius:
                     nearby.append(key)
             except QgsProcessingException:
@@ -577,11 +613,11 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
                           block=None, candidate_blocks=[], polygons=[], gap=None, target_gap=None, upstream=None)
 
         def target_at(leader, end):
-            node = leader['nodes'][end]
-            if node not in targets:
-                targets[node] = self._target_candidates(leader['ends'][end], polygons, polygon_index,
-                                                        boundary_tolerance, feedback)
-            return targets[node]
+            target = leader['ends'][end]
+            location = (target.x(), target.y())
+            if location not in targets:
+                targets[location] = self._target_candidates(target, polygons, polygon_index, boundary_tolerance, feedback)
+            return targets[location]
 
         def assign(leader, target_end, endpoints, anchor_gap, extra_reason=''):
             leader['candidate_blocks'] = endpoints
@@ -720,6 +756,7 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
                           'Outputs use the description point CRS.')
         if self.parameterAsCrs(parameters, self.WORKING_CRS, context).isValid():
             feedback.pushInfo('The legacy measurement CRS preference is ignored; ellipsoidal measurements are automatic.')
+        text_started = perf_counter()
         transform = QgsCoordinateTransform(output_crs, metric.crs, context.transformContext())
         records, lines = self._read_text(source, text_field, rotation, alignment, transform, metric, feedback)
         positions = {line.key: QgsPointXY(line.x, line.y) for line in lines}
@@ -754,16 +791,21 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
             if record['error']:
                 blocks.append(TextBlock((key,), key, record['text'], 'review', record['error']))
         blocks.sort(key=lambda block: min(block.members))
+        polygon_started = perf_counter()
+        feedback.pushInfo(f'Text assembly and leader reading took {polygon_started - text_started:.2f} s.')
         feedback.setProgress(40)
         polygon_fields, polygons, polygon_index = self._read_polygons(
-            polygon_layers, output_crs, context, feedback)
+            polygon_layers, output_crs, metric, context, feedback)
         feedback.setProgress(65)
         self._associate(leaders, blocks, polygons, polygon_index, boundary_tolerance, bool(polygon_layers), feedback)
+        output_started = perf_counter()
+        feedback.pushInfo(f'Polygon indexing and matching took {output_started - polygon_started:.2f} s.')
         result = self._outputs(parameters, context, feedback, source, records, blocks, leaders, polygons,
                                polygon_fields, output_crs, bool(polygon_layers), output_names)
+        feedback.pushInfo(f'Writing outputs took {perf_counter() - output_started:.2f} s.')
         feedback.pushInfo('Text blocks: ' + ', '.join(f'{name}={count}' for name, count in sorted(Counter(b.status for b in blocks).items())))
         feedback.pushInfo('Leader checks: ' + ', '.join(f'{name}={count}' for name, count in sorted(Counter(row['status'] for row in leaders).items())))
-        feedback.pushWarning('Experimental: statuses describe geometric evidence, not verified soil interpretation. Review candidate_text and reasons before use.')
+        feedback.pushWarning('Experimental: match statuses record geometric and keyword evidence. Review candidate_text and reasons before use.')
         feedback.setProgress(100)
         return result
 
@@ -816,6 +858,8 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
             self._label_postprocessor = _LabelPoints()
             context.layerToLoadOnCompletionDetails(dest).setPostProcessor(self._label_postprocessor)
         if self.OUTPUT_POLYGONS in output_names:
+            prefer_soil = self.parameterAsBoolean(parameters, self.PREFER_SOIL_KEYWORDS, context)
+            append_candidates = self.parameterAsBoolean(parameters, self.APPEND_CANDIDATES, context)
             generated = [_new_field(polygon_fields, name, FIELD_TYPE_STRING) for name in POLYGON_FIELDS + REVIEW_FIELDS]
             feedback.pushInfo('Polygon result fields: ' + ', '.join(generated))
             output_type = QgsWkbTypes.MultiPolygon
@@ -837,12 +881,30 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
                 if polygon['error']:
                     notes.append(polygon['error'])
                 status = 'review' if notes else ('multiple_descriptions' if len(unique) > 1 else 'matched' if ids else 'unmatched')
+                description = candidate if status == 'matched' else None
                 if status == 'multiple_descriptions':
-                    notes.append('Different descriptions point to this polygon; review the candidate blocks.')
+                    if prefer_soil:
+                        matches = [(text, terms) for text in unique.values() if (terms := soil_terms(text))]
+                        if len(matches) == 1:
+                            description, terms = matches[0]
+                            status = 'matched_by_keyword'
+                            notes.append('Only one candidate contains recognised soil terms (' + ', '.join(terms) + ').')
+                            if append_candidates:
+                                residuals = [text for text in unique.values() if text != description]
+                                description += '\n\nOther linked annotations:\n' + '\n\n'.join(residuals)
+                                notes.append('Other linked candidates were appended after the soil description.')
+                        else:
+                            notes.append(f'{len(matches)} candidates contain recognised soil terms; review the candidate blocks.')
+                    elif append_candidates:
+                        description = candidate
+                        status = 'combined_candidates'
+                        notes.append('All distinct candidates were combined by request.')
+                    else:
+                        notes.append('Different descriptions point to this polygon; review the candidate blocks.')
                 elif status == 'unmatched':
                     notes.append('No accepted leader association; no nearest-label guess made.')
                 statuses[status] += 1
-                self._write(sink, polygon_fields, polygon['attrs'] + [candidate if status == 'matched' else None,
+                self._write(sink, polygon_fields, polygon['attrs'] + [description,
                             candidate, status, ' '.join(notes), polygon['ref'], polygon['layer'], polygon['layer_id'], str(polygon['fid']),
                             _json([block_names[i] for i in ids]), _json(sorted(polygon['leaders'])), run_id, None], polygon['geometry'])
             feedback.pushInfo('Polygon results: ' + ', '.join(f'{name}={count}' for name, count in sorted(statuses.items())))

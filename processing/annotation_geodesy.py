@@ -2,9 +2,9 @@
 
 QgsDistanceArea uses GeographicLib for inverse geodesics. ECEF chord distances
 are lower bounds used only to find candidates, never as the measured distance.
-Polygon predicates use a separate ellipsoidal AEQD centred on each target; its
-radial distances are metres on WGS84. Source edges are adaptively subdivided
-before projection, rather than replacing a curved transformed edge by a chord.
+Polygon predicates use ellipsoidal azimuthal equidistant (AEQD) coordinates
+centred on each target, calculated from WGS84 geodesic distances and bearings.
+Adaptive subdivision follows each curved transformed edge before projection.
 """
 
 import heapq
@@ -52,6 +52,13 @@ class EllipsoidalMetric:
 
     def distance(self, a, b):
         return self.metres(point_of(a), point_of(b))
+
+    def local_xy(self, origin, point):
+        distance = self.metres(origin, point)
+        if distance == 0:
+            return QgsPointXY(0, 0)
+        bearing = self.area.bearing(origin, point)
+        return QgsPointXY(distance * math.sin(bearing), distance * math.cos(bearing))
 
     def angle(self, a, b):
         if self.metres(a, b) <= 1e-8:
@@ -148,9 +155,14 @@ class GlobalPointIndex:
             return []
         # Chord ordering is not necessarily geodesic ordering. Search every
         # candidate within the largest seed's geodesic distance before ranking.
-        radius = max(self.metric.metres(point, self.positions[key]) for key in seeds)
-        close = self.near(point, radius + 1e-6)
-        return sorted(close, key=lambda key: (close[key], key))[:count]
+        distances = {key: self.metric.metres(point, self.positions[key]) for key in seeds}
+        radius = max(distances.values()) + 1e-6
+        for key in self._search(point, radius=radius):
+            if key not in distances:
+                distance = self.metric.metres(point, self.positions[key])
+                if distance <= radius:
+                    distances[key] = distance
+        return sorted(distances, key=lambda key: (distances[key], key))[:count]
 
 
 def local_crs(point):
@@ -174,14 +186,15 @@ def polygon_parts(geometry):
 
 
 class LocalPolygon:
-    def __init__(self, geometry, source_crs, context, cancel):
+    def __init__(self, geometry, source_crs, context, cancel, *, metric=None):
         self.rings = geometry.asMultiPolygon() if geometry.isMultipart() else [geometry.asPolygon()]
-        self.source_crs, self.context, self.cancel = source_crs, context, cancel
+        self.source_is_geographic = source_crs.isGeographic()
+        self.cancel = cancel
+        self.metric = metric if metric is not None else EllipsoidalMetric(context)
         self.cap_centre, self.cap_radius = None, None
-        self.to_global = QgsCoordinateTransform(source_crs, QgsCoordinateReferenceSystem('EPSG:4326'), context.transformContext())
+        self.to_global = QgsCoordinateTransform(source_crs, self.metric.crs, context.transformContext())
 
     def at(self, target):
-        transform = QgsCoordinateTransform(self.source_crs, local_crs(target), self.context.transformContext())
         cache, count = {}, 0
 
         def project(point):
@@ -193,7 +206,7 @@ class LocalPolygon:
                     self.cancel()
                 if count > 200000:
                     raise ValueError('Polygon boundary is too complex to measure reliably; review this geometry.')
-                value = transform.transform(point)
+                value = self.metric.local_xy(target, geographic(self.to_global.transform(point)))
                 if not all(math.isfinite(v) for v in (value.x(), value.y())) or math.hypot(value.x(), value.y()) > 19500000:
                     raise ValueError('Polygon spans the opposite side of the globe from this target; review its geometry.')
                 cache[key] = value
@@ -225,7 +238,7 @@ class LocalPolygon:
                     raise ValueError('Polygon ring has too few vertices.')
                 points = [project(ring[0])]
                 for a, b in zip(ring, ring[1:]):
-                    if self.source_crs.isGeographic():
+                    if self.source_is_geographic:
                         b = QgsPointXY(a.x() + ((b.x() - a.x() + 180) % 360 - 180), b.y())
                     points.extend(segment(a, b, project(a), project(b)))
                 points[-1] = points[0]
@@ -235,7 +248,8 @@ class LocalPolygon:
         repaired = not geometry.isGeosValid()
         if repaired:
             geometry = QgsGeometry.collectGeometry(polygon_parts(geometry.makeValid()))
-        if geometry.isNull() or geometry.isEmpty() or geometry.type() != GEOMETRY_POLYGON or not geometry.isGeosValid():
+        if (geometry.isNull() or geometry.isEmpty() or geometry.type() != GEOMETRY_POLYGON
+                or (repaired and not geometry.isGeosValid())):
             raise ValueError('Polygon cannot be used for reliable spatial matching.')
         return geometry, repaired
 

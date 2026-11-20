@@ -140,3 +140,17 @@ def test_bad_geographic_outlier_does_not_reject_valid_route():
     assert sum(f['fragment_count'] for f in rows(outputs['OUTPUT_LABELS'])) == 5
     assert sum(f['text_status'] == 'review' for f in rows(outputs['OUTPUT_LABELS'])) == 1
     assert {f['description_status'] for f in rows(outputs['OUTPUT_POLYGONS'])} == {'matched'}
+
+
+def test_direct_local_coordinates_match_proj_aeqd():
+    context = QgsProcessingContext()
+    metric = EllipsoidalMetric(context)
+    for origin, target in [
+            ((3, 50), (3.1, 50.2)),
+            ((179.98, 45), (-179.99, 45)),
+            ((0, 90), (90, 89.999)),
+            ((20, -89.9), (-130, -89.9)),
+            ((-160, 10), (70, 35))]:
+        centre, point = QgsPointXY(*origin), QgsPointXY(*target)
+        reference = QgsCoordinateTransform(metric.crs, local_crs(centre), context.transformContext()).transform(point)
+        assert metric.local_xy(centre, point).distance(reference) < 0.0001

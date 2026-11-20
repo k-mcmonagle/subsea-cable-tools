@@ -91,13 +91,14 @@ descriptions. Rotation, alignment, spacing and distance tolerances are under **A
 The tool creates copies and leaves the imported layers unchanged:
 
 - **Assembled description points** contain one point per proposed text block. `assembled_text`
-  is labelled automatically. Green points have consistent layout supported by a leader anchor;
-  blue points preserve single original text; amber points use layout alone and should be checked.
+  is labelled automatically with 9-point wrapped text and a white buffer. Green points have
+  consistent layout supported by a leader anchor. Blue points preserve the original text of a
+  single annotation. Amber points use layout alone and should be checked.
   Red points need review: their proposal is in `candidate_text`, with accepted text left empty.
 - **Soil polygons with description candidates** retain original attributes and add
-  `soil_description`, `description_status`, candidate text and source references. Only a unique
-  accepted description is filled automatically. Different descriptions, overlapping polygons,
-  boundary targets and invalid geometry remain review cases. Existing field names are preserved;
+  `soil_description`, `description_status`, candidate text and source references. The default
+  assigns only a unique accepted description. Overlapping polygons, boundary targets and
+  invalid geometry remain review cases. Existing field names are preserved;
   newly generated fields receive a suffix if needed.
 - **Leader association checks** show which text block and polygon each leader could connect,
   with the reason for accepting or rejecting it. One description can populate every polygon
@@ -106,8 +107,22 @@ The tool creates copies and leaves the imported layers unchanged:
   themselves be polygon targets are flagged. Enable **Allow leaders to start on different lines
   of one description** under **Advanced parameters** when the drawing uses that convention.
 
-With the outputs loaded, open **Plugins → Subsea Cable Tools → Seabed Description Review**.
-Choose the polygon, text block or leader output. **Needs review** prioritises conflicts and
+Under **Advanced parameters**, **Resolve conflicts when only one candidate has soil keywords**
+chooses a unique candidate with terms such as sand, clay, silt, mud, gravel, cobbles, peat,
+shell fragments, till and bedrock. Multiple soil candidates and conflicts with no keyword match
+stay in review. **Append other linked candidates to the polygon description** combines all
+confirmed candidates when used alone. With both options on, it appends the residual annotations
+after a unique soil match under **Other linked annotations**. Both options default to off.
+All distinct proposals remain in `candidate_text`. Automatic decisions are marked
+`matched_by_keyword` or `combined_candidates`, with details in `match_reason`.
+
+For alignment charts, open the assembled points' **Layer Properties > Labels**. Keep the value as
+`assembled_text` and set text size in points for a consistent paper size. Adjust **Formatting >
+Wrap lines to** and **Buffer** to suit the sheet. Set scale-based visibility under **Rendering** to
+show the labels at the chart scales you use. A QGIS layer style can carry these settings to other runs.
+
+Open **Plugins → Subsea Cable Tools → Seabed Description Review** and click **Run matching**.
+After loading the results, choose the polygon, text block or leader output. **Needs review** prioritises conflicts and
 uncertain matches. Click a row or use **Previous** and **Next** to highlight its linked evidence
 and move the map. For polygons, enter a description or choose a candidate from the linked text.
 **Apply review** records the decision and advances through the queue. Use QGIS **Save Layer Edits**
@@ -120,7 +135,8 @@ Geographic inputs (such as EPSG:4326) and layers with different CRSs are support
 reprojection. Long routes can cross UTM zones, the date line and polar regions; there is no overall
 route-length or latitude restriction. Text spacing and leader distances use the WGS84 ellipsoid.
 Polygon checks use local coordinates centred on each target, with adaptive subdivision of
-transformed edges (2 mm numerical tolerance; boundary checks include a 4 mm review margin).
+transformed edges (2 mm numerical tolerance). Boundary checks include a 4 mm review margin.
+The Processing log reports elapsed time for text and leaders, polygon matching, and output writing.
 These are calculation tolerances, not a statement of survey accuracy. Geographic polygon edges
 crossing the date line follow the short longitude interval. Outputs keep the text layer's CRS;
 old measurement CRS preferences are ignored. Valid source CRS definitions and datum transformations
