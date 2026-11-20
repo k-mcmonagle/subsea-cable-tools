@@ -89,14 +89,17 @@ def estimate_line_gap(lines, neighbor_pairs, metric=None):
     return typical * 1.5, reliable, reason
 
 
-def assemble_blocks(lines, pairs, max_gap, anchored=(), reliable_gap=True, cancel=lambda: None, metric=None):
+def assemble_blocks(lines, pairs, max_gap, anchored=(), reliable_gap=True, cancel=lambda: None, metric=None,
+                    *, allow_multiple_anchors=False):
     """Assemble candidates, marking branches, mixed spacing and overlaps for review.
 
     ``pairs`` contains all pairs within max_gap (plus coincident points). Distinct
-    leader anchors in one component are ambiguous; several leaders sharing one
-    text anchor are allowed. Uncertain candidates never become accepted text.
+    leader anchors default to review. Enable multiple anchors for drawings
+    whose leaders can attach to different lines of the same description.
     """
     lookup = {line.key: line for line in lines}
+    positions = {line.key: (metric.position(line) if metric else (round(line.x, 6), round(line.y, 6)))
+                 for line in lines}
     parent = {key: key for key in lookup}
     problems = {key: set() for key in lookup}
     anchored = set(anchored)
@@ -123,9 +126,11 @@ def assemble_blocks(lines, pairs, max_gap, anchored=(), reliable_gap=True, cance
         parent[find(j)] = find(i)
         for source, target in ((a, b), (b, a)):
             _, up = _offset(source, target, metric)
-            choices.setdefault((source.key, up > 0), []).append(distance)
-    for (key, _direction), distances in choices.items():
-        distances.sort()
+            by_position = choices.setdefault((source.key, up > 0), {})
+            position = positions[target.key]
+            by_position[position] = min(by_position.get(position, distance), distance)
+    for (key, _direction), by_position in choices.items():
+        distances = sorted(by_position.values())
         if len(distances) > 1 and distances[1] <= distances[0] * 1.25:
             problems[key].add('Competing nearby text lines or adjacent columns.')
 
@@ -142,8 +147,7 @@ def assemble_blocks(lines, pairs, max_gap, anchored=(), reliable_gap=True, cance
         representatives, seen_lines = [], set()
         for key in ordered:
             line = lookup[key]
-            position = metric.position(line) if metric else (round(line.x, 6), round(line.y, 6))
-            signature = (position, normalized_text(line.text))
+            signature = (positions[key], normalized_text(line.text))
             if signature not in seen_lines:
                 representatives.append(key)
                 seen_lines.add(signature)
@@ -151,9 +155,8 @@ def assemble_blocks(lines, pairs, max_gap, anchored=(), reliable_gap=True, cance
                 for a, b in zip(representatives, representatives[1:])]
         if gaps and (min(gaps) <= 1e-6 or max(gaps) > 1.8 * min(gaps)):
             reasons.add('Uneven line spacing; neighboring callouts may have been combined.')
-        anchor_positions = {(metric.position(lookup[key]) if metric else (round(lookup[key].x, 6), round(lookup[key].y, 6)))
-                            for key in set(members) & anchored}
-        if len(anchor_positions) > 1:
+        anchor_positions = {positions[key] for key in set(members) & anchored}
+        if len(anchor_positions) > 1 and not allow_multiple_anchors:
             reasons.add('Several distinct leader anchors in the proposed text block.')
         if len(representatives) > 20:
             reasons.add('More than 20 text fragments; inspect possible chained callouts.')
@@ -165,7 +168,7 @@ def assemble_blocks(lines, pairs, max_gap, anchored=(), reliable_gap=True, cance
         elif len(representatives) == 1:
             status, reason = 'single', 'Original text preserved; no line grouping needed.'
         elif anchor_positions:
-            status, reason = 'supported', 'Aligned, consistently spaced lines with one text anchor used by the leader(s).'
+            status, reason = 'supported', 'Aligned, consistently spaced lines with leader anchor evidence.'
         else:
             status, reason = 'layout_only', 'Aligned, consistently spaced lines; no leader evidence. Check the assembled label.'
         result.append(TextBlock(tuple(ordered), representatives[0], text, status, reason))

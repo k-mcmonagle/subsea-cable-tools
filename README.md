@@ -100,7 +100,18 @@ The tool creates copies and leaves the imported layers unchanged:
   boundary targets and invalid geometry remain review cases. Existing field names are preserved;
   newly generated fields receive a suffix if needed.
 - **Leader association checks** show which text block and polygon each leader could connect,
-  with the reason for accepting or rejecting it. Several leaders may share a description block.
+  with the reason for accepting or rejecting it. One description can populate every polygon
+  reached by a confirmed leader. Split stems are followed through exact shared endpoints in a
+  single leader layer when there is one text end and an unambiguous path. Connections that could
+  themselves be polygon targets are flagged. Enable **Allow leaders to start on different lines
+  of one description** under **Advanced parameters** when the drawing uses that convention.
+
+With the outputs loaded, open **Plugins → Subsea Cable Tools → Seabed Description Review**.
+Choose the polygon, text block or leader output. **Needs review** prioritises conflicts and
+uncertain matches. Click a row or use **Previous** and **Next** to highlight its linked evidence
+and move the map. For polygons, enter a description or choose a candidate from the linked text.
+**Apply review** records the decision and advances through the queue. Use QGIS **Save Layer Edits**
+to keep decisions. Save temporary outputs to GeoPackage to review them across sessions.
 
 Certainty describes geometric evidence, not confirmation of the soil interpretation. The tool
 never assigns a polygon merely because it is nearest. Ambiguous text grouping, insufficient

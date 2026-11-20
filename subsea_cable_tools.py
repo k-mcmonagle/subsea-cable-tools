@@ -61,6 +61,7 @@ class SubseaCableTools:
         ('planner_dock', ('shutdown',)),
         ('burial_dock', ('shutdown',)),
         ('route_comments_dock', ('shutdown',)),
+        ('annotation_review_dock', ('shutdown',)),
     )
     # Top-level tool windows: shutdown() stops their workers and removes their
     # map graphics; close() is the fallback for a window without one.
@@ -76,7 +77,7 @@ class SubseaCableTools:
         'span_analysis_action', 'workbench_action',
         'planner_action', 'burial_action', 'transit_measure_action',
         'explorer_action', 'cable_library_action', 'kp_settings_action',
-        'save_layers_gpkg_action', 'route_comments_action',
+        'save_layers_gpkg_action', 'route_comments_action', 'annotation_review_action',
     )
 
     def __init__(self, iface):
@@ -110,6 +111,7 @@ class SubseaCableTools:
         self.planner_dock = None
         self.burial_dock = None
         self.route_comments_dock = None
+        self.annotation_review_dock = None
         self.explorer_window = None
         self.catenary_calculator_v2_dialog = None
         self.span_analysis_dialog = None
@@ -252,6 +254,11 @@ class SubseaCableTools:
             self.show_route_comments,
             tooltip="Route Comments: capture, review and export comments on routes "
                     "(route points, KP ranges, map locations) in a comment register.")
+
+        self.annotation_review_action = self.add_action(
+            self._icon('icon.png'), "Seabed Description Review",
+            self.show_annotation_review,
+            tooltip="Review seabed polygon descriptions, text blocks and leaders on the map.")
 
         self.transit_measure_action = self.add_action(
             self._icon('transit_measure_icon.png'), "Transit Measure",
@@ -679,6 +686,19 @@ class SubseaCableTools:
         self.route_comments_dock.show()
         self.route_comments_dock.raise_()
         return self.route_comments_dock
+
+    def show_annotation_review(self):
+        if not _alive(self.annotation_review_dock):
+            try:
+                from .processing.annotation_review_dock import AnnotationReviewDock
+                self.annotation_review_dock = AnnotationReviewDock(self.iface)
+                self.iface.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.annotation_review_dock)
+            except Exception:
+                self.annotation_review_dock = None
+                self._report_open_failure("Seabed Description Review could not be opened.")
+                return
+        self.annotation_review_dock.show()
+        self.annotation_review_dock.raise_()
 
     def _add_route_comment(self, kind, capture, data):
         """KP Mouse Tool hook: add a comment at a route point, location or KP range."""

@@ -5,13 +5,14 @@ import json
 import math
 import os
 import re
+from uuid import uuid4
 
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     NULL, QgsCoordinateTransform, QgsFeature,
     QgsField, QgsFields, QgsGeometry, QgsPointXY, QgsProcessing,
     QgsProcessingException, QgsProcessingLayerPostProcessorInterface,
-    QgsProcessingParameterCrs, QgsProcessingParameterFeatureSink,
+    QgsProcessingParameterBoolean, QgsProcessingParameterCrs, QgsProcessingParameterFeatureSink,
     QgsProcessingParameterFeatureSource, QgsProcessingParameterField,
     QgsProcessingParameterMultipleLayers, QgsProcessingParameterNumber,
     QgsVectorLayerSimpleLabeling,
@@ -35,6 +36,11 @@ from ..qgis_compat import (
 MAX_FEATURES = 100000
 MAX_PAIRS = 500000
 MAX_TEXT_CHARS = 20000000
+POLYGON_FIELDS = (
+    'soil_description', 'candidate_text', 'description_status', 'match_reason', 'polygon_ref',
+    'source_layer', 'source_layer_id', 'source_feature_id', 'block_ids', 'leader_refs',
+)
+REVIEW_FIELDS = ('association_run', 'review_status')
 
 
 def _present(value):
@@ -124,6 +130,7 @@ class AttachSeabedDescriptionsAlgorithm(SubseaCableAlgorithm):
     MAX_LINE_GAP = 'MAX_LINE_GAP'
     ANCHOR_TOLERANCE = 'ANCHOR_TOLERANCE'
     BOUNDARY_TOLERANCE = 'BOUNDARY_TOLERANCE'
+    ALLOW_MULTIPLE_ANCHORS = 'ALLOW_MULTIPLE_ANCHORS'
     OUTPUT_LABELS = 'OUTPUT_LABELS'
     OUTPUT_POLYGONS = 'OUTPUT_POLYGONS'
     OUTPUT_CHECKS = 'OUTPUT_CHECKS'
@@ -173,6 +180,9 @@ class AttachSeabedDescriptionsAlgorithm(SubseaCableAlgorithm):
         self.addParameter(QgsProcessingParameterNumber(
             self.BOUNDARY_TOLERANCE, self.tr('Flag targets this close to polygon boundaries for review (metres)'),
             type=PROCESSING_NUMBER_DOUBLE, defaultValue=0.5, minValue=0))
+        self.addParameter(QgsProcessingParameterBoolean(
+            self.ALLOW_MULTIPLE_ANCHORS,
+            self.tr('Allow leaders to start on different lines of one description'), defaultValue=False))
         self.addParameter(QgsProcessingParameterCrs(
             self.WORKING_CRS, self.tr('Legacy measurement CRS (ignored; measurements are now ellipsoidal)'), optional=True))
         self.addParameter(QgsProcessingParameterFeatureSink(
@@ -190,7 +200,7 @@ class AttachSeabedDescriptionsAlgorithm(SubseaCableAlgorithm):
             advanced = QgsProcessingParameterDefinition.FlagAdvanced
             hidden = QgsProcessingParameterDefinition.FlagHidden
         for name in (self.ROTATION_FIELD, self.ALIGNMENT_FIELD, self.MAX_LINE_GAP,
-                     self.ANCHOR_TOLERANCE, self.BOUNDARY_TOLERANCE, self.WORKING_CRS):
+                     self.ANCHOR_TOLERANCE, self.BOUNDARY_TOLERANCE, self.ALLOW_MULTIPLE_ANCHORS, self.WORKING_CRS):
             parameter = self.parameterDefinition(name)
             parameter.setFlags(parameter.flags() | advanced)
         legacy_crs = self.parameterDefinition(self.WORKING_CRS)
@@ -210,14 +220,19 @@ reading order, with newlines preserved. Zero line gap estimates a limit from rep
 spacing; small or mixed-scale samples require review or an explicit limit. The rule is geometric,
 not a probability or confirmation of the survey interpretation. Inspect the first results at
 the survey drawing scale.</p>
-<p><b>Text status:</b> single = original text; supported = consistent layout with one text
-anchor used by the leader(s); layout_only = consistent layout without leader evidence;
+<p><b>Text status:</b> single = original text; supported = consistent layout with leader
+anchor evidence; layout_only = consistent layout without leader evidence;
 review = uncertain assembly. Accepted text is in <b>assembled_text</b>. Review rows keep the
 proposal in <b>candidate_text</b>, with assembled_text empty so they are not labelled as accepted.
 Source feature IDs and reasons are retained. A label point is placed at its first text line.</p>
 <p>For polygon assignment, a leader must have one unambiguous text end and its other end
 strictly inside one selected polygon, away from boundaries. Both line directions are supported.
-Several leaders can share a text block. Nearby polygons are never silently selected. Overlaps,
+Several leaders can share a text block and attach it to multiple polygons. If the drawing
+allows leaders to start at different lines of one description, enable that option under
+<b>Advanced parameters</b>. By default those groups require review because they can also
+represent adjacent callouts. Split stems in one
+leader layer can be followed through shared endpoints when they form a tree with one text end.
+Junctions that could also be polygon targets require review. Overlaps,
 boundary hits, invalid polygons and uncertain text are flagged. Invalid polygons are repaired
 only in a working copy for candidate searches; output geometries preserve the originals.</p>
 <p><b>Polygon status:</b> matched = one distinct accepted description; multiple_descriptions =
@@ -226,8 +241,9 @@ association. Only matched polygons receive <b>soil_description</b>; proposals re
 <b>candidate_text</b>. Identical repeated descriptions are deduplicated. All original polygon
 attributes are copied; generated names gain a suffix if they would overwrite an existing field.
 The source layer, feature IDs and block IDs permit tracing results back to the input.</p>
-<p>The leader-check layer explains each association, including rejected leaders. Use it with
-the original annotation layers to review results. Text spacing and leader-anchor distances are
+<p>Open <b>Seabed Description Review</b> from the plugin menu to inspect flagged polygons,
+text blocks and leaders on the map and save decisions to the output layers. The leader-check
+layer records the upstream part of a split path. Text spacing and leader-anchor distances are
 measured on the WGS84 ellipsoid. Polygon containment and boundary distances use a separate local
 projection centred on each leader target, with curved transformed edges subdivided to a 2 mm
 numerical tolerance and a 4 mm boundary review margin. These tolerances describe the calculation,
@@ -344,7 +360,7 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
                     raise QgsProcessingException('Too many competing text neighbors. Reduce the line-gap limit or select a smaller area.')
                 yield line.key, other
 
-    def _read_leaders(self, layers, metric, output_crs, text_index, tolerance, context, feedback):
+    def _read_leaders(self, layers, metric, output_crs, text_index, anchor_positions, tolerance, context, feedback):
         leaders, anchored = [], set()
         for layer_number, layer in enumerate(layers, 1):
             if not layer.crs().isValid():
@@ -371,7 +387,7 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
                         raise QgsProcessingException('Too many leader parts; use a smaller area.')
                     row = {'ref': f'L{layer_number}:{feature.id()}:{part_number}', 'layer': layer.name(), 'layer_id': layer.id(),
                            'fid': feature.id(), 'part': part_number, 'geometry': QgsGeometry(),
-                           'ends': [], 'near': [], 'error': ''}
+                           'ends': [], 'nodes': [], 'near': [], 'error': ''}
                     leaders.append(row)
                     try:
                         if not part or len(part) < 2:
@@ -385,6 +401,7 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
                         if metric.metres(ends[0], ends[1]) <= 1e-6:
                             raise ValueError('Closed leader or arrowhead; no distinct text and target ends.')
                         row['ends'] = ends
+                        row['nodes'] = [(layer_number, p.x(), p.y()) for p in (part[0], part[-1])]
                         for point in ends:
                             radius = max(tolerance, 1e-6)
                             close = text_index.near(point, radius)
@@ -392,7 +409,7 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
                         # A seed is only evidence when one end has one distinct
                         # text position. Ambiguous seeds do not strengthen groups.
                         active = [close for close in row['near'] if close]
-                        if len(active) == 1 and len(active[0]) == 1:
+                        if len(active) == 1 and len({anchor_positions[key] for key in active[0]}) == 1:
                             anchored.update(active[0])
                     except QgsProcessingException:
                         raise
@@ -465,77 +482,181 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
                         index.add(len(records) - 1, row['local'])
         return fields, records, index
 
-    def _associate(self, leaders, blocks, polygons, polygon_index, boundary_tolerance, feedback):
+    def _target_candidates(self, target, polygons, polygon_index, boundary_tolerance, feedback):
+        point = QgsGeometry.fromPointXY(QgsPointXY(0, 0))
+        radius = max(boundary_tolerance, 1e-6) + BOUNDARY_MARGIN
+        inside, nearby, failed, distances = [], [], [], {}
+        for key in polygon_index.candidates(target, radius):
+            self._cancel(feedback)
+            polygon = polygons[key]
+            try:
+                search, repaired = polygon['local'].at(target)
+                if repaired:
+                    polygon['error'] = 'Invalid polygon; repaired only for candidate search. Review geometry and match.'
+                boundary = QgsGeometry(search.constGet().boundary())
+                distances[key] = boundary.distance(point)
+                if search.contains(point):
+                    inside.append(key)
+                elif search.distance(point) <= radius:
+                    nearby.append(key)
+            except QgsProcessingException:
+                raise
+            except Exception as exc:
+                polygon['error'] = str(exc) if isinstance(exc, ValueError) else 'Polygon could not be measured at this target.'
+                failed.append(key)
+        candidates = sorted(set(inside + nearby + failed))
+        reasons = []
+        if failed:
+            reasons.append('A candidate polygon could not be measured reliably at this target.')
+        if candidates and (len(inside) != 1 or nearby):
+            reasons.append('Target overlaps polygons or lies on/near a polygon boundary.')
+        edge_distance = distances[inside[0]] if len(inside) == 1 else None
+        if edge_distance is not None and edge_distance <= boundary_tolerance + BOUNDARY_MARGIN:
+            reasons.append('Target is too close to the polygon boundary.')
+        if any(polygons[key]['error'] for key in candidates):
+            reasons.append('Polygon geometry requires review.')
+        return candidates, edge_distance, reasons
+
+    def _leader_trees(self, leaders, feedback):
+        """Find tree components rooted at one text end, using exact same-layer endpoints."""
+        adjacency = defaultdict(list)
+        for i, leader in enumerate(leaders):
+            self._cancel(feedback)
+            if not leader['error']:
+                for end, node in enumerate(leader['nodes']):
+                    adjacency[node].append((i, end))
+        visited = set()
+        for start in adjacency:
+            self._cancel(feedback)
+            if start in visited:
+                continue
+            visited.add(start)
+            component, pending = [], [start]
+            while pending:
+                self._cancel(feedback)
+                node = pending.pop()
+                component.append(node)
+                for i, end in adjacency[node]:
+                    other = leaders[i]['nodes'][1 - end]
+                    if other not in visited:
+                        visited.add(other)
+                        pending.append(other)
+            if len(component) < 3 or sum(len(adjacency[node]) for node in component) != 2 * (len(component) - 1):
+                continue
+            roots = [node for node in component if any(leaders[i]['near'][end] for i, end in adjacency[node])]
+            if len(roots) != 1:
+                continue
+            root = roots[0]
+            parent = {root: None}
+            order = [root]
+            for node in order:
+                self._cancel(feedback)
+                for i, end in adjacency[node]:
+                    target_end = 1 - end
+                    other = leaders[i]['nodes'][target_end]
+                    if other not in parent:
+                        parent[other] = (node, i, target_end)
+                        order.append(other)
+            if any(parent[node][0] != root for node in order[1:]):
+                yield adjacency, root, parent, order
+
+    @staticmethod
+    def _link_candidates(leader, polygons, candidates, blocks, reason=''):
+        for key in candidates:
+            polygons[key]['blocks'].update(blocks)
+            polygons[key]['leaders'].add(leader['ref'])
+            if reason:
+                polygons[key]['review'].add(reason)
+
+    def _associate(self, leaders, blocks, polygons, polygon_index, boundary_tolerance, have_polygons, feedback):
         memberships = {key: i for i, block in enumerate(blocks) for key in block.members}
+        targets = {}
         for leader in leaders:
             self._cancel(feedback)
-            leader.update(status='unmatched', reason=leader['error'], block=None, candidate_blocks=[],
-                          polygons=[], gap=None, target_gap=None)
-            if leader['error']:
-                leader['status'] = 'review'
-                continue
-            endpoints = [{memberships[key] for key in close} for close in leader['near']]
-            leader['candidate_blocks'] = sorted(set().union(*endpoints))
-            if not any(endpoints):
-                leader['reason'] = 'Neither endpoint is close to a text anchor.'
-                continue
-            if all(endpoints) or max(map(len, endpoints)) > 1:
-                leader.update(status='review', reason='Competing text blocks or text near both leader ends.')
-                continue
-            text_end = 0 if endpoints[0] else 1
-            block_id = next(iter(endpoints[text_end]))
-            leader['block'] = block_id
-            leader['gap'] = min(leader['near'][text_end].values())
-            target = leader['ends'][1 - text_end]
-            geometry = QgsGeometry.fromPointXY(QgsPointXY(0, 0))
-            radius = max(boundary_tolerance, 1e-6) + BOUNDARY_MARGIN
-            ids = polygon_index.candidates(target, radius)
-            inside, nearby, failed, distances = [], [], [], {}
-            for key in ids:
-                self._cancel(feedback)
-                polygon = polygons[key]
-                try:
-                    search, repaired = polygon['local'].at(target)
-                    if repaired:
-                        polygon['error'] = 'Invalid polygon; repaired only for candidate search. Review geometry and match.'
-                    boundary = QgsGeometry(search.constGet().boundary())
-                    distances[key] = boundary.distance(geometry)
-                    if search.contains(geometry):
-                        inside.append(key)
-                    elif search.distance(geometry) <= radius:
-                        nearby.append(key)
-                except QgsProcessingException:
-                    raise
-                except Exception as exc:
-                    polygon['error'] = str(exc) if isinstance(exc, ValueError) else 'Polygon could not be measured at this target.'
-                    failed.append(key)
-            candidates = sorted(set(inside + nearby + failed))
-            leader['polygons'] = candidates
+            leader.update(status='review' if leader['error'] else 'unmatched', reason=leader['error'],
+                          block=None, candidate_blocks=[], polygons=[], gap=None, target_gap=None, upstream=None)
+
+        def target_at(leader, end):
+            node = leader['nodes'][end]
+            if node not in targets:
+                targets[node] = self._target_candidates(leader['ends'][end], polygons, polygon_index,
+                                                        boundary_tolerance, feedback)
+            return targets[node]
+
+        def assign(leader, target_end, endpoints, anchor_gap, extra_reason=''):
+            leader['candidate_blocks'] = endpoints
+            leader['gap'] = anchor_gap
+            candidates, distance, reasons = target_at(leader, target_end)
+            leader.update(polygons=candidates, target_gap=distance)
+            reasons = list(reasons)
+            if len(endpoints) == 1:
+                leader['block'] = endpoints[0]
+                if blocks[endpoints[0]].status in {'review', 'layout_only'}:
+                    reasons.append('Text assembly lacks unambiguous leader support or requires review.')
+            else:
+                reasons.append('Competing text blocks at the text end.')
+            if extra_reason:
+                reasons.append(extra_reason)
             if not candidates:
-                leader['reason'] = ('No polygon layers selected.' if not polygons else
-                                    'Target is outside the selected soil polygons; no nearest-polygon assignment made.')
+                if len(endpoints) > 1 or extra_reason:
+                    leader['status'] = 'review'
+                else:
+                    leader['status'] = 'unmatched' if have_polygons else 'not_requested'
+                reasons.append('Target is outside the selected soil polygons.' if have_polygons else 'No polygon layers selected.')
+                leader['reason'] = ' '.join(reasons)
+                return
+            reason = ' '.join(reasons)
+            leader.update(status='review' if reason else 'matched',
+                          reason=reason or 'One text block and one polygon containing the leader target.')
+            self._link_candidates(leader, polygons, candidates, endpoints, reason)
+
+        joined = set()
+        if polygons:
+            for adjacency, root, parent, order in self._leader_trees(leaders, feedback):
+                i, end = adjacency[root][0]
+                anchors = leaders[i]['near'][end]
+                root_blocks = sorted({memberships[key] for key in anchors})
+                anchor_gap = min(anchors.values())
+                ambiguous_path = {root: False}
+                for node in order[1:]:
+                    self._cancel(feedback)
+                    upstream, i, target_end = parent[node]
+                    leader = leaders[i]
+                    joined.add(i)
+                    if parent[upstream] is not None:
+                        leader['upstream'] = leaders[parent[upstream][1]]['ref']
+                    is_junction = len(adjacency[node]) > 1
+                    has_target = is_junction and bool(target_at(leader, target_end)[0])
+                    ambiguous_path[node] = ambiguous_path[upstream] or has_target
+                    if not is_junction or has_target:
+                        reason = ('A connection along this leader could also be a polygon target.'
+                                  if ambiguous_path[node] else '')
+                        assign(leader, target_end, root_blocks, anchor_gap, reason)
+                    else:
+                        leader.update(status='connector', reason='Shared leader path to downstream endpoints.',
+                                      candidate_blocks=root_blocks)
+                        if len(root_blocks) == 1:
+                            leader['block'] = root_blocks[0]
+
+        for i, leader in enumerate(leaders):
+            self._cancel(feedback)
+            if leader['error'] or i in joined:
                 continue
-            reasons = []
-            if failed:
-                reasons.append("A candidate polygon could not be measured reliably at this target.")
-            if len(inside) != 1 or nearby:
-                reasons.append('Target overlaps polygons or lies on/near a polygon boundary.')
-            if len(inside) == 1:
-                edge_distance = distances[inside[0]]
-                leader['target_gap'] = edge_distance
-                if edge_distance <= boundary_tolerance + BOUNDARY_MARGIN:
-                    reasons.append('Target is too close to the polygon boundary.')
-            if blocks[block_id].status in {'review', 'layout_only'}:
-                reasons.append('Text assembly lacks unambiguous leader support or requires review.')
-            if any(polygons[key]['error'] for key in candidates):
-                reasons.append('Polygon geometry requires review.')
-            leader['status'] = 'review' if reasons else 'matched'
-            leader['reason'] = ' '.join(reasons) if reasons else 'One text block and one polygon containing the opposite endpoint.'
-            for key in candidates:
-                polygons[key]['blocks'].add(block_id)
-                polygons[key]['leaders'].add(leader['ref'])
-                if reasons:
-                    polygons[key]['review'].add(leader['reason'])
+            first, last = leader['near']
+            if first and last:
+                reason = 'Text is near both leader ends; check which end points to each polygon.'
+                candidates = set()
+                for target_end, anchors in ((1, first), (0, last)):
+                    ids, _, _ = target_at(leader, target_end)
+                    self._link_candidates(leader, polygons, ids, {memberships[key] for key in anchors}, reason)
+                    candidates.update(ids)
+                leader.update(status='review', reason=reason, polygons=sorted(candidates),
+                              candidate_blocks=sorted({memberships[key] for key in first.keys() | last.keys()}))
+            elif first or last:
+                anchors = first or last
+                assign(leader, 1 if first else 0, sorted({memberships[key] for key in anchors}), min(anchors.values()))
+            else:
+                leader['reason'] = 'Neither endpoint is close to a text anchor or connected by a traceable leader path.'
 
     def _sink(self, parameters, name, fields, geometry_type, crs, context):
         destination = self.parameterAsOutputLayer(parameters, name, context)
@@ -615,18 +736,20 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
             feedback.pushInfo(message)
         leader_layers = self.parameterAsLayerList(parameters, self.LEADERS, context)
         polygon_layers = self.parameterAsLayerList(parameters, self.POLYGONS, context)
-        output_names = [self.OUTPUT_LABELS]
-        if leader_layers:
-            output_names.append(self.OUTPUT_CHECKS)
-        if polygon_layers:
-            output_names.append(self.OUTPUT_POLYGONS)
+        output_names = {self.OUTPUT_LABELS}
+        for name, layers in ((self.OUTPUT_CHECKS, leader_layers), (self.OUTPUT_POLYGONS, polygon_layers)):
+            if layers and self.parameterAsOutputLayer(parameters, name, context) not in ('', 'SKIP_OUTPUT'):
+                output_names.add(name)
         self._validate_destinations(parameters, context,
                                     [self.parameterAsVectorLayer(parameters, self.TEXT, context)] + leader_layers + polygon_layers,
                                     output_names)
+        anchor_positions = {line.key: metric.position(line) for line in lines}
         leaders, anchored = self._read_leaders(leader_layers, metric, output_crs, text_index,
-                                              anchor_tolerance, context, feedback)
-        blocks = assemble_blocks(lines, self._pairs(lines, text_index, max(gap, 1e-6), feedback), gap,
-                                 anchored, reliable_gap, lambda: self._cancel(feedback), metric)
+                                              anchor_positions, anchor_tolerance, context, feedback)
+        blocks = assemble_blocks(
+            lines, self._pairs(lines, text_index, max(gap, 1e-6), feedback), gap,
+            anchored, reliable_gap, lambda: self._cancel(feedback), metric,
+            allow_multiple_anchors=self.parameterAsBoolean(parameters, self.ALLOW_MULTIPLE_ANCHORS, context))
         for key, record in records.items():
             if record['error']:
                 blocks.append(TextBlock((key,), key, record['text'], 'review', record['error']))
@@ -635,9 +758,9 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
         polygon_fields, polygons, polygon_index = self._read_polygons(
             polygon_layers, output_crs, context, feedback)
         feedback.setProgress(65)
-        self._associate(leaders, blocks, polygons, polygon_index, boundary_tolerance, feedback)
+        self._associate(leaders, blocks, polygons, polygon_index, boundary_tolerance, bool(polygon_layers), feedback)
         result = self._outputs(parameters, context, feedback, source, records, blocks, leaders, polygons,
-                               polygon_fields, output_crs, bool(polygon_layers), bool(leader_layers))
+                               polygon_fields, output_crs, bool(polygon_layers), output_names)
         feedback.pushInfo('Text blocks: ' + ', '.join(f'{name}={count}' for name, count in sorted(Counter(b.status for b in blocks).items())))
         feedback.pushInfo('Leader checks: ' + ', '.join(f'{name}={count}' for name, count in sorted(Counter(row['status'] for row in leaders).items())))
         feedback.pushWarning('Experimental: statuses describe geometric evidence, not verified soil interpretation. Review candidate_text and reasons before use.')
@@ -657,8 +780,10 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
         return {}
 
     def _outputs(self, parameters, context, feedback, source, records, blocks, leaders, polygons,
-                 polygon_fields, crs, have_polygons, have_leaders):
+                 polygon_fields, crs, have_polygons, output_names):
         result = {}
+        run_id = uuid4().hex
+        review_fields = [(name, FIELD_TYPE_STRING) for name in REVIEW_FIELDS]
         block_names = {i: f'B{i + 1:06d}' for i in range(len(blocks))}
         block_links = defaultdict(list)
         for leader in leaders:
@@ -667,7 +792,7 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
         fields = _fields([(name, FIELD_TYPE_STRING) for name in
                           ('block_id', 'assembled_text', 'candidate_text', 'text_status', 'text_reason',
                            'target_status', 'polygon_refs', 'source_layer', 'source_fids')]
-                         + [('fragment_count', FIELD_TYPE_INT), ('label_rotation', FIELD_TYPE_DOUBLE)])
+                         + [('fragment_count', FIELD_TYPE_INT), ('label_rotation', FIELD_TYPE_DOUBLE)] + review_fields)
         sink, dest = self._sink(parameters, self.OUTPUT_LABELS, fields, WKB_POINT, crs, context)
         result[self.OUTPUT_LABELS] = dest
         for i, block in enumerate(blocks):
@@ -679,22 +804,19 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
                 target_status = 'review'
             elif any(link['status'] == 'matched' for link in links):
                 target_status = 'matched' if len(refs) == 1 else 'multiple_targets'
-                if any(link['status'] != 'matched' for link in links):
+                if any(link['status'] == 'unmatched' for link in links):
                     target_status = 'partial'
             record = records[block.anchor]
             self._write(sink, fields, [block_names[i], block.text if block.status != 'review' else None,
                                       block.text, block.status, block.reason, target_status, _json(refs),
-                                      source.sourceName(), _json(list(block.members)), len(block.members), record['rotation']],
+                                      source.sourceName(), _json(list(block.members)), len(block.members), record['rotation'], run_id, None],
                         record['geometry'])
         if context.willLoadLayerOnCompletion(dest):
             # Retain the Python wrapper until Processing has applied it.
             self._label_postprocessor = _LabelPoints()
             context.layerToLoadOnCompletionDetails(dest).setPostProcessor(self._label_postprocessor)
-        if have_polygons:
-            specification = [(name, FIELD_TYPE_STRING) for name in
-                             ('soil_description', 'candidate_text', 'description_status', 'match_reason',
-                              'polygon_ref', 'source_layer', 'source_layer_id', 'source_feature_id', 'block_ids', 'leader_refs')]
-            generated = [_new_field(polygon_fields, name, kind) for name, kind in specification]
+        if self.OUTPUT_POLYGONS in output_names:
+            generated = [_new_field(polygon_fields, name, FIELD_TYPE_STRING) for name in POLYGON_FIELDS + REVIEW_FIELDS]
             feedback.pushInfo('Polygon result fields: ' + ', '.join(generated))
             output_type = QgsWkbTypes.MultiPolygon
             if any(QgsWkbTypes.hasZ(row['geometry'].wkbType()) for row in polygons):
@@ -722,13 +844,13 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
                 statuses[status] += 1
                 self._write(sink, polygon_fields, polygon['attrs'] + [candidate if status == 'matched' else None,
                             candidate, status, ' '.join(notes), polygon['ref'], polygon['layer'], polygon['layer_id'], str(polygon['fid']),
-                            _json([block_names[i] for i in ids]), _json(sorted(polygon['leaders']))], polygon['geometry'])
+                            _json([block_names[i] for i in ids]), _json(sorted(polygon['leaders'])), run_id, None], polygon['geometry'])
             feedback.pushInfo('Polygon results: ' + ', '.join(f'{name}={count}' for name, count in sorted(statuses.items())))
-        if have_leaders:
+        if self.OUTPUT_CHECKS in output_names:
             fields = _fields([(name, FIELD_TYPE_STRING) for name in
                               ('leader_ref', 'source_layer', 'source_layer_id', 'source_feature_id', 'block_id', 'candidate_block_ids',
-                               'polygon_refs', 'match_status', 'match_reason')]
-                             + [('part_number', FIELD_TYPE_INT), ('anchor_gap_m', FIELD_TYPE_DOUBLE), ('boundary_gap_m', FIELD_TYPE_DOUBLE)])
+                               'polygon_refs', 'match_status', 'match_reason', 'upstream_leader_ref')]
+                             + [('part_number', FIELD_TYPE_INT), ('anchor_gap_m', FIELD_TYPE_DOUBLE), ('boundary_gap_m', FIELD_TYPE_DOUBLE)] + review_fields)
             sink, dest = self._sink(parameters, self.OUTPUT_CHECKS, fields, WKB_LINESTRING, crs, context)
             result[self.OUTPUT_CHECKS] = dest
             for row in leaders:
@@ -736,5 +858,5 @@ Use temporary layers or GeoPackage outputs; Shapefile cannot safely store the lo
                 self._write(sink, fields, [row['ref'], row['layer'], row['layer_id'], str(row['fid']), block_names.get(row['block']),
                             _json([block_names[i] for i in row['candidate_blocks']]),
                             _json([polygons[key]['ref'] for key in row['polygons']]), row['status'], row['reason'],
-                            row['part'], row['gap'], row['target_gap']], row['geometry'])
+                            row['upstream'], row['part'], row['gap'], row['target_gap'], run_id, None], row['geometry'])
         return result

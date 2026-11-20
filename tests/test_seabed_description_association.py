@@ -331,3 +331,73 @@ def test_output_cannot_replace_input_or_another_output(tmp_path):
     _, ok = algorithm.run(params, QgsProcessingContext(), feedback)
     assert not ok and any('separate files' in message for message in feedback.messages)
     assert not (tmp_path / 'both.gpkg').exists()
+
+
+def test_shared_stem_links_distinct_polygons_and_records_upstream_part():
+    poly = polygons(['Polygon((0 0,20 0,20 20,0 20,0 0))', 'Polygon((30 0,50 0,50 20,30 20,30 0))'])
+    line = leaders(['LineString(60 60,100 110)', 'MultiLineString((10 10,60 60),(60 60,40 10))'])
+    outputs, context, project, _ = run(labels(), [line], [poly])
+    label = rows(outputs['OUTPUT_LABELS'])[0]
+    assert label['target_status'] == 'multiple_targets'
+    assert len(json.loads(label['polygon_refs'])) == 2
+    checks = rows(outputs['OUTPUT_CHECKS'])
+    stem = next(check for check in checks if check['match_status'] == 'connector')
+    for check in checks:
+        if check.id() != stem.id():
+            assert check['match_status'] == 'matched'
+            assert check['upstream_leader_ref'] == stem['leader_ref']
+    for polygon in rows(outputs['OUTPUT_POLYGONS']):
+        assert polygon['soil_description'] == 'Fine sand\nwith shells'
+        assert polygon['association_run'] == label['association_run']
+
+
+def test_split_path_keeps_boundary_branch_in_review_and_matches_clear_branch():
+    poly = polygons(['Polygon((0 0,20 0,20 20,0 20,0 0))', 'Polygon((30 0,50 0,50 20,30 20,30 0))'])
+    line = leaders(['MultiLineString((100 110,60 60),(60 60,0 10),(40 10,60 60))'])
+    outputs, context, project, _ = run(labels(), [line], [poly])
+    assert rows(outputs['OUTPUT_LABELS'])[0]['target_status'] == 'review'
+    assert [p['description_status'] for p in rows(outputs['OUTPUT_POLYGONS'])] == ['review', 'matched']
+
+
+def test_junction_inside_polygon_does_not_automatically_assign_connected_polygons():
+    poly = polygons(['Polygon((0 0,20 0,20 20,0 20,0 0))', 'Polygon((30 0,50 0,50 20,30 20,30 0))'])
+    line = leaders(['LineString(100 110,10 10)', 'LineString(10 10,40 10)'])
+    outputs, context, project, _ = run(labels(), [line], [poly])
+    assert all(p['description_status'] == 'review' and absent(p['soil_description'])
+               for p in rows(outputs['OUTPUT_POLYGONS']))
+    assert all('could also be a polygon target' in check['match_reason'] for check in rows(outputs['OUTPUT_CHECKS']))
+
+
+def test_different_text_lines_can_share_targets_when_drawing_convention_is_enabled():
+    poly = polygons(['Polygon((0 0,20 0,20 20,0 20,0 0))', 'Polygon((30 0,50 0,50 20,30 20,30 0))'])
+    text = labels()
+    line = leaders(['LineString(100 110,10 10)', 'LineString(100 100,40 10)'])
+    for allowed, expected in [(False, 'review'), (True, 'matched')]:
+        outputs, context, project, _ = run(text, [line], [poly], ALLOW_MULTIPLE_ANCHORS=allowed)
+        assert [p['description_status'] for p in rows(outputs['OUTPUT_POLYGONS'])] == [expected, expected]
+
+
+def test_overprinted_duplicate_anchor_still_supports_text_assembly():
+    text = labels([('Point(100 110)', ['Fine sand', 0, 'left']), ('Point(100 110)', ['Fine sand', 0, 'left']),
+                   ('Point(100 100)', ['with shells', 0, 'left'])])
+    outputs, context, project, _ = run(text, [leaders()], [polygons()])
+    label = rows(outputs['OUTPUT_LABELS'])[0]
+    assert label['text_status'] == 'supported' and label['fragment_count'] == 3
+    assert rows(outputs['OUTPUT_POLYGONS'])[0]['soil_description'] == 'Fine sand\nwith shells'
+
+
+def test_ambiguous_leader_direction_preserves_polygon_candidates():
+    text = labels([('Point(100 110)', ['Fine sand', 0, 'left']), ('Point(10 10)', ['Gravel', 0, 'left'])])
+    outputs, context, project, _ = run(text, [leaders()], [polygons()])
+    polygon = rows(outputs['OUTPUT_POLYGONS'])[0]
+    check = rows(outputs['OUTPUT_CHECKS'])[0]
+    assert polygon['description_status'] == 'review' and absent(polygon['soil_description'])
+    assert polygon['candidate_text'] == 'Fine sand'
+    assert json.loads(check['polygon_refs']) == [polygon['polygon_ref']]
+    assert len(json.loads(check['candidate_block_ids'])) == 2
+
+
+def test_skipping_optional_outputs_keeps_association_in_label_output():
+    outputs, context, project, _ = run(labels(), [leaders()], [polygons()], OUTPUT_CHECKS='', OUTPUT_POLYGONS='SKIP_OUTPUT')
+    assert set(outputs) == {'OUTPUT_LABELS'}
+    assert rows(outputs['OUTPUT_LABELS'])[0]['target_status'] == 'matched'
