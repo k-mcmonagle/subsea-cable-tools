@@ -22,7 +22,7 @@ import os
 from contextlib import contextmanager
 from typing import Callable, Dict, List, Optional
 
-from qgis.core import (QgsApplication, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsGeometry,
+from qgis.core import (Qgis, QgsApplication, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsGeometry,
                        QgsProject, QgsRectangle)
 from qgis.PyQt.QtCore import (QBuffer, QByteArray, QIODevice, QItemSelection, QItemSelectionModel, QSettings, Qt,
                               QTimer, QUrl)
@@ -56,6 +56,7 @@ from .widgets import (COND_COLORS, EDITABLE, ID_ROLE, AdaptiveSplitter, CommentD
                       CommentTableModel, ThreadView, readable_selection)
 
 MAX_RECENT = 8
+RESTORE_VISIBILITY = "subsea_cable_tools/route_comments_restore_on_open"
 POLL_MS = 4000
 FLOATING_KEY = f"{SETTINGS}/floating"
 GEOMETRY_KEY = f"{SETTINGS}/window_geometry"
@@ -145,6 +146,8 @@ class RouteCommentsDock(QDockWidget):
         self._from_map = False
         self._thread_saving = False
         self._editing_position = False
+        self._map_suspended = False
+        self._unsaved_recent = []
         self.thumb_cache = ThumbnailCache()
         self._build_ui()
         self._poll_timer = QTimer(self)
@@ -158,6 +161,9 @@ class RouteCommentsDock(QDockWidget):
         project = QgsProject.instance()
         project.readProject.connect(self._on_project_changed)
         project.cleared.connect(self._on_project_changed)
+        project.projectSaved.connect(self._project_saved)
+        project.layerTreeRoot().visibilityChanged.connect(self._tree_visibility_changed)
+        project.layersWillBeRemoved.connect(self._layers_leaving)
         project.aboutToBeCleared.connect(self._stop_placing)   # its route layer is about to go
         self._project_connected = True
         self._on_project_changed()
@@ -192,6 +198,7 @@ class RouteCommentsDock(QDockWidget):
         set_menu = QMenu(self.set_button)
         self.act_new_set = set_menu.addAction("New set…", self.new_set)
         self.act_duplicate_set = set_menu.addAction("Duplicate set…", self.duplicate_set)
+        self.act_merge_sets = set_menu.addAction("Merge with another set…", self.merge_sets)
         self.act_duplicate_set.setToolTip("A copy of this set: everything, or its statuses, priorities and custom "
                                           "fields only")
         self.act_rename_set = set_menu.addAction("Rename set…", self.rename_set)
@@ -543,16 +550,37 @@ class RouteCommentsDock(QDockWidget):
     def _error(self, title: str, exc: BaseException) -> None:
         QMessageBox.warning(self, f"Route Comments — {title}", str(exc))
 
+    def _recent_key(self):
+        filename = QgsProject.instance().fileName()
+        if not filename:
+            return None
+        identity = os.path.normcase(os.path.normpath(filename))
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        return f"{SETTINGS}/project_recent/{digest}"
+
     def _recent(self) -> List[str]:
-        value = QSettings().value(f"{SETTINGS}/recent", []) or []
-        if isinstance(value, str):
-            value = [value]
-        return [str(p) for p in value if p]
+        key = self._recent_key()
+        if key is None:
+            return list(self._unsaved_recent)
+        paths = QSettings().value(key, []) or []
+        return [paths] if isinstance(paths, str) else list(paths)
 
     def _remember(self, path: str) -> None:
         recent = [p for p in self._recent() if os.path.normcase(p) != os.path.normcase(path)]
-        QSettings().setValue(f"{SETTINGS}/recent", [path] + recent[: MAX_RECENT - 1])
-        QSettings().setValue(f"{SETTINGS}/last_register", path)
+        paths = [path] + recent[: MAX_RECENT - 1]
+        key = self._recent_key()
+        if key is None:
+            self._unsaved_recent = paths
+        else:
+            QSettings().setValue(key, paths)
+
+    def _project_saved(self):
+        if self._recent_key() is not None:
+            for path in reversed(self._unsaved_recent):
+                self._remember(path)
+            self._unsaved_recent = []
+            if self.store is not None:
+                self._remember(self.store.path)
 
     @staticmethod
     def _clear_menu(menu) -> None:
@@ -575,7 +603,7 @@ class RouteCommentsDock(QDockWidget):
         if recent:
             sub = menu.addMenu("Recent registers")
             for path in recent:
-                action = sub.addAction(os.path.basename(path), lambda p=path: self.open_register(p))
+                action = sub.addAction(os.path.basename(path), lambda _checked=False, p=path: self.open_register(p))
                 action.setToolTip(path)
                 action.setEnabled(os.path.isfile(path))
             sub.setToolTipsVisible(True)
@@ -719,7 +747,9 @@ class RouteCommentsDock(QDockWidget):
 
     def _on_project_changed(self, *_args) -> None:
         """Open the register the project names (or none)."""
+        self._unsaved_recent = []
         self._stop_placing()
+        self.act_pick.setChecked(False)
         self._close_previews()
         self._disconnect_layers()
         path, set_id = map_layers.project_register()
@@ -865,6 +895,32 @@ class RouteCommentsDock(QDockWidget):
                           f"<a href='set:{source['set_id']}'>Back to '{html.escape(source['name'])}'</a>")
         return new
 
+    def merge_sets(self) -> None:
+        if self.store is None or not self.set_row or not self._confirm_leave():
+            return
+        try:
+            others = [row for row in self.store.list_sets() if row["set_id"] != self.set_row["set_id"]]
+            if not others:
+                return
+            selected, ok = QInputDialog.getItem(
+                self, "Merge comment sets", f"Combine '{self.set_row['name']}' with which set?",
+                [row["name"] for row in others], 0, False)
+            if not ok:
+                return
+            other = next(row for row in others if row["name"] == selected)
+            name, ok = QInputDialog.getText(
+                self, "Merge comment sets", "Name for the new combined set. Both originals are kept. "
+                "All comments, replies and images are copied, with new IDs and consecutive comment numbers.",
+                text=unique_name("Merged comments", [self.set_row["name"]] + [row["name"] for row in others]))
+            if not ok or not name.strip():
+                return
+            with _busy():
+                merged = self.store.merge_sets(self.set_row["set_id"], other["set_id"], name)
+        except CommentStoreError as exc:
+            self._error("Merge comment sets", exc)
+            return
+        self._reload_sets(merged["set_id"])
+
     def renumber_by_kp(self) -> bool:
         """Number the set's comments 1, 2, 3… in KP order, after a preview and confirmation."""
         if self.set_row is None or self.store is None or not self._confirm_leave():
@@ -998,7 +1054,7 @@ class RouteCommentsDock(QDockWidget):
         register open or cannot reach it (another drive mapping, no access,
         a newer plugin version's register).
         """
-        if not self.act_show_map.isChecked() or self.set_row is None or self.store is None:
+        if self._map_suspended or not self.act_show_map.isChecked() or self.set_row is None or self.store is None:
             self._disconnect_layers()
             if remove:
                 self.layers.remove()
@@ -1032,7 +1088,48 @@ class RouteCommentsDock(QDockWidget):
 
     def _toggle_map(self, on: bool) -> None:
         QSettings().setValue(f"{SETTINGS}/show_map", bool(on))
+        if not on:
+            self._close_previews()
+            self._stop_placing()
+            self.act_pick.setChecked(False)
         self._refresh_map(remove=not on)
+        self._update_highlight()
+
+    def _layers_leaving(self, layer_ids):
+        if any(layer.id() in layer_ids for layer in self._connected_layers):
+            self._close_previews()
+            if self.highlight is not None:
+                self.highlight.clear()
+
+    def _tree_visibility_changed(self, node):
+        if self._map_suspended and node.customProperty(RESTORE_VISIBILITY, False):
+            node.removeCustomProperty(RESTORE_VISIBILITY)
+        if self._kp_preview is not None and not self._comment_layer_visible(self._kp_preview.comment):
+            self._stop_kp_preview()
+        self._update_highlight()
+
+    @staticmethod
+    def _layer_kind(comment):
+        return "ranges" if str(comment.get("wkt") or "").upper().startswith("LINESTRING") else "points"
+
+    def _comment_layer_visible(self, comment):
+        kind = self._layer_kind(comment)
+        return (self.act_show_map.isChecked() and
+                any(layer.customProperty(map_layers.LAYER_PROP) == kind for layer in self.layers.visible_layers()))
+
+    def _update_highlight(self):
+        if self.highlight is None:
+            return
+        if self._map_suspended or not self.isVisible() or not self.act_show_map.isChecked():
+            self.highlight.clear()
+            return
+        kinds = {layer.customProperty(map_layers.LAYER_PROP) for layer in self.layers.visible_layers()}
+        wkts = []
+        for cid in self.selected_ids()[:200]:
+            comment = self.by_id.get(cid, {})
+            if self._layer_kind(comment) in kinds and comment.get("wkt"):
+                wkts.append(comment["wkt"])
+        self.highlight.show(wkts)
 
     def _toggle_labels(self, on: bool) -> None:
         QSettings().setValue(f"{SETTINGS}/labels", bool(on))
@@ -1165,14 +1262,13 @@ class RouteCommentsDock(QDockWidget):
         new_current = ids[0] if len(ids) == 1 else None
         if new_current != self.current_id and not self._confirm_leave():
             return
-        if sync_map and self.act_show_map.isChecked():
+        if sync_map and not self._map_suspended and self.act_show_map.isChecked():
             self._syncing = True
             try:
                 self.layers.select(ids)
             finally:
                 self._syncing = False
-        if self.highlight is not None:
-            self.highlight.show([self.by_id[c].get("wkt") for c in ids[:200] if c in self.by_id])
+        self._update_highlight()
         if new_current != self.current_id or new_current is None:
             self._show_comment(new_current)
             if new_current is not None and not self._from_map and self.follow_button.isChecked():
@@ -1181,7 +1277,7 @@ class RouteCommentsDock(QDockWidget):
         self._update_status()
 
     def _on_layer_selection(self, *_args) -> None:
-        if self._syncing:
+        if self._syncing or self._map_suspended:
             return
         ids = self.layers.selected_ids()
         hidden = self._hidden(ids)
@@ -1253,7 +1349,7 @@ class RouteCommentsDock(QDockWidget):
     def _start_kp_preview(self, cid, editor):
         self._stop_kp_preview()
         comment = self.by_id.get(cid)
-        if self.iface is None or comment is None:
+        if self.iface is None or comment is None or not self._comment_layer_visible(comment):
             return
         try:
             capture = self.checker.capture_for_edit(comment)
@@ -2022,34 +2118,57 @@ class RouteCommentsDock(QDockWidget):
         if self.current_id is None or self.store is None:
             return
         try:
+            if on:
+                image = next((row for row in self.store.list_attachments(self.current_id)
+                              if row["attachment_id"] == attachment_id), None)
+                if image is None or not os.path.isfile(self.store.attachment_path(image)):
+                    raise CommentStoreError("The image file is missing. Restore it in the register's "
+                                            "attachments folder or attach the picture again.")
             self.store.set_map_image(self.current_id, attachment_id if on else None)
         except CommentStoreError as exc:
             self._error("Map image", exc)
             self._keep_edits_and_reload()
             return
         if on:
-            self._prepare_map_images()
+            self._prepare_map_images(self.by_id.get(self.current_id))
         self._reload_keeping_image(attachment_id)
 
-    def _prepare_map_images(self) -> None:
+    def _prepare_map_images(self, comment=None) -> None:
         """Make sure an image chosen for the map can be seen: the map and its
         labels on, labels that can hold images, and a word on the scale."""
+        if Qgis.QGIS_VERSION_INT < 34000:
+            self._message("The image is saved. Map label images require QGIS 3.40 or later.", MESSAGE_WARNING)
+            return
+        if comment is not None and not comment.get("wkt"):
+            self._message("The image is saved. Use Place on the map to give this comment a position.",
+                          MESSAGE_WARNING)
+            return
         if not self.act_show_map.isChecked():
             self.act_show_map.setChecked(True)
         if not self.act_labels.isChecked():
             self.act_labels.setChecked(True)
         self.layers.set_labels(True)       # also labels turned off in Layer Properties
         layers = self.layers.layers()
-        settings = map_layers.label_settings_of(self.layers.find("points"))
-        if layers and (not settings.images or any(map_layers.labels_predate_images(x) for x in layers)
-                       or not all(map_layers.labels_show_images(x) for x in layers)):
+        if comment is not None:
+            if not self._comment_layer_visible(comment):
+                self._message("The comment layer is hidden. Enable it and its group in the Layers panel "
+                              "to see the image.", MESSAGE_WARNING)
+                return
+            layers = [self.layers.find(self._layer_kind(comment))]
+        settings = map_layers.label_settings_of(layers[0] if layers else None)
+        repair = [layer for layer in layers if not map_layers.labels_show_images(layer)
+                  or map_layers.labels_predate_images(layer) or not map_layers.label_settings_of(layer).images]
+        if repair:
             answer = QMessageBox.question(
                 self, "Route Comments", "The comment labels are not set to show images. Update them now? This "
                 "replaces label changes made in Layer Properties (Label contents… sets them again).",
                 MESSAGEBOX_YES | MESSAGEBOX_NO, MESSAGEBOX_YES)
-            if answer == MESSAGEBOX_YES:
-                settings.images = True
-                map_layers.apply_labels(layers, settings, True)
+            if answer != MESSAGEBOX_YES:
+                return
+            for layer in repair:
+                layer_settings = map_layers.label_settings_of(layer)
+                layer_settings.images = True
+                map_layers.apply_labels([layer], layer_settings, True)
         canvas = self.iface.mapCanvas() if self.iface is not None else None
         if canvas is not None and canvas.scale() > settings.detail_scale * 1.001:
             scale = int(settings.detail_scale)
@@ -2435,7 +2554,7 @@ class RouteCommentsDock(QDockWidget):
             if not self.act_show_map.isChecked():
                 self.act_show_map.setChecked(True)
             if self.pick_tool is None:
-                self.pick_tool = map_layers.CommentPickTool(canvas, self.layers.layers, self._describe)
+                self.pick_tool = map_layers.CommentPickTool(canvas, self.layers.visible_layers, self._describe)
                 self.pick_tool.picked.connect(self._on_picked)
                 self._connect_map_tool_signal()
             canvas.setMapTool(self.pick_tool)
@@ -2520,6 +2639,7 @@ class RouteCommentsDock(QDockWidget):
                        self.act_export, self.act_duplicate_set):
             action.setEnabled(has_set)
         self.act_renumber.setEnabled(has_set and len(self.comments) > 1)
+        self.act_merge_sets.setEnabled(has_set and self.set_combo.count() > 1)
         self.act_import.setEnabled(self.store is not None)
         self.set_combo.setEnabled(self.store is not None)
         self.position_button.setEnabled(has_comment)
@@ -2536,10 +2656,37 @@ class RouteCommentsDock(QDockWidget):
 
     def showEvent(self, event):  # noqa: N802 - Qt API
         super().showEvent(event)
+        self._map_suspended = False
+        root = QgsProject.instance().layerTreeRoot()
+        for layer in self.layers.layers():
+            node = root.findLayer(layer.id())
+            if node is not None and node.customProperty(RESTORE_VISIBILITY, False):
+                node.removeCustomProperty(RESTORE_VISIBILITY)
+                node.setItemVisibilityChecked(True)
+        self._refresh_map()
+        if self.act_show_map.isChecked() and self.store is not None and self.selected_ids():
+            self._syncing = True
+            try:
+                self.layers.select(self.selected_ids())
+            finally:
+                self._syncing = False
+        self._update_highlight()
         if not self._poll_timer.isActive():
             self._poll_timer.start()
 
     def hideEvent(self, event):  # noqa: N802 - Qt API
+        self._map_suspended = True
+        self._stop_placing()
+        self.act_pick.setChecked(False)
+        self._update_highlight()
+        if self._project_connected and self.store is not None and self.act_show_map.isChecked():
+            root = QgsProject.instance().layerTreeRoot()
+            for layer in self.layers.layers():
+                layer.removeSelection()
+                node = root.findLayer(layer.id())
+                if node is not None and node.itemVisibilityChecked():
+                    node.setItemVisibilityChecked(False)
+                    node.setCustomProperty(RESTORE_VISIBILITY, True)
         self._close_previews()
         self._poll_timer.stop()
         self._save_window_state()
@@ -2557,7 +2704,10 @@ class RouteCommentsDock(QDockWidget):
         if self._project_connected:
             project = QgsProject.instance()
             for signal, slot in ((project.readProject, self._on_project_changed),
+                                 (project.layerTreeRoot().visibilityChanged, self._tree_visibility_changed),
+                                 (project.layersWillBeRemoved, self._layers_leaving),
                                  (project.cleared, self._on_project_changed),
+                                 (project.projectSaved, self._project_saved),
                                  (project.aboutToBeCleared, self._stop_placing)):
                 try:
                     signal.disconnect(slot)

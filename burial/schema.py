@@ -153,7 +153,7 @@ PLAN_FIELDS: List[FieldSpec] = [
     ("scope_end_kp", "float"),
     ("direction", "int"),            # +1 with increasing KP, -1 against
     ("target_burial_m", "float"),    # informational in v1
-    ("params_json", "str"),          # plan-level post-processing params
+    ("params_json", "str"),          # plan-level settings, including risk_scale
     #                                  (min_section_km, sliver_tol_km,
     #                                   coarse_step_m, refine_tol_m)
     ("status", "str"),               # "" | draft | stale | issued
@@ -671,7 +671,7 @@ HAZARD_FIELDS: List[FieldSpec] = [
     ("crossing_angle_deg", "float"),  # nullable; line crossings only
     ("lat", "float"),
     ("lon", "float"),
-    ("risk", "str"),                 # "" | low | medium | high (effective)
+    ("risk", "str"),                 # effective plan risk-level ID ("" = unassigned)
     ("auto_risk", "str"),            # the check's assessment (audit)
     ("risk_source", "str"),          # auto | user
     ("status", "str"),               # open | noted | accepted | mitigated
@@ -968,6 +968,8 @@ HAZARDS_LAYER_FIELDS: List[FieldSpec] = [
     ("crossing", "int"),
     ("crossing_angle_deg", "float"),
     ("risk", "str"),
+    ("risk_label", "str"),
+    ("risk_score", "int"),
     ("status", "str"),
     ("source", "str"),
     ("notes", "str"),

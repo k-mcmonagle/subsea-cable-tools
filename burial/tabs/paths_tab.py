@@ -1308,6 +1308,9 @@ class PathsTab(QWidget):
                 # status instead of leaving the old task message visible.
                 self.refresh()
                 return
+            if self.model.path_fingerprints() != fingerprints:
+                self.status_label.setText("Path inputs changed during generation. Generate again for the current plan.")
+                return
             if self.model.save_path_result(task.result.registry_row(work)):
                 self.status_label.setText("Installation paths generated and saved.")
 

@@ -66,6 +66,7 @@ from ..slope_utils import interpolate_covered, is_finite
 from . import ui_helpers
 from . import events as ev
 from . import generation, schema
+from .risk_scale import DEFAULT_SCALE
 
 _PEN_STYLE = getattr(Qt, "PenStyle", Qt)
 _FRAME_VLINE = getattr(QFrame, "Shape", QFrame).VLine
@@ -536,6 +537,7 @@ class BurialProfileWidget(QWidget):
         self._overlay_context = generation.ResolutionContext()
         self._overlay_rule_names: Dict[str, str] = {}
         self._hazards: List[Dict] = []
+        self._risk_scale = DEFAULT_SCALE
         self._overlay_button = QToolButton()
         self._overlay_button.setPopupMode(TOOLBUTTON_POPUP_MODE_INSTANT)
         self._overlay_button.setToolTip(
@@ -1306,18 +1308,14 @@ class BurialProfileWidget(QWidget):
                 labels.append((iv.start_km, iv.end_km, f"  no data: {name}"))
         self._ii_labels.set_ranges(labels)
 
-    def set_hazards(self, hazards: List[Dict]) -> None:
+    def set_hazards(self, hazards: List[Dict], scale=DEFAULT_SCALE) -> None:
         """Risk Profile hazards on the hazard strip, coloured by risk."""
         self._hazards = list(hazards or [])
+        self._risk_scale = scale
         self._apply_hazards()
 
     def _apply_hazards(self) -> None:
-        colors = {
-            schema.RISK_HIGH: ui_helpers.qcolor("risk_high"),
-            schema.RISK_MEDIUM: ui_helpers.qcolor("risk_medium"),
-            schema.RISK_LOW: ui_helpers.qcolor("risk_low"),
-            schema.RISK_UNASSIGNED: ui_helpers.qcolor("risk_unassigned"),
-        }
+        colors = ui_helpers.risk_colors(self._risk_scale)
         strip, full = [], []
         for hazard in self._hazards:
             level = hazard.get("risk") or ""
@@ -1335,7 +1333,7 @@ class BurialProfileWidget(QWidget):
             shade = QColor(base)
             shade.setAlpha(_HAZARD_FULL_ALPHA)
             text = (f"Hazard: {hazard.get('label') or 'hazard'} "
-                    f"[{schema.RISK_LABELS.get(level, 'Unassigned')}]")
+                    f"[{self._risk_scale.caption(level)}]")
             strip.append((start, end, text, color))
             full.append((start, end, text, shade))
         self._hazard_band.set_ranges(strip)
@@ -1603,9 +1601,8 @@ class BurialProfileWidget(QWidget):
                         lambda _checked, st=style: self.set_hazard_style(st))
                 sub = menu.addMenu("    Hazard risk levels")
                 sub.setEnabled(self.overlay_visible(key))
-                for level in list(reversed(schema.RISK_LEVELS)) + [
-                        schema.RISK_UNASSIGNED]:
-                    item = sub.addAction(schema.RISK_LABELS[level])
+                for level in (*reversed(self._risk_scale.levels), ""):
+                    item = sub.addAction(self._risk_scale.caption(level))
                     item.setCheckable(True)
                     item.setChecked(level not in self._hazard_levels_hidden)
                     item.toggled.connect(

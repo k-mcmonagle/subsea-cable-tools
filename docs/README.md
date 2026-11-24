@@ -24,6 +24,7 @@ The top-level [README](../README.md) is the short introduction and tool list. Us
 ## Design records
 
 - [DECISIONS.md](../DECISIONS.md) — Burial Planner implementation decisions and judgement calls. It is the authoritative record of intended behaviour; the v0.3 specification it cites is not in the repository.
+- [Alter-course pull-out at plough launch](ALTER_COURSE_PULL_OUT.md) — research and proposed implementation: screen bends at an estimated bottom tension, then model lateral movement and seabed spans.
 
 ## Model notes (catenary)
 

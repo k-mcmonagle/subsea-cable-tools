@@ -38,6 +38,7 @@ class PlanRereferenceReport:
     max_shift_m: float = 0.0
     flagged: List[str] = field(default_factory=list)   # "Event PLDN KP 1.234: gap"
     outside: List[str] = field(default_factory=list)   # beyond the new route
+    outside_if_kept: List[str] = field(default_factory=list)
 
     def summary(self) -> str:
         text = (f"{self.items} KP value(s) translated; largest change "
@@ -63,6 +64,8 @@ class _Mapper:
             self.report.flagged.append(f"{label} KP {old:.3f}: {', '.join(flags)}")
         if self.bounds is not None:
             lo, hi = self.bounds
+            if old < lo - 5e-4 or old > hi + 5e-4:
+                self.report.outside_if_kept.append(f"{label} KP {old:.3f}")
             if new < lo - 5e-4 or new > hi + 5e-4:
                 self.report.outside.append(f"{label} KP {old:.3f} → {new:.3f}")
 

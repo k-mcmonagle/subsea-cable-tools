@@ -79,5 +79,10 @@ def test_risk_check_fingerprint_carries_kp_method():
     check = {"config_json": "{}", "enabled": 1}
     old_payload = {"config_json": {}, "enabled": 1, "inputs": {}}
     assert analysis_state.check_fingerprint(check, {}) != analysis_state.digest(old_payload)
+    before_contacts = dict(old_payload, kp_method=analysis_state.RISK_KP_METHOD)
+    assert analysis_state.check_fingerprint(check, {}) != analysis_state.digest(before_contacts)
     assert analysis_state.check_fingerprint(check, {}) == analysis_state.digest(
-        dict(old_payload, kp_method=analysis_state.RISK_KP_METHOD))
+        dict(before_contacts, contact_method=analysis_state.RISK_CONTACT_METHOD))
+    table = dict(check, config_json='{"kind": "kp_table"}')
+    assert analysis_state.check_fingerprint(table, {}) == analysis_state.digest(
+        dict(before_contacts, config_json={"kind": "kp_table"}))

@@ -37,6 +37,7 @@ from ..kp_range_utils import (KP_MODE_CARTESIAN, KP_MODE_GEODESIC, describe_kp_m
                               make_kp_distance_area, set_kp_distance_settings)
 from ..plugin_log import log_exception
 from .canvas_items import _sip_isdeleted, remove_canvas_item
+from .kp_markers import KpMarkers
 
 PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # maptools/ -> plugin root
 
@@ -120,6 +121,8 @@ class KPMouseMapTool(QgsMapTool):
         copyLatLonStyle="LABELLED",
         start_kp_km=None,
         showHoverDepth=True,
+        station_interval_km=None,
+        station_leaders=True,
     ):
         super().__init__(canvas)
         self.canvas = canvas
@@ -168,6 +171,11 @@ class KPMouseMapTool(QgsMapTool):
         # picked for a comment is a route_comments.capture.RangePicker.
         self.comment_hook = None
         self._comment_range = None
+        self._markers_active = False
+        self.markers = None
+        if station_interval_km is not None:
+            self.markers = KpMarkers(canvas, station_interval_km, station_leaders)
+            canvas.extentsChanged.connect(self._draw_stations)
         self.recalculate_geometries()
         self.canvas.destinationCrsChanged.connect(self._on_map_crs_changed)
 
@@ -249,6 +257,9 @@ class KPMouseMapTool(QgsMapTool):
             # Removed from the project (e.g. a new project): no route, rather
             # than a RuntimeError on the next map CRS change.
             self.layer = None
+        if self.markers is not None:
+            self.markers.clear()
+        self._rpl_reference = ""
         if self.layer is None:
             self.distanceArea = make_kp_distance_area(
                 map_crs, QgsProject.instance().transformContext(), mode=mode)
@@ -270,6 +281,10 @@ class KPMouseMapTool(QgsMapTool):
         self.distanceArea = distance
         self.features_geoms = geoms
         self._route = route
+        from ..route_comments.route_ref import workbench_rpl_info
+        info = workbench_rpl_info(self.layer)
+        self._rpl_reference = " ".join(filter(None, (info.get("rpl_name"), info.get("rpl_rev"))))
+        self._draw_stations()
         self.total_length_meters = route.total_length_m
         try:
             warnings = [text for level, text in route.kp_basis_notes() if level == "warn"]
@@ -347,8 +362,14 @@ class KPMouseMapTool(QgsMapTool):
 
     def activate(self):
         super().activate()
+        self._markers_active = True
+        self._draw_stations()
         self.last_message = ""
         self.last_global_pos = None
+
+    def _draw_stations(self):
+        if self._markers_active and self.markers is not None:
+            self.markers.draw(self._route)
 
     def _ensure_timers(self):
         """Recreate the tooltip timers if they have been torn down.
@@ -425,8 +446,9 @@ class KPMouseMapTool(QgsMapTool):
             if depth_lines:
                 message += "\n" + "\n".join(depth_lines)
 
-        self.iface.mainWindow().statusBar().showMessage(
-            range_text or message.replace('\n', ' | '))
+        reference = self._rpl_reference or self.layer.name()
+        status = range_text or message.replace('\n', ' | ')
+        self.iface.mainWindow().statusBar().showMessage(f"{status} | RPL: {reference}")
         
         # Store the message and position for the timers.
         self.last_message = message
@@ -1452,6 +1474,9 @@ class KPMouseMapTool(QgsMapTool):
             self.iface.messageBar().pushMessage("Error", msg, level=MESSAGE_CRITICAL, duration=4)
 
     def deactivate(self):
+        self._markers_active = False
+        if self.markers is not None:
+            self.markers.clear()
         self._cancel_comment_range(quiet=True)
         if self.mouse_stop_timer is not None:
             self.mouse_stop_timer.stop()
@@ -1477,6 +1502,14 @@ class KPMouseMapTool(QgsMapTool):
         ``deleteLater()`` on QGIS 3, so the old calls silently left every
         marker in the canvas). Safe to call more than once.
         """
+        self._markers_active = False
+        if self.markers is not None:
+            try:
+                self.canvas.extentsChanged.disconnect(self._draw_stations)
+            except (TypeError, RuntimeError):
+                pass
+            self.markers.clear()
+            self.markers = None
         for timer_attr in ('mouse_stop_timer', 'persistent_tooltip_timer'):
             timer = getattr(self, timer_attr, None)
             if timer is not None and not _sip_isdeleted(timer):
@@ -1599,6 +1632,14 @@ class KPRangeRingDialog(QDialog):
         return self.edit_comment.text().strip()
 
 
+def _station_interval(settings):
+    try:
+        value = float(settings.value("stationIntervalKm", 0))
+        return value if math.isfinite(value) and 0.001 <= value <= 10000 else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
 class KPConfigDialog(QDialog):
     """A dialog for configuring the KP Mouse Tool settings."""
     def __init__(
@@ -1681,6 +1722,29 @@ class KPConfigDialog(QDialog):
             "(default: the project CRS when projected, else the route's UTM zone).")
         self.cartesian_checkbox.setChecked(current_use_cartesian)
         layout.addWidget(self.cartesian_checkbox)
+
+        settings = QSettings("SubseaCableTools", "KPMouseTool")
+        self.stations = QCheckBox("Show KP markers while this tool is active")
+        self.stations.setChecked(settings.value("showStations", False, type=bool))
+        layout.addWidget(self.stations)
+        marker_row = QHBoxLayout()
+        marker_row.addWidget(QLabel("Marker spacing"))
+        self.station_interval = QDoubleSpinBox()
+        self.station_interval.setDecimals(3)
+        self.station_interval.setRange(0, 10000)
+        self.station_interval.setSingleStep(0.1)
+        self.station_interval.setSuffix(" km")
+        self.station_interval.setSpecialValueText("Automatic (zoom)")
+        self.station_interval.setToolTip("Set zero for automatic spacing. Crowded labels are thinned.")
+        self.station_interval.setValue(_station_interval(settings))
+        self.station_leaders = QCheckBox("Draw leader lines")
+        self.station_leaders.setChecked(settings.value("stationLeaders", True, type=bool))
+        for control in (self.station_interval, self.station_leaders):
+            marker_row.addWidget(control)
+            control.setEnabled(self.stations.isChecked())
+            self.stations.toggled.connect(control.setEnabled)
+        marker_row.addStretch(1)
+        layout.addLayout(marker_row)
 
         # Depth options
         self.depth_checkbox = QCheckBox("Enable depth sampling (right-click menu, live profile)")
@@ -2252,7 +2316,8 @@ class KPMouseTool:
 
             # The profile toggle is flipped inside the map tool (menu / D key)
             # and persisted; re-read it so a rebuilt tool keeps the user's state.
-            self.showDepthProfile = QSettings("SubseaCableTools", "KPMouseTool").value(
+            settings = QSettings("SubseaCableTools", "KPMouseTool")
+            self.showDepthProfile = settings.value(
                 "showDepthProfile", self.showDepthProfile, type=bool)
             # Pick up a change made in KP settings since the tool was set up.
             self.useCartesian = kp_distance_mode() == KP_MODE_CARTESIAN
@@ -2276,6 +2341,9 @@ class KPMouseTool:
                 self.copyLatLonStyle,
                 start_kp_km=self._start_kp_for(layer),
                 showHoverDepth=self.showHoverDepth,
+                station_interval_km=_station_interval(settings) if settings.value("showStations", False,
+                                                                                  type=bool) else None,
+                station_leaders=settings.value("stationLeaders", True, type=bool),
             )
             self.mapTool.comment_hook = self.comment_hook
             self.iface.mapCanvas().setMapTool(self.mapTool)
@@ -2373,6 +2441,10 @@ class KPMouseTool:
                 copy_latlon_style,
             ) = dialog.get_settings()
             if layer:
+                settings = QSettings("SubseaCableTools", "KPMouseTool")
+                settings.setValue("showStations", dialog.stations.isChecked())
+                settings.setValue("stationIntervalKm", dialog.station_interval.value())
+                settings.setValue("stationLeaders", dialog.station_leaders.isChecked())
                 self.referenceLayer = layer
                 self.measurementUnit = unit
                 self.showReverseKP = show_reverse_kp

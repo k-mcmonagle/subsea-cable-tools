@@ -16,14 +16,16 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 from qgis.PyQt.QtCore import QSettings, Qt
-from qgis.PyQt.QtGui import QColor
+from qgis.PyQt.QtGui import QBrush, QColor
 from qgis.PyQt.QtWidgets import (
+    QApplication,
     QCheckBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
     QMenu,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QTableWidgetItem,
     QVBoxLayout,
@@ -68,6 +70,7 @@ class BasTab(QWidget):
         self._loaded_plan_id = ""
         self._working: List[Dict] = []
         self._columns: List[Dict] = []
+        self._draft_base_columns = None
         self._specs: List[tuple] = []   # (header, key, kind) per table column
         self._sort: Optional[tuple] = None  # (column index, descending)
 
@@ -88,6 +91,9 @@ class BasTab(QWidget):
         self.import_button.setToolTip("Import KP ranges and their columns from a "
                                       "CSV/XLSX table with KP re-referencing.")
         self.import_button.clicked.connect(self._import)
+        self.generate_button = QPushButton("Generate from polygons…")
+        self.generate_button.setToolTip("Intersect the plan route with polygon layers over the plan scope.")
+        self.generate_button.clicked.connect(self._generate)
         self.export_button = QPushButton("Export CSV")
         self.export_button.clicked.connect(self._export)
         self.rereference_button = QPushButton("Re-reference KPs…")
@@ -99,7 +105,7 @@ class BasTab(QWidget):
         self.columns_button.setToolTip("Add, rename, retype, reorder or remove "
                                        "the register's columns.")
         self.columns_button.clicked.connect(self._edit_columns)
-        for button in (self.import_button, self.export_button,
+        for button in (self.import_button, self.generate_button, self.export_button,
                        self.rereference_button, self.columns_button):
             toolbar.addWidget(button)
         self.show_map = QCheckBox("Show on map")
@@ -181,6 +187,7 @@ class BasTab(QWidget):
     def refresh(self) -> None:
         plan_id = self.model.plan_id
         has_plan = bool(self.model.plan)
+        self.generate_button.setEnabled(has_plan and self.model.route is not None)
         for button in (self.import_button, self.export_button, self.rereference_button,
                        self.columns_button, self.add_button, self.duplicate_button,
                        self.remove_button, self.sort_button, self.apply_button,
@@ -188,6 +195,7 @@ class BasTab(QWidget):
             button.setEnabled(has_plan)
         if not has_plan:
             self._working, self._columns = [], []
+            self._draft_base_columns = None
             self._dirty = False
             self._loaded_plan_id = ""
             self._rebuild_table()
@@ -196,7 +204,7 @@ class BasTab(QWidget):
             return
         columns = self.model.bas_columns()
         if self._dirty and plan_id == self._loaded_plan_id:
-            if columns != self._columns:
+            if self._draft_base_columns is None and columns != self._columns:
                 # Columns changed underneath unapplied edits: reshape the
                 # table but keep the working rows (values are keyed).
                 self._columns = columns
@@ -205,6 +213,7 @@ class BasTab(QWidget):
             self._update_status()
             return
         self._working = [bas_model.decode_row(r) for r in self.model.bas_rows]
+        self._draft_base_columns = None
         self._columns = columns
         self._dirty = False
         self._loaded_plan_id = plan_id
@@ -273,6 +282,8 @@ class BasTab(QWidget):
         self._specs = [("Start KP", "start_kp", "kp"), ("End KP", "end_kp", "kp")]
         for col in self._columns:
             self._specs.append((col["label"], col["key"], col.get("kind") or "text"))
+        self._length_column = len(self._specs)
+        self._specs.append(("Length (km)", None, "length_ro"))
         self._specs.extend(_PROVENANCE)
 
     def _rebuild_table(self) -> None:
@@ -300,6 +311,9 @@ class BasTab(QWidget):
             self._loading = False
 
     def _cell_text(self, row: Dict, key: str, kind: str) -> str:
+        if kind == "length_ro":
+            a, b = row.get("start_kp"), row.get("end_kp")
+            return f"{b - a:.3f}" if a is not None and b is not None and b >= a else ""
         if key in ("start_kp", "end_kp", "src_start_kp", "src_end_kp"):
             value = row.get(key)
             return "" if value is None else f"{float(value):.3f}"
@@ -334,6 +348,20 @@ class BasTab(QWidget):
             if col == 0:
                 item.setData(ITEM_DATA_USER_ROLE, row.get("row_id"))
             self.table.setItem(index, col, item)
+        self._mark_review_cells(index)
+
+    def _mark_review_cells(self, row):
+        note = self._working[row].get("notes") or ""
+        review = note.startswith("Review — ")
+        blocked = self.table.blockSignals(True)
+        try:
+            for col in (0, len(self._specs) - 1):  # start KP stays visible when Notes is off screen
+                item = self.table.item(row, col)
+                item.setToolTip(note if review else "")
+                item.setBackground(QBrush(QColor("#fff0bb")) if review else QBrush())
+                item.setForeground(QBrush(QColor("#422d00")) if review else QBrush())
+        finally:
+            self.table.blockSignals(blocked)
 
     def _item_changed(self, item) -> None:
         if self._loading:
@@ -366,6 +394,7 @@ class BasTab(QWidget):
             return
         elif key in ("notes",):
             row[key] = text
+            self._mark_review_cells(r)
         else:
             values = row.setdefault("values", {})
             column = self._column(key)
@@ -390,6 +419,7 @@ class BasTab(QWidget):
                 values[key] = text
         self._mark_dirty()
         if kind == "kp":
+            self.table.amend_last(r, self._length_column, self._cell_text(row, None, "length_ro"))
             self._refresh_strip()
 
     def _mark_dirty(self) -> None:
@@ -467,6 +497,9 @@ class BasTab(QWidget):
         _header, key, kind = self._specs[column]
 
         def sort_key(row: Dict):
+            if kind == "length_ro":
+                a, b = row.get("start_kp"), row.get("end_kp")
+                return (1, 0.0, "") if a is None or b is None else (0, b - a, "")
             if key in ("start_kp", "end_kp", "src_start_kp", "src_end_kp"):
                 value = row.get(key)
                 return (1, 0.0, "") if value is None else (0, float(value), "")
@@ -568,6 +601,12 @@ class BasTab(QWidget):
         menu = QMenu(self)
         index = self.table.indexAt(pos)
         at = index.row() if index.isValid() else len(self._working)
+        if index.isValid():
+            row = self._working[at]
+            go = menu.addAction("Go to section", lambda: self._row_activated(at, 0))
+            go.setEnabled(self.dock is not None and self.model.route is not None
+                          and row.get("start_kp") is not None and row.get("end_kp") is not None)
+            menu.addSeparator()
         menu.addAction("Insert row above", lambda: self._insert_rows(at, 1))
         menu.addAction("Insert row below", lambda: self._insert_rows(at + 1, 1))
         menu.addAction("Duplicate row(s)", self._duplicate_rows)
@@ -610,14 +649,19 @@ class BasTab(QWidget):
             return
         label = next((c["label"] for c in columns if c["key"] == key), key)
         self._columns = columns
-        self.model.save_bas_columns(
-            columns, reason=f"BAS column '{label}' decimals: "
-                            f"{bas_model.decimals_label(places)}")
+        if self._draft_base_columns is None:
+            self.model.save_bas_columns(
+                columns, reason=f"BAS column '{label}' decimals: "
+                                f"{bas_model.decimals_label(places)}")
         self._rebuild_table()
         self._update_status()
 
     # -- apply / revert ----------------------------------------------------------------
     def _apply(self) -> None:
+        if self._draft_base_columns is not None and self.model.bas_columns() != self._draft_base_columns:
+            QMessageBox.warning(self, "BAS register", "The saved columns changed during review. "
+                                "Export your draft or revert it before generating against the new columns.")
+            return
         issues = bas_model.validate_rows(self._working, self._columns)
         blocking = [i for i in issues if "required" in i or "greater than" in i]
         if blocking:
@@ -634,7 +678,8 @@ class BasTab(QWidget):
         keep = {c["key"] for c in self._columns}
         for row in self._working:
             row["values"] = {k: v for k, v in row.get("values", {}).items() if k in keep}
-        if self.model.save_bas(self._working, reason="edited in BAS tab"):
+        if self.model.save_bas(self._working, columns=self._columns if self._draft_base_columns is not None else None,
+                               reason="edited in BAS tab"):
             self._dirty = False
             self.refresh()
 
@@ -653,6 +698,15 @@ class BasTab(QWidget):
         columns = list(dialog.columns)
         if not dialog.replace_existing:
             rows = self._working + rows
+            if self._draft_base_columns is not None:
+                existing = {col["key"]: col for col in self._columns}
+                for col in columns:
+                    if col["key"] in existing and col != existing[col["key"]]:
+                        QMessageBox.warning(self, "BAS register", "Apply the draft before importing a table "
+                                            "with different definitions for the same columns.")
+                        return
+                    existing.setdefault(col["key"], col)
+                columns = list(existing.values())
         meta = {
             "source_ref": dialog.source_ref,
             "source_rpl": dialog.kp_map.source_label
@@ -667,6 +721,58 @@ class BasTab(QWidget):
                 meta_updates=meta):
             self._dirty = False
             self.refresh()
+
+    def _generate(self):
+        from qgis.core import QgsCsException
+
+        from ..bas_polygon_dialog import BasPolygonDialog
+        from ..bas_polygons import generate_sections
+        from ..rpl_reference import plan_rpl_label
+
+        if self.model.route is None:
+            self._set_status("Select a plan with a resolved route.", "warn")
+            return
+        dialog = BasPolygonDialog(self)
+        if not dialog.tree.topLevelItemCount():
+            self._set_status("Add a polygon layer to the project to generate BAS sections.", "warn")
+            return
+        if qt_exec(dialog) != DIALOG_ACCEPTED:
+            return
+        route, plan_id = self.model.route, self.model.plan_id
+        progress = QProgressDialog("Intersecting polygons…", "Cancel", 0, 0, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+
+        def advance(layer_name):
+            progress.setLabelText(f"Intersecting {layer_name}…")
+            QApplication.processEvents()
+            return not progress.wasCanceled() and self.model.route is route and self.model.plan_id == plan_id
+
+        try:
+            rows, columns = generate_sections(route, dialog.sources(), self._columns,
+                                              self.model.gen_params().scope, plan_rpl_label(self.model), advance)
+            cancelled = progress.wasCanceled() or self.model.route is not route or self.model.plan_id != plan_id
+        except (QgsCsException, ValueError, RuntimeError) as exc:
+            QMessageBox.warning(self, "Generate BAS sections", str(exc))
+            return
+        finally:
+            progress.close()
+            progress.deleteLater()
+        if cancelled:
+            return
+        if not rows:
+            self._set_status("The selected polygons cover no length of route within the plan scope.", "warn")
+            return
+        self._working.extend(rows)
+        if self._draft_base_columns is None:
+            self._draft_base_columns = self.model.bas_columns()
+        self._columns = columns
+        self._sort = None
+        self._mark_dirty()
+        self._rebuild_table()
+        self._refresh_strip()
+        issues = sum(bool(row["notes"]) for row in rows)
+        self._set_status(f"Generated {len(rows)} section(s). {issues} marked for review in Notes. "
+                         "Choose Apply changes to save.", "info")
 
     def _export(self) -> None:
         if not self.model.plan:
@@ -728,7 +834,8 @@ class BasTab(QWidget):
             # Keep the unapplied rows; only the shape changes now, the
             # values are saved with the next Apply.
             self._columns = dialog.columns
-            self.model.save_bas_columns(dialog.columns, reason="BAS columns edited")
+            if self._draft_base_columns is None:
+                self.model.save_bas_columns(dialog.columns, reason="BAS columns edited")
             self._rebuild_table()
             self._update_status()
             return

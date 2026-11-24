@@ -4,7 +4,7 @@
 Sits between Exclusions and Plan Builder in the workflow: checks scan
 registered inputs (rocks, pockmarks, sandwaves, mag/sonar/linear contacts,
 crossings, …) for features on or near the route, and every interaction
-lands in the hazard register with an auto-assigned Low/Medium/High risk
+lands in the hazard register with an auto-assigned level on the plan's scoring scale
 (proximity bands and/or attribute rules — all values user-entered with a
 source reference). Hazards never remove burial length — that is the
 Exclusion stack's job; this tab profiles what remains.
@@ -22,11 +22,10 @@ settings or input changed since its scan is marked out of date.
 
 from __future__ import annotations
 
-from ...table_widgets import ResizableTableWidget
-
 import json
 from typing import Dict, List, Optional
 
+from qgis.gui import QgsCollapsibleGroupBoxBasic
 from qgis.PyQt.QtCore import Qt, QTimer
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
@@ -44,6 +43,7 @@ from qgis.PyQt.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -62,7 +62,6 @@ from ...qgis_compat import (
     MESSAGE_BOX_NO,
     MESSAGE_BOX_YES,
     SELECTION_BEHAVIOR_SELECT_ROWS,
-    SELECTION_MODE_EXTENDED,
     SELECTION_MODE_SINGLE,
     qt_exec,
 )
@@ -76,6 +75,9 @@ from ...workbench import rules_engine as eng
 from .. import (analysis_state, analysis_task, coverage, map_layers, risk, risk_scan,
                 schema)
 from .. import ui_helpers
+from ..hazard_register import HazardRegister, NOTES, RISK, STATUS
+from ..risk_scale import DEFAULT_SCALE
+from ..risk_scale_dialog import RiskScaleDialog
 from .attribute_widgets import (
     AttributeRulesTable,
     ExpressionEdit,
@@ -88,30 +90,6 @@ _CHECK_FIRE_COL = 2
 _CHECK_COLUMNS = ["On", "Check", "Findings", "Hazards · total extent", "Unique extent"]
 _CHECK_COUNT_COL = 3
 
-_HAZARD_COLUMNS = ["Risk", "Status", "KP", "End KP", "Offset (m)", "X-ing",
-                   "Angle (°)", "Feature", "Check", "Notes"]
-_HAZARD_RISK_COL = 0
-_HAZARD_STATUS_COL = 1
-_HAZARD_NOTES_COL = 9
-
-
-def _risk_colors():
-    """Theme-aware risk colours (resolved at refresh time)."""
-    return {
-        schema.RISK_HIGH: ui_helpers.qcolor("risk_high"),
-        schema.RISK_MEDIUM: ui_helpers.qcolor("risk_medium"),
-        schema.RISK_LOW: ui_helpers.qcolor("risk_low"),
-        schema.RISK_UNASSIGNED: ui_helpers.qcolor("risk_unassigned"),
-    }
-
-# Register-size guards: per-row combo widgets cost ~1 ms each, so a dense
-# scan (thousands of boulder picks) would freeze the UI on every refresh.
-# Beyond these limits the table shows risk/status as text (edit via the
-# right-click menu) and truncates the view — never the stored register.
-_MAX_COMBO_ROWS = 400
-_MAX_TABLE_ROWS = 2000
-
-
 class CheckEditorDialog(QDialog):
     """Edit one bp_risk_check row."""
 
@@ -122,17 +100,24 @@ class CheckEditorDialog(QDialog):
         self.inputs = inputs
         # The plan model, for a KP-range table's reference RPL picker.
         self.model = model
+        self.scale = model.risk_scale() if model is not None else DEFAULT_SCALE
         config = risk.check_config(self.check)
         self.setWindowTitle("Risk check")
         self.setMinimumWidth(520)
 
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+        layout = QVBoxLayout(content)
         form = QFormLayout()
         self.name_edit = QLineEdit(self.check.get("name") or "")
         self.name_edit.setPlaceholderText("e.g. Boulders ≥ 0.5 m")
         form.addRow("Name:", self.name_edit)
         self.kind_combo = QComboBox()
-        self.kind_combo.addItem("Features near the route (layer)",
+        self.kind_combo.addItem("Features on or near the route (layer)",
                                 risk_scan.CHECK_KIND_FEATURES)
         self.kind_combo.addItem("KP-range table (start/end KP rows)",
                                 risk_scan.CHECK_KIND_KP_TABLE)
@@ -169,11 +154,17 @@ class CheckEditorDialog(QDialog):
         self.distance_spin.setRange(0.0, 1000000.0)
         self.distance_spin.setDecimals(1)
         self.distance_spin.setSuffix(" m")
+        self.distance_spin.setSpecialValueText("0 m · intersections only")
         self.distance_spin.setValue(float(config.get("distance_m") or 0.0))
         self.distance_spin.setToolTip(
-            "Search distance from the route centreline, applied each side. "
-            "Features beyond this are not registered at all.")
-        form.addRow("Search within (each side of route):", self.distance_spin)
+            "At zero, register points on the centreline, line crossings, touches and overlaps. "
+            "A positive distance also includes nearby features on either side.")
+        form.addRow("Search each side", self.distance_spin)
+        self.distance_hint = QLabel("Use 0 m for features that touch or overlap the route. "
+                                    "Enter a distance to include nearby features on either side.")
+        self.distance_hint.setWordWrap(True)
+        self.distance_hint.setStyleSheet(ui_helpers.hint_style())
+        form.addRow(self.distance_hint)
         self.filter_edit = ExpressionEdit(
             config.get("filter_expression") or "",
             "optional QGIS filter expression")
@@ -221,12 +212,19 @@ class CheckEditorDialog(QDialog):
         turns_form.addRow(turns_note)
         layout.addWidget(self.turns_group)
 
-        self.bands_group = QGroupBox("Risk from proximity (nearest approach)")
+        self.bands_group = QGroupBox("Spatial rating")
         bands_form = QFormLayout(self.bands_group)
+        self.contact_combo = QComboBox()
+        self.contact_combo.addItem("Use other criteria", "")
+        for level in self.scale.levels:
+            self.contact_combo.addItem(self.scale.caption(level), level)
+        self.contact_combo.setCurrentIndex(max(0, self.contact_combo.findData(config.get("on_route_risk") or "")))
+        bands_form.addRow("Risk on route contact", self.contact_combo)
+        bands = QgsCollapsibleGroupBoxBasic("Distance bands")
+        distance_form = QFormLayout(bands)
         self.band_spins: Dict[str, QDoubleSpinBox] = {}
-        for key, label in (("band_high_m", "High within:"),
-                           ("band_medium_m", "Medium within:"),
-                           ("band_low_m", "Low within:")):
+        for level in reversed(self.scale.levels):
+            key = f"band_{level}_m"
             spin = QDoubleSpinBox()
             spin.setRange(0.0, 1000000.0)
             spin.setDecimals(1)
@@ -234,17 +232,18 @@ class CheckEditorDialog(QDialog):
             spin.setSpecialValueText("(off)")
             spin.setValue(float(config.get(key) or 0.0))
             self.band_spins[key] = spin
-            bands_form.addRow(label, spin)
+            distance_form.addRow(f"{self.scale.caption(level)} within", spin)
         bands_note = QLabel(
-            "The tightest matching band wins (crossings are 0 m). 0 turns a "
-            "band off. Values are your project's criteria — record the "
-            "source below.")
+            "Route contacts are at 0 m and match every enabled distance band. "
+            "The highest scoring spatial or attribute match wins.")
         bands_note.setWordWrap(True)
         bands_note.setStyleSheet(ui_helpers.hint_style())
-        bands_form.addRow(bands_note)
+        distance_form.addRow(bands_note)
+        bands.setCollapsed(not any(spin.value() for spin in self.band_spins.values()))
+        bands_form.addRow(bands)
         layout.addWidget(self.bands_group)
 
-        self.attr_group = QGroupBox("Risk from an attribute (optional)")
+        self.attr_group = QgsCollapsibleGroupBoxBasic("Attribute and expression rules")
         attr_form = QFormLayout(self.attr_group)
         self.attribute_edit = FieldCombo(
             config.get("attribute") or "",
@@ -253,32 +252,31 @@ class CheckEditorDialog(QDialog):
             "The field the Value / Range rows below read. Expression rows "
             "can reference any field.")
         attr_form.addRow("Attribute:", self.attribute_edit)
-        self.rules_table = AttributeRulesTable(with_kind=True, with_risk=True)
+        self.rules_table = AttributeRulesTable(with_kind=True, with_risk=True, risk_scale=self.scale)
         self.rules_table.set_attribute_name_provider(self.attribute_edit.text)
         self.rules_table.set_rules(config.get("attribute_rules") or [])
         attr_form.addRow("Rules:", self.rules_table)
         rules_note = QLabel(
-            "First matching row wins, top to bottom. Ranges take ≥ / > "
-            "and < / ≤ bounds so bins are unambiguous (e.g. ≥ 0 … "
-            "< 5 High, ≥ 5 … < 10 Medium, ≥ 10 … ≤ 200 Low). "
-            "The effective risk is the most severe of proximity and "
-            "attribute.")
+            'The first matching row assigns a level. Expressions can combine fields, '
+            'for example "Likelihood" * "Consequence" >= 15. The higher of the '
+            'spatial and attribute scores wins.')
         rules_note.setWordWrap(True)
         rules_note.setStyleSheet(ui_helpers.hint_style())
         attr_form.addRow(rules_note)
+        self.attr_group.setCollapsed(not bool(config.get("attribute_rules") or config.get("attribute")))
         layout.addWidget(self.attr_group)
 
         tail = QFormLayout()
         self.tail_form = tail
         self.default_combo = QComboBox()
-        for level in [schema.RISK_UNASSIGNED] + schema.RISK_LEVELS:
-            self.default_combo.addItem(schema.RISK_LABELS[level], level)
+        for level in ("", *self.scale.levels):
+            self.default_combo.addItem(self.scale.caption(level), level)
         self.default_combo.setCurrentIndex(
             max(0, self.default_combo.findData(config.get("default_risk") or "")))
         self.default_combo.setToolTip(
             "Applied when a feature is inside the search distance but no "
             "band or attribute rule fires.")
-        tail.addRow("Risk when nothing fires:", self.default_combo)
+        tail.addRow("Default risk", self.default_combo)
         self.source_edit = QLineEdit(self.check.get("source_ref") or "")
         self.source_edit.setPlaceholderText(
             "Document + revision these criteria come from")
@@ -286,12 +284,14 @@ class CheckEditorDialog(QDialog):
         self.notes_edit = QLineEdit(self.check.get("notes") or "")
         tail.addRow("Notes:", self.notes_edit)
         layout.addLayout(tail)
+        layout.addStretch(1)
 
         buttons = QDialogButtonBox()
         buttons.setStandardButtons(BUTTON_BOX_OK | BUTTON_BOX_CANCEL)
         buttons.accepted.connect(self._accept)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        outer.addWidget(buttons)
+        self.resize(620, 590)
         self._sync_input_layer()
         self._sync_kind()
 
@@ -362,15 +362,14 @@ class CheckEditorDialog(QDialog):
         for widget in (self.input_combo, self.filter_edit, self.label_edit):
             widget.setEnabled(not turns)
         self.distance_spin.setEnabled(not turns and not table)
+        self.distance_hint.setVisible(not turns and not table)
         risk_label = self.tail_form.labelForField(self.default_combo)
         if risk_label is not None:
-            risk_label.setText("Risk for flagged A/Cs:" if turns
-                               else "Risk when nothing fires:")
+            risk_label.setText("Risk for flagged A/Cs" if turns else "Default risk")
         self.default_combo.setToolTip(
             "Every flagged A/C is recorded at this level." if turns else
             "Applied to a row when no attribute rule fires." if table else
-            "Applied when a feature is inside the search distance but no "
-            "band or attribute rule fires.")
+            "Assigned when a feature matches the search and no contact, distance or attribute criterion applies.")
         if turns and not self.name_edit.text().strip():
             self.name_edit.setPlaceholderText("A/C course change")
 
@@ -402,6 +401,7 @@ class CheckEditorDialog(QDialog):
             config.update({
                 "input_id": self.input_combo.currentData() or "",
                 "distance_m": self.distance_spin.value(),
+                "on_route_risk": self.contact_combo.currentData() or "",
                 "filter_expression": self.filter_edit.text().strip(),
                 "label_attribute": self.label_edit.text().strip(),
                 "attribute": self.attribute_edit.text().strip(),
@@ -427,7 +427,7 @@ class CheckEditorDialog(QDialog):
 class ManualHazardDialog(QDialog):
     """Add a user-entered hazard (desktop study item, fishing ground, …)."""
 
-    def __init__(self, dock, parent=None):
+    def __init__(self, dock, parent=None, scale=DEFAULT_SCALE, scope=None):
         super().__init__(parent)
         self.dock = dock
         self.setWindowTitle("Add manual hazard")
@@ -437,9 +437,10 @@ class ManualHazardDialog(QDialog):
         self.label_edit.setPlaceholderText("e.g. Charted wreck, Fishing area")
         form.addRow("Hazard:", self.label_edit)
         kp_row = QHBoxLayout()
-        self.kp_spin = QDoubleSpinBox()
-        self.kp_spin.setDecimals(3)
-        self.kp_spin.setRange(0.0, 100000.0)
+        limits = sorted((scope.start_km, scope.end_km)) if scope is not None else (0.0, 100000.0)
+        self.kp_spin = ui_helpers.KpSpinBox()
+        self.kp_spin.setRange(*limits)
+        self.kp_spin.setValue(limits[0])
         self.kp_spin.setSuffix(" km")
         kp_row.addWidget(self.kp_spin)
         pick = QPushButton("Pick…")
@@ -447,10 +448,11 @@ class ManualHazardDialog(QDialog):
         pick.clicked.connect(self._pick_kp)
         kp_row.addWidget(pick)
         form.addRow("KP:", kp_row)
-        self.range_check = QCheckBox("KP range (to)")
-        self.end_spin = QDoubleSpinBox()
-        self.end_spin.setDecimals(3)
-        self.end_spin.setRange(0.0, 100000.0)
+        self.range_check = QCheckBox("Extends to KP")
+        self.range_check.setToolTip("Leave clear for a point hazard at a single KP.")
+        self.end_spin = ui_helpers.KpSpinBox()
+        self.end_spin.setRange(*limits)
+        self.end_spin.setValue(limits[0])
         self.end_spin.setSuffix(" km")
         self.end_spin.setEnabled(False)
         self.range_check.toggled.connect(self.end_spin.setEnabled)
@@ -459,8 +461,8 @@ class ManualHazardDialog(QDialog):
         range_row.addWidget(self.end_spin, 1)
         form.addRow("", range_row)
         self.risk_combo = QComboBox()
-        for level in [schema.RISK_UNASSIGNED] + schema.RISK_LEVELS:
-            self.risk_combo.addItem(schema.RISK_LABELS[level], level)
+        for level in ("", *scale.levels):
+            self.risk_combo.addItem(scale.caption(level), level)
         form.addRow("Risk:", self.risk_combo)
         self.notes_edit = QLineEdit()
         form.addRow("Notes:", self.notes_edit)
@@ -477,7 +479,7 @@ class ManualHazardDialog(QDialog):
             QMessageBox.warning(
                 self, "Burial Planner",
                 "The range end KP must be greater than the start KP "
-                "(or untick 'KP range').")
+                "for a range. Clear ‘Extends to KP’ for a point hazard.")
             return
         self.accept()
 
@@ -486,7 +488,7 @@ class ManualHazardDialog(QDialog):
         # the duration of the pick or the canvas can never take the click;
         # on_finished re-shows it on pick, cancel or tool switch alike.
         if self.dock.pick_kp_on_map(
-                lambda kp: self.kp_spin.setValue(round(float(kp), 3)),
+                lambda kp: self.kp_spin.setValue(float(kp)),
                 "Click the route to set the hazard KP (right-click cancels).",
                 on_finished=self.show):
             self.hide()
@@ -556,17 +558,13 @@ class RiskTab(QWidget):
             "names again. Right-click to show or hide coverage columns.")
         self.check_table.horizontalHeaderItem(4).setToolTip(
             "Length and percentage of the plan scope covered only by this check's "
-            "hazards, compared with other enabled checks. This is hazard coverage, "
-            "not an exclusion or a risk score. Uses the displayed extent, including "
-            "±25 m around point and very short hazards. Manual hazards without "
-            "a check are not part of this comparison.")
+            "hazard ranges, compared with other enabled checks. A point contributes zero length.")
         count_header = self.check_table.horizontalHeaderItem(_CHECK_COUNT_COL)
         if count_header is not None:
             count_header.setToolTip(
                 "Hazards found by the check's last scan, and the length and "
                 "share of the plan scope they cover, including overlaps with "
-                "other checks. Uses the displayed extent clipped to the scope "
-                "(±25 m around point and very short hazards).")
+                "other checks. Point hazards count as findings and contribute zero length.")
         self.check_table.itemChanged.connect(self._on_check_item_changed)
         self.check_table.doubleClicked.connect(lambda _i: self._edit_check())
         self.check_table.setContextMenuPolicy(CONTEXT_MENU_POLICY_CUSTOM)
@@ -575,25 +573,24 @@ class RiskTab(QWidget):
         checks_layout.addWidget(self.check_table, 1)
 
         check_buttons = QHBoxLayout()
-        self.add_check_button = QPushButton("＋ Add check…")
+        self.add_check_button = QPushButton("Add check…")
         self.add_check_button.clicked.connect(self._add_check)
         check_buttons.addWidget(self.add_check_button)
-        for label, slot, tip in (
-                ("Edit…", self._edit_check,
-                 "Edit the current check (double-click also edits)."),
-                ("Delete…", self._delete_check,
-                 "Delete the current check and its hazards (confirmed)."),
-                ("↑", lambda: self._move_check(-1),
-                 "Move the check up the list."),
-                ("↓", lambda: self._move_check(1),
-                 "Move the check down the list.")):
-            button = QPushButton(label)
-            button.setToolTip(tip)
-            button.clicked.connect(slot)
-            check_buttons.addWidget(button)
+        self.check_actions = ui_helpers.menu_tool_button(
+            "Selected check", (("Edit check…", self._edit_check),
+                               ("Move up", lambda: self._move_check(-1)),
+                               ("Move down", lambda: self._move_check(1)),
+                               None, ("Delete check…", self._delete_check)),
+            tooltip="Select a check to edit, move or delete it.")
+        self.check_table.itemSelectionChanged.connect(self._sync_check_actions)
+        check_buttons.addWidget(self.check_actions)
         check_buttons.addStretch(1)
+        self.scale_button = QPushButton("Scoring scale…")
+        self.scale_button.setToolTip("Edit this plan’s risk levels, numeric scores and colours.")
+        self.scale_button.clicked.connect(self._edit_scale)
+        check_buttons.addWidget(self.scale_button)
         self.run_button = ui_helpers.menu_tool_button(
-            "Run ▾",
+            "Run checks",
             (("Run all enabled checks", lambda: self._run_checks()),
              ("Run selected check", self._run_selected_check)),
             tooltip="Scan the registered input layers for features on or "
@@ -603,13 +600,12 @@ class RiskTab(QWidget):
         check_buttons.addWidget(self.run_button)
         self.stop_button = QPushButton("Stop")
         self.stop_button.setEnabled(False)
+        self.stop_button.hide()
         self.stop_button.clicked.connect(self._cancel_scan)
-        check_buttons.addWidget(self.stop_button)
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setVisible(False)
         self.progress.setMaximumWidth(160)
-        check_buttons.addWidget(self.progress)
         checks_layout.addLayout(check_buttons)
         splitter.addWidget(checks_widget)
 
@@ -620,54 +616,24 @@ class RiskTab(QWidget):
         self.register_label = QLabel("Hazard register")
         register_header.addWidget(self.register_label)
         register_header.addStretch(1)
-        manual_button = QPushButton("＋ Add manual hazard…")
-        manual_button.clicked.connect(self._add_manual_hazard)
-        register_header.addWidget(manual_button)
-        export_button = QPushButton("Export CSV…")
-        export_button.clicked.connect(self._export_csv)
-        register_header.addWidget(export_button)
+        self.manual_button = QPushButton("Add manual hazard…")
+        self.manual_button.clicked.connect(self._add_manual_hazard)
+        register_header.addWidget(self.manual_button)
+        self.export_button = QPushButton("Export CSV…")
+        self.export_button.setToolTip("Export the full hazard register, including rows hidden by table filters.")
+        self.export_button.clicked.connect(self._export_csv)
+        register_header.addWidget(self.export_button)
         hazards_layout.addLayout(register_header)
-        self.hazard_table = ResizableTableWidget(0, len(_HAZARD_COLUMNS))
-        self.hazard_table.setHorizontalHeaderLabels(_HAZARD_COLUMNS)
-        offset_header = self.hazard_table.horizontalHeaderItem(4)
-        if offset_header is not None:
-            offset_header.setToolTip(
-                "Nearest approach from the route centreline, signed by the "
-                "direction of travel: + to starboard, − to port "
-                "(positive when the side cannot be resolved).")
-        crossing_header = self.hazard_table.horizontalHeaderItem(5)
-        if crossing_header is not None:
-            crossing_header.setToolTip(
-                "✕ = the feature crosses the route (offset 0).")
-        angle_header = self.hazard_table.horizontalHeaderItem(6)
-        if angle_header is not None:
-            angle_header.setToolTip(
-                "Crossing angle in degrees, where applicable.")
-        notes_header = self.hazard_table.horizontalHeaderItem(
-            _HAZARD_NOTES_COL)
-        if notes_header is not None:
-            notes_header.setToolTip(
-                "Editable in place — double-click a Notes cell to edit. "
-                "Double-clicking other cells zooms to the hazard.")
-        self.hazard_table.verticalHeader().setVisible(False)
-        self.hazard_table.setSelectionBehavior(SELECTION_BEHAVIOR_SELECT_ROWS)
-        self.hazard_table.setSelectionMode(SELECTION_MODE_EXTENDED)
-        self.hazard_table.horizontalHeader().setStretchLastSection(True)
-        # Right-click the header to hide secondary columns (persisted).
-        ui_helpers.enable_column_menu(
-            self.hazard_table,
-            "SubseaCableTools/BurialPlanner/hazard_hidden_columns",
-            always_visible=(_HAZARD_RISK_COL, 2))
-        self.hazard_table.itemChanged.connect(self._on_hazard_item_changed)
-        self.hazard_table.itemSelectionChanged.connect(self._on_hazard_selected)
+        self.register = HazardRegister()
+        self.hazard_table = self.register.table
+        self.register.source.editRequested.connect(self._deferred_hazard_edit)
+        self.hazard_table.selectionModel().selectionChanged.connect(self._on_hazard_selected)
         self.hazard_table.setContextMenuPolicy(CONTEXT_MENU_POLICY_CUSTOM)
-        self.hazard_table.customContextMenuRequested.connect(
-            self._hazard_context_menu)
-        # Notes edits on double-click; other cells navigate.
-        self.hazard_table.cellDoubleClicked.connect(
-            lambda row, column: self._goto_hazard_row(row)
-            if column != _HAZARD_NOTES_COL else None)
-        hazards_layout.addWidget(self.hazard_table, 1)
+        self.hazard_table.customContextMenuRequested.connect(self._hazard_context_menu)
+        self.hazard_table.doubleClicked.connect(
+            lambda index: self._goto_hazard_row(index.row())
+            if index.column() not in (RISK, STATUS, NOTES) else None)
+        hazards_layout.addWidget(self.register, 1)
         splitter.addWidget(hazards_widget)
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 3)
@@ -677,6 +643,8 @@ class RiskTab(QWidget):
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
         status_row.addWidget(self.status_label, 1)
+        status_row.addWidget(self.progress)
+        status_row.addWidget(self.stop_button)
         layout.addLayout(status_row)
 
         refresh_soon = ui_helpers.coalesced(self, self.refresh)
@@ -691,7 +659,11 @@ class RiskTab(QWidget):
         self._loading = True
         try:
             has_plan = bool(self.model.plan)
+            self.scale = self.model.risk_scale()
+            self.scale_button.setEnabled(has_plan and self._scan_task is None)
             self.add_check_button.setEnabled(has_plan)
+            self.manual_button.setEnabled(has_plan)
+            self.export_button.setEnabled(bool(self.model.hazards))
             self.run_button.setEnabled(has_plan and self._scan_task is None)
             params = self.model.gen_params()
             scope = params.scope
@@ -704,14 +676,13 @@ class RiskTab(QWidget):
             run_state = self.model.risk_status() if has_plan else {}
             self._run_state = run_state
             domain_km = scope.length_km if has_plan else 0.0
-            spans_by_check = {
-                str(c.get("check_id") or ""): [(s, e) for s, e, _level in
-                    risk.hazard_spans(by_check.get(str(c.get("check_id") or ""), []))]
-                for c in checks}
+            ranges_by_check = {cid: [(s, e) for s, e, _level in risk.hazard_spans(found, 0, self.scale) if e > s]
+                               for cid, found in by_check.items()}
             enabled_ids = {str(c.get("check_id") or "") for c in checks
                            if int(c.get("enabled") or 0)}
             exclusive = coverage.route_coverage(
-                {cid: spans_by_check[cid] for cid in enabled_ids}, scope)
+                {cid: ranges_by_check.get(cid, []) for cid in enabled_ids}, scope)
+            risk_colors = ui_helpers.risk_colors(self.scale)
             unique_current = all(
                 (run_state.get(cid) or {}).get("state") == analysis_state.STATE_CURRENT
                 for cid in enabled_ids)
@@ -741,10 +712,10 @@ class RiskTab(QWidget):
                 found = by_check.get(str(check.get("check_id") or ""), [])
                 worst = schema.RISK_UNASSIGNED
                 for hazard in found:
-                    worst = risk.risk_max(worst, hazard.get("risk") or "")
+                    worst = risk.risk_max(worst, hazard.get("risk") or "", scale=self.scale)
                 check_id = str(check.get("check_id") or "")
                 intervals = [(iv.start_km, iv.end_km) for iv in eng.clip_intervals(
-                    [Interval(s, e) for s, e in spans_by_check[check_id]], scope)]
+                    [Interval(s, e) for s, e, _ in risk.hazard_spans(found, scale=self.scale)], scope)]
                 run = run_state.get(check_id) or {}
                 state = run.get("state", analysis_state.STATE_NEW)
                 stale = bool(found) and state == analysis_state.STATE_CHANGED
@@ -753,12 +724,15 @@ class RiskTab(QWidget):
                                    | Qt.ItemFlag.ItemIsSelectable)
                 fire_item.setData(
                     ITEM_DATA_USER_ROLE,
-                    (scope.length_km, intervals, _risk_colors()[worst],
+                    (scope.length_km, intervals, risk_colors[worst],
                      scope.start_km, {"stale": stale}))
                 self.check_table.setItem(i, _CHECK_FIRE_COL, fire_item)
 
+                covered = (exclusive[check_id].total_km if check_id in exclusive else
+                           sum(iv.length_km for iv in eng.clip_intervals(
+                               [Interval(s, e) for s, e in ranges_by_check.get(check_id, [])], scope)))
                 count_text, count_tip = self._count_cell(
-                    found, intervals, domain_km, run, state,
+                    found, covered, domain_km, run, state,
                     bool(int(check.get("enabled") or 0)))
                 count_item = QTableWidgetItem(count_text)
                 count_item.setToolTip(count_tip)
@@ -778,14 +752,14 @@ class RiskTab(QWidget):
                         f"Covered only by this check: {unique_text} of the plan scope.\n"
                         f"Also covered by other enabled checks: "
                         f"{max(0.0, contribution.total_km - contribution.unique_km):.3f} km.\n"
-                        "Hazard coverage, not excluded route. Uses displayed extents "
-                        "(±25 m around point and very short hazards), clipped to the scope; "
-                        "manual hazards without a check are not compared.")
+                        "Only the recorded KP ranges contribute length. "
+                        "Point symbols are widened on the strip for visibility.")
                 unique_item = QTableWidgetItem(unique_text)
                 unique_item.setToolTip(unique_tip)
                 unique_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
                 self.check_table.setItem(i, 4, unique_item)
             self._checks_view.__exit__(None, None, None)
+            self._sync_check_actions()
             self._name_column.fit()
 
             self._refresh_hazards()
@@ -795,13 +769,11 @@ class RiskTab(QWidget):
             self._loading = False
 
     @staticmethod
-    def _count_cell(found: List[Dict], intervals, domain_km: float,
+    def _count_cell(found: List[Dict], covered: float, domain_km: float,
                     run: Dict, state: str, enabled: bool):
         """(text, tooltip) for a check's Hazards · extent cell."""
         when = analysis_state.format_utc(run.get("run_utc") or "")
         if found:
-            covered = sum(iv.length_km for iv in eng.normalize(
-                [Interval(s, e) for s, e in intervals]))
             pct = 100.0 * covered / domain_km if domain_km > 0 else 0.0
             text = f"{len(found)} · {covered:.3f} km · {pct:.1f}%"
             tip = (f"{len(found)} hazard(s) over {covered:.3f} km "
@@ -818,8 +790,8 @@ class RiskTab(QWidget):
             tip += f"\nLast scan: {when}."
         if state == analysis_state.STATE_CHANGED:
             text += " (out of date)"
-            tip += ("\nOut of date: the check's settings, its input or the plugin's KP "
-                    "method changed since its scan — run it again.")
+            tip += ("\nRun again to verify this result against the current route, "
+                    "check settings, input and KP method.")
         for warning in (run.get("warnings") or [])[:3]:
             tip += f"\n⚠ {warning}"
         return text, tip
@@ -870,14 +842,13 @@ class RiskTab(QWidget):
         lines.append("Right-click for the hazards nearest this KP.")
         return "\n".join(lines)
 
-    @staticmethod
-    def _hazard_line(hazard: Dict) -> str:
+    def _hazard_line(self, hazard: Dict) -> str:
         start = float(hazard.get("kp") or 0.0)
         end = float(hazard.get("end_kp") or start)
         lo, hi = min(start, end), max(start, end)
         where = (f"KP {lo:.3f}–{hi:.3f}" if hi - lo > 5e-4
                  else f"KP {lo:.3f}")
-        level = schema.RISK_LABELS.get(hazard.get("risk") or "", "")
+        level = self.scale.caption(hazard.get("risk"))
         return (f"{hazard.get('label') or 'hazard'} — {where}"
                 + (f"  [{level}]" if level else ""))
 
@@ -902,143 +873,33 @@ class RiskTab(QWidget):
 
     def _refresh_overview(self, scope) -> None:
         spans = []
-        risk_colors = _risk_colors()
-        for start_km, end_km, level in risk.hazard_spans(self.model.hazards):
+        risk_colors = ui_helpers.risk_colors(self.scale)
+        for start_km, end_km, level in risk.hazard_spans(self.model.hazards, scale=self.scale):
             spans.append((start_km, end_km, risk_colors.get(
                 level, risk_colors[schema.RISK_UNASSIGNED]),
-                f"{schema.RISK_LABELS.get(level, 'Unassigned')} risk"))
+                f"{self.scale.caption(level)} risk"))
         self.overview.set_spans(scope.length_km, spans, "Risk",
                                 domain_start_km=scope.start_km)
 
     def _refresh_hazards(self) -> None:
         hazards = self.model.hazards
-        check_names = {str(c.get("check_id") or ""): (c.get("name") or "")
-                       for c in self.model.risk_checks}
-        counts = risk.summarise_hazards(hazards)
-        summary = f"Hazard register — {counts['total']} hazard(s)"
-        if counts["total"]:
-            bits = [f"{counts[level]} {schema.RISK_LABELS[level].lower()}"
-                    for level in reversed(schema.RISK_LEVELS) if counts[level]]
-            if counts[schema.RISK_UNASSIGNED]:
-                bits.append(f"{counts[schema.RISK_UNASSIGNED]} unassigned")
-            bits.append(f"{counts['open']} open")
-            summary += " (" + ", ".join(bits) + ")"
-        shown = hazards
-        if len(hazards) > _MAX_TABLE_ROWS:
-            shown = hazards[:_MAX_TABLE_ROWS]
-            summary += (f" — showing the first {_MAX_TABLE_ROWS} by KP; "
-                        "tighten the checks or export the CSV for the rest")
-        use_combos = len(shown) <= _MAX_COMBO_ROWS
-        if not use_combos and len(hazards) <= _MAX_TABLE_ROWS:
-            summary += " — set risk/status via right-click (large register)"
-        self.register_label.setText(summary)
-
-        self.hazard_table.setUpdatesEnabled(False)
-        try:
-            with ui_helpers.preserve_table_view(self.hazard_table):
-                self._populate_hazard_rows(shown, check_names, use_combos)
-        finally:
-            self.hazard_table.setUpdatesEnabled(True)
-
-    def _populate_hazard_rows(self, hazards: List[Dict],
-                              check_names: Dict[str, str],
-                              use_combos: bool) -> None:
-        self.hazard_table.setRowCount(len(hazards))
-        for i, hazard in enumerate(hazards):
-            hazard_id = hazard.get("hazard_id")
-            end_kp = hazard.get("end_kp")
-            is_range = (end_kp is not None
-                        and abs(float(end_kp) - float(hazard.get("kp") or 0.0))
-                        > 5e-4)
-            angle = hazard.get("crossing_angle_deg")
-            level = hazard.get("risk") or ""
-            # KP-table rows have a range, not a measured offset.
-            from_table = str(hazard.get("feature_ref") or "").startswith("row:")
-            values = [
-                "" if use_combos else schema.RISK_LABELS.get(level, ""),
-                "" if use_combos else schema.HAZARD_STATUS_LABELS.get(
-                    hazard.get("status") or "", ""),
-                schema.format_kp(hazard.get("kp")),
-                schema.format_kp(end_kp) if is_range else "",
-                "" if from_table else
-                (f"{float(hazard.get('offset_m') or 0.0):+.1f}"
-                 if not int(hazard.get("crossing") or 0) else "0.0"),
-                "✕" if int(hazard.get("crossing") or 0) else "",
-                f"{float(angle):.1f}" if angle is not None else "",
-                hazard.get("label") or "",
-                check_names.get(str(hazard.get("check_id") or ""), "manual"),
-                hazard.get("notes") or "",
-            ]
-            for j, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-                if j == _HAZARD_NOTES_COL:
-                    flags |= Qt.ItemFlag.ItemIsEditable
-                item.setFlags(flags)
-                if j == 0:
-                    item.setData(ITEM_DATA_USER_ROLE, hazard_id)
-                    if not use_combos:
-                        color = _risk_colors().get(level)
-                        if color is not None:
-                            from qgis.PyQt.QtGui import QBrush
-                            item.setForeground(QBrush(color))
-                if j == 7:
-                    try:
-                        attributes = json.loads(
-                            hazard.get("attributes_json") or "{}")
-                    except (ValueError, TypeError):
-                        attributes = {}
-                    if attributes:
-                        item.setToolTip("\n".join(
-                            f"{k}: {v}" for k, v in attributes.items()))
-                if j == _HAZARD_NOTES_COL and value:
-                    item.setToolTip(value)
-                self.hazard_table.setItem(i, j, item)
-            if not use_combos:
-                self.hazard_table.removeCellWidget(i, _HAZARD_RISK_COL)
-                self.hazard_table.removeCellWidget(i, _HAZARD_STATUS_COL)
-                continue
-            self._add_hazard_combo(
-                i, _HAZARD_RISK_COL, hazard_id, "risk",
-                [(lv, schema.RISK_LABELS[lv])
-                 for lv in [schema.RISK_UNASSIGNED] + schema.RISK_LEVELS],
-                hazard.get("risk") or "",
-                "Effective risk. Auto-assigned by the check "
-                f"({schema.RISK_LABELS.get(hazard.get('auto_risk') or '', 'Unassigned')}); "
-                "changing it here records a user override that survives "
-                "re-scans.")
-            self._add_hazard_combo(
-                i, _HAZARD_STATUS_COL, hazard_id, "status",
-                [(s, schema.HAZARD_STATUS_LABELS[s])
-                 for s in schema.HAZARD_STATUSES],
-                hazard.get("status") or schema.HAZARD_STATUS_OPEN,
-                "Review status — carried over when checks are re-run.")
-
-    def _add_hazard_combo(self, row: int, column: int, hazard_id: str,
-                          field: str, options, current: str,
-                          tooltip: str = "") -> None:
-        combo = QComboBox()
-        for value, label in options:
-            combo.addItem(label, value)
-        combo.setCurrentIndex(max(0, combo.findData(current or "")))
-        if tooltip:
-            combo.setToolTip(tooltip)
-        if field == "risk":
-            color = _risk_colors().get(current or "")
-            if color is not None:
-                combo.setStyleSheet(f"color: {color.name()};")
-        combo.currentIndexChanged.connect(
-            lambda _index, c=combo, hid=hazard_id, f=field:
-            self._deferred_hazard_edit(hid, f, c.currentData()))
-        self.hazard_table.setCellWidget(row, column, combo)
+        counts = risk.summarise_hazards(hazards, self.scale)
+        total = counts["total"]
+        self.register_label.setText(f"Hazard register · {total:,} total · {counts['open']:,} open")
+        self.register_label.setToolTip("\n".join(
+            f"{self.scale.caption(level)}: {counts[level]:,}" for level in (*reversed(self.scale.levels), "")
+            if counts[level]))
+        self.register.replace(hazards, self.model.risk_checks, self.scale, self.model.plan_id)
 
     def _deferred_hazard_edit(self, hazard_id: str, field: str,
                               value: str) -> None:
         if self._loading or not hazard_id:
             return
-        from qgis.PyQt.QtCore import QTimer
+        plan_id = self.model.plan_id
 
         def apply() -> None:
+            if self.model.plan_id != plan_id:
+                return
             hazard = next((h for h in self.model.hazards
                            if h.get("hazard_id") == hazard_id), None)
             if hazard is None or (hazard.get(field) or "") == (value or ""):
@@ -1049,18 +910,10 @@ class RiskTab(QWidget):
 
     # -- selections / navigation ---------------------------------------------
     def _selected_hazard_ids(self) -> List[str]:
-        ids = []
-        for index in self.hazard_table.selectionModel().selectedRows():
-            item = self.hazard_table.item(index.row(), 0)
-            if item is not None:
-                ids.append(item.data(ITEM_DATA_USER_ROLE))
-        return [i for i in ids if i]
+        return self.register.selected_ids()
 
     def _hazard_for_row(self, row: int) -> Optional[Dict]:
-        item = self.hazard_table.item(row, 0)
-        hazard_id = item.data(ITEM_DATA_USER_ROLE) if item else ""
-        return next((h for h in self.model.hazards
-                     if h.get("hazard_id") == hazard_id), None)
+        return self.register.hazard_at(row)
 
     def _on_hazard_selected(self) -> None:
         if self._loading:
@@ -1090,19 +943,11 @@ class RiskTab(QWidget):
         else:
             self.dock.goto_kp(start)
 
-    def _on_hazard_item_changed(self, item) -> None:
-        if self._loading or item.column() != _HAZARD_NOTES_COL:
-            return
-        id_item = self.hazard_table.item(item.row(), 0)
-        hazard_id = id_item.data(ITEM_DATA_USER_ROLE) if id_item else ""
-        if hazard_id:
-            self.model.update_hazards([hazard_id], {"notes": item.text()})
-
     def _hazard_context_menu(self, position) -> None:
-        item = self.hazard_table.itemAt(position)
-        if item is None:
+        index = self.hazard_table.indexAt(position)
+        if not index.isValid():
             return
-        row = item.row()
+        row = index.row()
         selected_rows = {index.row() for index in
                          self.hazard_table.selectionModel().selectedRows()}
         if row not in selected_rows:
@@ -1118,10 +963,12 @@ class RiskTab(QWidget):
         menu.addSeparator()
         risk_menu = menu.addMenu(f"Set risk{suffix}")
         risk_actions = {}
-        for level in [schema.RISK_UNASSIGNED] + schema.RISK_LEVELS:
-            risk_actions[risk_menu.addAction(
-                schema.RISK_LABELS[level])] = level
-        reset_action = menu.addAction(f"Reset risk to check's{suffix}")
+        for level in ("", *self.scale.levels):
+            risk_actions[risk_menu.addAction(self.scale.caption(level))] = level
+        reset_action = menu.addAction(f"Restore automatic rating{suffix}")
+        selected_ids = set(ids)
+        reset_action.setEnabled(any(h.get("hazard_id") in selected_ids and h.get("check_id")
+                                    for h in self.model.hazards))
         status_menu = menu.addMenu(f"Set status{suffix}")
         status_actions = {}
         for status in schema.HAZARD_STATUSES:
@@ -1136,15 +983,7 @@ class RiskTab(QWidget):
         elif chosen in risk_actions:
             self.model.update_hazards(ids, {"risk": risk_actions[chosen]})
         elif chosen == reset_action:
-            groups: Dict[str, List[str]] = {}
-            for h in self.model.hazards:
-                if h.get("hazard_id") in ids:
-                    groups.setdefault(h.get("auto_risk") or "",
-                                      []).append(h.get("hazard_id"))
-            for auto, group_ids in groups.items():
-                self.model.update_hazards(
-                    group_ids, {"risk": auto,
-                                "risk_source": schema.RISK_SOURCE_AUTO})
+            self.model.update_hazards(ids, {"risk_source": schema.RISK_SOURCE_AUTO})
         elif chosen in status_actions:
             self.model.update_hazards(ids,
                                       {"status": status_actions[chosen]})
@@ -1159,6 +998,17 @@ class RiskTab(QWidget):
                 self.model.delete_hazards(ids)
 
     # -- check edits -----------------------------------------------------------
+    def _sync_check_actions(self) -> None:
+        self.check_actions.setEnabled(self.check_table.selectionModel().hasSelection())
+
+    def _edit_scale(self) -> None:
+        dialog = RiskScaleDialog(self.scale, risk.used_levels(self.model.risk_checks, self.model.hazards), self)
+        if qt_exec(dialog) == DIALOG_ACCEPTED:
+            try:
+                self.model.set_risk_scale(dialog.scale.rows())
+            except ValueError as exc:
+                QMessageBox.warning(self, dialog.windowTitle(), str(exc))
+
     def _selected_check_index(self) -> int:
         return self.check_table.currentRow()
 
@@ -1343,13 +1193,16 @@ class RiskTab(QWidget):
             self.model.direction, self._scan_finished,
             start_kp_km=(self.model.route.start_kp_km
                          if self.model.route is not None else 0.0),
-            kp_mode=self.model.kp_mode())
+            kp_mode=self.model.kp_mode(), scale=self.model.risk_scale())
+        self._scan_fingerprints = self.model.risk_check_fingerprints()
         task.progressMessage.connect(self._set_transient)
         task.progressChanged.connect(
             lambda pct: self.progress.setValue(int(pct)))
         self._scan_task = task
+        self.scale_button.setEnabled(False)
         self.run_button.setEnabled(False)
         self.stop_button.setEnabled(True)
+        self.stop_button.show()
         self.progress.setVisible(True)
         self.progress.setValue(0)
         self._set_transient("Scanning…")
@@ -1373,8 +1226,10 @@ class RiskTab(QWidget):
             except RuntimeError:
                 pass  # the task manager already deleted it
         self.run_button.setEnabled(bool(self.model.plan))
+        self.scale_button.setEnabled(bool(self.model.plan))
         self.stop_button.setEnabled(False)
         self.progress.setVisible(False)
+        self.stop_button.hide()
 
     def _scan_finished(self, task) -> None:
         """Completion callback on the main thread."""
@@ -1384,9 +1239,11 @@ class RiskTab(QWidget):
             # write hazards later, nor clear a newer scan's reference.
             return
         self._scan_task = None
-        self.run_button.setEnabled(True)
+        self.run_button.setEnabled(bool(self.model.plan))
+        self.scale_button.setEnabled(bool(self.model.plan))
         self.stop_button.setEnabled(False)
         self.progress.setVisible(False)
+        self.stop_button.hide()
         if task.plan_id != self.model.plan_id:
             # The user switched plans while the scan ran — these hazards
             # belong to the plan the scan was started on, not this one.
@@ -1399,6 +1256,10 @@ class RiskTab(QWidget):
         if task.error:
             self._flash(f"Scan failed: {task.error}")
             return
+        current = self.model.risk_check_fingerprints()
+        if any(current.get(cid) != self._scan_fingerprints.get(cid) for cid in task.run_check_ids):
+            self._flash("The route or check settings changed during the scan. Run the checks again.")
+            return
         message = (f"Scanned {len(task.run_check_ids)} check(s): "
                    f"{len(task.hazards)} hazard(s).")
         warnings = self._prescan_warnings + task.warnings
@@ -1408,8 +1269,9 @@ class RiskTab(QWidget):
                 message += f"  ·  … {len(warnings) - 4} more"
         self._transient_status = ""
         if task.run_check_ids:
-            self.model.apply_risk_scan(task.hazards,
-                                       check_ids=task.run_check_ids)
+            if not self.model.apply_risk_scan(task.hazards, check_ids=task.run_check_ids):
+                self._flash("The scan results could not be saved.")
+                return
             counts: Dict[str, int] = {}
             for hazard in task.hazards:
                 key = str(hazard.get("check_id") or "")
@@ -1459,7 +1321,7 @@ class RiskTab(QWidget):
             click_kp = None
             found = risk.sort_hazards(
                 [h for h in self.model.hazards
-                 if str(h.get("check_id") or "") == check_id])
+                 if str(h.get("check_id") or "") == check_id], self.scale)
         menu = QMenu(self)
         edit_action = menu.addAction("Edit check…")
         run_action = menu.addAction("Run this check")
@@ -1480,7 +1342,7 @@ class RiskTab(QWidget):
                              f"{schema.format_kp(max(start, end))}")
                 else:
                     where = f"KP {schema.format_kp(start)}"
-                level = schema.RISK_LABELS.get(hazard.get("risk") or "", "")
+                level = self.scale.caption(hazard.get("risk"))
                 action = menu.addAction(
                     f"Go to {hazard.get('label') or 'hazard'} — {where}"
                     + (f"  [{level}]" if level else ""))
@@ -1508,7 +1370,7 @@ class RiskTab(QWidget):
     def _add_manual_hazard(self) -> None:
         if not self.model.plan:
             return
-        dialog = ManualHazardDialog(self.dock, self)
+        dialog = ManualHazardDialog(self.dock, self, scale=self.scale, scope=self.model.gen_params().scope)
         if qt_exec(dialog) != DIALOG_ACCEPTED:
             return
         kp, end_kp, label, level, notes = dialog.values()

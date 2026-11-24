@@ -147,14 +147,14 @@ count/complexity safeguards still apply. This optional tool does not change gene
 
 These are in **Plugins ▸ Subsea Cable Tools**. The main toolbar has **KP Mouse Tool**, **KP Plot**, **Depth Profile**, **Catenary Calculator V2** and **Transit Measure**; tools under active development are in its **Experimental** dropdown.
 
-- **KP Mouse Tool** — inspect live route KP and nearby depth on the map; right-click to add a route comment.
+- **KP Mouse Tool** — inspect live route KP, reference and nearby depth. In **Configure KP Mouse Tool**, enable temporary KP markers, choose automatic or fixed spacing, and toggle leader lines. Right-click the map to add a route comment.
 - **KP Plot** — plot KP-indexed table values along a route.
 - **Depth Profile** — plot bathymetry and slope along a line.
 - **Catenary Calculator V2** — explore a two-dimensional static cable model; its *Steady Lay (beta)* tab gives the cable angle, layback and tensions while laying at a given ship speed, with current drag.
 - **Transit Measure** — measure a drawn path and estimate transit time.
 - **Cable Route Workbench** — manage cable systems, RPL revisions and assemblies.
 - **Planner** — build map-linked vessel and resource schedules.
-- **Burial Planner** — develop burial plans from routes and survey data.
+- **Burial Planner** — develop burial plans from routes and survey data. In **BAS ▸ Generate from polygons…**, choose polygon layers and optional classification fields. For polygons produced by the seabed description tool, choose `soil_description`. For separate soil-type layers, leave fields unchecked to use their layer names. Review the generated KP ranges, lengths and flagged intervals, then choose **Apply changes**. Right-click a row and choose **Go to section** to inspect it on the route.
 - **Cable Lay Data Explorer** — inspect and analyse imported lay records; its *Lay Assessment* tab lists KP ranges of possible suspensions, loop risk and tension-limit exceedances, with a seabed profile of where the cable rests ([method](docs/LAY_ASSESSMENT.md)).
 - **Span & Slack Analysis (beta)** — rest a cable on the seabed along a route, vary the bottom tension or slack, and see spans, loop risk, residual tension and friction effects, with a bending-stiffness detail model and a tension sweep ([method](docs/SPAN_ANALYSIS.md)).
 - **Route Comments** — capture, search and export spatial comments on routes (route points, KP ranges, map locations) in a shared GeoPackage register, with replies, images and custom fields ([guide](docs/ROUTE_COMMENTS.md)).

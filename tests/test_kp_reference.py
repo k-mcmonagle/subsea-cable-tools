@@ -209,6 +209,9 @@ def test_move_plan_to_new_revision(temp: str) -> bool:
     model.update_plan({"scope_start_kp": 0.0, "scope_end_kp": model.route.end_kp_km}, reason="scope")
     model.add_event(1.0, schema.EVENT_BURIAL_START)
     model.add_event(5.5, schema.EVENT_BURIAL_END)
+    model.save_bas([{"row_id": schema.new_id(), "start_kp": 5.0, "end_kp": 5.5,
+                     "src_start_kp": 5.0, "src_end_kp": 5.5, "src_rpl": "Rev A",
+                     "notes": "Reviewed soil boundary"}])
     before = {e["event_id"]: (e["lon"], e["lat"], float(e["kp"])) for e in model.events}
     wb.add("B", "Rev B", _ROUTE_B)
     model._load_route()
@@ -229,9 +232,17 @@ def test_move_plan_to_new_revision(temp: str) -> bool:
     # The KP-5.5 event lies past the re-routed leg: its KP grows by the
     # detour length but it stays on the same seabed spot.
     ok = ok and moved < 1.0 and shifted > 10.0
+    row = model.bas_rows[0]
+    ok = ok and row["end_kp"] > 5.5 and row["src_end_kp"] == 5.5 and row["src_rpl"] == "Rev A"
+    ok = ok and row["notes"] == "Reviewed soil boundary"
     last = model.store.list_change_log(model.plan_id)[-1]
     ok = ok and last.get("action") == "rereference_plan"
-    return _result("moving a plan to a new RPL revision keeps seabed positions, updates KPs",
+    restored = model.rollback_to(last["change_id"])
+    ok = ok and restored and model.plan["rpl_id"] == "A" and model.resolved_rpl_id == "A"
+    ok = ok and (model.bas_rows[0]["start_kp"], model.bas_rows[0]["end_kp"]) == (5.0, 5.5)
+    ok = ok and {e["event_id"]: (e["lon"], e["lat"], float(e["kp"]))
+                 for e in model.events} == before
+    return _result("moving a plan re-references KPs; rollback restores the old RPL and events",
                    bool(ok), f"moved {moved:.2f} m, KP change {shifted:.1f} m; {report.summary()}")
 
 

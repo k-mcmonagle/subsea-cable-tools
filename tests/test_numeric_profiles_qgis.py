@@ -96,6 +96,85 @@ class NumericQgisTests(unittest.TestCase):
         rows, _ = polygon_assignments(self.route("LINESTRING(0 0,4000 0,0 0)"), layer, "Investigation")
         self.assertEqual([(r["start_kp"], r["end_kp"]) for r in rows], [(11, 12), (16, 17)])
 
+    def test_bas_sections_use_fields_or_layer_names_and_mark_ambiguous_intervals(self):
+        from ..burial.bas_polygons import generate_sections
+        from ..burial.bas_polygon_dialog import BasPolygonDialog
+        from types import SimpleNamespace
+
+        a = self.polygon("POLYGON((500 -10,2500 -10,2500 10,500 10,500 -10))", "Fine")
+        b = self.polygon("POLYGON((1500 0,3500 0,3500 10,1500 10,1500 0))")
+        b.setName("Coarse")
+        for layer in (a, b):
+            QgsProject.instance().addMapLayer(layer)
+            self.layers.append(layer.id())
+        dialog = BasPolygonDialog(None)
+        for i in range(dialog.tree.topLevelItemCount()):
+            item = dialog.tree.topLevelItem(i)
+            if item.text(0) == a.name():
+                item.child(0).setCheckState(0, Qt.CheckState.Checked)
+            if item.text(0) == b.name():
+                item.setCheckState(0, Qt.CheckState.Checked)
+        rows, cols = generate_sections(self.route(), dialog.sources(), [],
+                                       SimpleNamespace(start_km=10.25, end_km=14), "Revision")
+        self.assertEqual({c["label"] for c in cols}, {"Investigation", "Soil layer"})
+        self.assertEqual([(r["start_kp"], r["end_kp"]) for r in rows],
+                         [(10.25, 10.5), (10.5, 11.5), (11.5, 12.5), (12.5, 13.5), (13.5, 14)])
+        self.assertEqual(rows[2]["values"], {"investigation": "Fine", "soil_layer": "Coarse"})
+        self.assertIn("Overlap", rows[2]["notes"])
+        self.assertIn("boundary", rows[2]["notes"])
+        self.assertIn("Gap", rows[-1]["notes"])
+        self.assertEqual(rows[1]["src_rpl"], "Revision")
+        from qgis.core import QgsField
+        from ..qgis_compat import FIELD_TYPE_STRING
+        a.dataProvider().addAttributes([QgsField("Material", FIELD_TYPE_STRING)])
+        a.updateFields()
+        feature = next(a.getFeatures())
+        a.dataProvider().changeAttributeValues({feature.id(): {a.fields().indexOf("Material"): "Sand"}})
+        whole_route, _ = generate_sections(self.route(), [(a, ["Investigation", "Material"])], [],
+                                            SimpleNamespace(start_km=0, end_km=0))
+        self.assertEqual((whole_route[0]["start_kp"], whole_route[-1]["end_kp"]), (10, 14))
+        self.assertEqual(whole_route[1]["values"], {"investigation": "Fine", "material": "Sand"})
+        dialog.deleteLater()
+
+    def test_bas_polygon_draft_apply_revert_and_navigation(self):
+        from unittest.mock import Mock, patch
+        from ..burial.tabs import bas_tab
+
+        layer = self.polygon("POLYGON((500 -10,2500 -10,2500 10,500 10,500 -10))", "Fine")
+        QgsProject.instance().addMapLayer(layer)
+        self.layers.append(layer.id())
+        self.model.route = self.route()
+        dock = Mock()
+        tab = bas_tab.BasTab(self.model, dock)
+
+        def choose(dialog):
+            for i in range(dialog.tree.topLevelItemCount()):
+                item = dialog.tree.topLevelItem(i)
+                if item.text(0) == layer.name():
+                    item.child(0).setCheckState(0, Qt.CheckState.Checked)
+            return bas_tab.DIALOG_ACCEPTED
+
+        with patch.object(bas_tab, "qt_exec", side_effect=choose):
+            tab._generate()
+            self.assertEqual(len(tab._working), 3)
+            self.assertFalse(self.model.bas_rows)
+            tab._revert()
+            self.assertFalse(tab._columns)
+            self.assertFalse(tab._working)
+            tab._generate()
+        tab.refresh()
+        self.assertEqual(tab.table.item(1, tab._length_column).text(), "2.000")
+        tab._apply()
+        self.assertEqual(self.model.bas_rows[1]["values"], {"investigation": "Fine"})
+        self.assertEqual(self.model.bas_columns()[0]["key"], "investigation")
+        tab.table.setCurrentCell(0, 0)
+        pos = tab.table.visualItemRect(tab.table.item(1, 0)).center()
+        with patch.object(bas_tab, "qt_exec", side_effect=lambda menu, _pos:
+                          next(a for a in menu.actions() if a.text() == "Go to section").trigger()):
+            tab._context_menu(pos)
+        dock.goto_range.assert_called_once_with(10.5, 12.5)
+        tab.deleteLater()
+
     def test_polygon_crs_transformed_and_unknown_ids_flagged(self):
         layer = self.polygon("POLYGON((0.01 -0.001,0.02 -0.001,0.02 0.001,0.01 0.001,0.01 -0.001))",
                              source="unknown", crs="EPSG:4326")

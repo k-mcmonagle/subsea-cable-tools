@@ -1087,6 +1087,11 @@ class BurialPlannerDock(QDockWidget):
         if task.error:
             self.builder_tab.analysis_finished(f"Analysis failed: {task.error}")
             return
+        basis = self._task_basis["fingerprints"]
+        if (basis["global"]["route"] != self.model.route_geometry_fingerprint()
+                or basis["kp_mode"] != list(self.model.kp_mode())):
+            self.builder_tab.analysis_finished("The route changed during analysis. Run again for the current route.")
+            return
         try:
             self.builder_tab.analysis_message("Applying generation results…")
             self._apply_analysis_results(task)
@@ -1453,6 +1458,10 @@ class BurialPlannerDock(QDockWidget):
         params = self.model.gen_params()
         identity = getattr(self, "_profile_identity", None) or \
             self.model.profile_identity()
+        if identity["route_geom_fingerprint"] != self.model.route_geometry_fingerprint():
+            self.profile_status.setText("The route changed during sampling. Rebuild the profile for the current route.")
+            self.profile_tab.set_runtime_status(self.profile_status.text())
+            return
         profile = profile_data.PlanProfile(
             step_m=task.step_m,
             cross_offset_m=task.cross_offset_m,
@@ -1481,7 +1490,7 @@ class BurialPlannerDock(QDockWidget):
     def _refresh_profile_overlays(self) -> None:
         self.profile.set_overlays(self.model.display_context(),
                                   self._rule_names())
-        self.profile.set_hazards(self.model.hazards)
+        self.profile.set_hazards(self.model.hazards, self.model.risk_scale())
 
     def _rule_names(self) -> Dict[str, str]:
         return {str(r.get("rule_id")): (r.get("name") or "criterion")

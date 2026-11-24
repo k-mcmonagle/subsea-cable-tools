@@ -10,6 +10,7 @@ from __future__ import annotations
 
 
 from ..burial import attribute_rules, io_csv, risk, schema
+from ..burial.risk_scale import DEFAULT_SCALE, RiskScale
 
 
 def _result(name: str, ok: bool, detail: str = "") -> bool:
@@ -50,6 +51,30 @@ def test_risk_evaluation() -> bool:
     ok = ok and risk.attribute_risk(config, {}) == schema.RISK_UNASSIGNED
     ok = ok and risk.risk_max("low", "", "high", "medium") == "high"
     return _result("risk evaluation: bands + attribute rules + default", ok)
+
+
+def test_custom_score_precedence_and_validation() -> bool:
+    rows = [dict(id="monitor", label="Monitor", score=0, color="#228844"),
+            dict(id="assess", label="Assess", score=8, color="#996600"),
+            dict(id="act", label="Act", score=24, color="#aa2255")]
+    scale = RiskScale(list(reversed(rows)))
+    config = {"default_risk": "monitor", "on_route_risk": "assess",
+              "band_monitor_m": 10, "attribute_rules": [{"expression": "flagged", "risk": "act"}]}
+    assert risk.evaluate_risk(config, 0, expression_hits=[True], intersects=True, scale=scale) == "act"
+    assert risk.evaluate_risk(config, 0, intersects=True, scale=scale) == "assess"
+    assert risk.evaluate_risk(config, -10, scale=scale) == "monitor"
+    assert risk.evaluate_risk(config, None, scale=scale) == "monitor"
+    assert risk.risk_max("", "monitor", scale=scale) == "monitor"
+    assert risk.merge_risk_spans([(0, 1, "act"), (0, 1, "assess")], scale)[-1][2] == "act"
+    for invalid in ([], [rows[0], dict(rows[1], score=0)], [rows[0], dict(rows[1], label="MONITOR")],
+                    [dict(rows[0], score=-1)], [dict(rows[0], color="unknown")]):
+        try:
+            RiskScale(invalid)
+        except ValueError:
+            continue
+        raise AssertionError(f"Accepted invalid scale {invalid}")
+    assert RiskScale.from_plan({}) is DEFAULT_SCALE
+    return _result("custom scores, zero-rated findings, validation and overlap order", True)
 
 
 def test_attribute_rule_text_form() -> bool:
@@ -214,6 +239,7 @@ def test_range_bounds_and_expression_rules() -> bool:
 def run_all() -> list:
     return [
         test_risk_evaluation(),
+        test_custom_score_precedence_and_validation(),
         test_attribute_rule_text_form(),
         test_range_bounds_and_expression_rules(),
         test_carry_over(),

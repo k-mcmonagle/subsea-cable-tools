@@ -320,6 +320,7 @@ class LabelSettings:
     leader_mm: float = 8.0               # how far a leader sets the tag off the comment
     images: bool = True                  # a comment's chosen image at the top of its detail tag
     image_mm: float = 30.0               # that image's width on the map
+    image_overlap: bool = False
 
     @classmethod
     def from_json(cls, text: str) -> "LabelSettings":
@@ -435,7 +436,8 @@ def _pal(expression: str, settings: LabelSettings, line: bool, bold: bool = True
     pal.fieldName = expression
     pal.enabled = True
     fmt = QgsTextFormat()
-    fmt.setAllowHtmlFormatting(html)
+    if hasattr(fmt, "setAllowHtmlFormatting"):
+        fmt.setAllowHtmlFormatting(html)
     font = QFont()
     font.setBold(bold)
     fmt.setFont(font)
@@ -473,11 +475,16 @@ def _pal(expression: str, settings: LabelSettings, line: bool, bold: bool = True
     else:
         pal.dist = max(1.0, float(settings.leader_mm))
         pal.setCallout(_leader(line))
-    thinning = pal.thinningSettings()
+    thinning = pal.thinningSettings() if hasattr(pal, "thinningSettings") else None
     if hasattr(thinning, "setLabelMarginDistance"):   # QGIS 3.42+: tags don't touch
         thinning.setLabelMarginDistance(1.5)
         thinning.setLabelMarginDistanceUnit(_render_mm())
     _state_properties(pal, line)
+    if html and settings.image_overlap:
+        props = pal.dataDefinedProperties()
+        props.setProperty(_scoped(QgsPalLayerSettings, "Property", "AlwaysShow"),
+                          QgsProperty.fromExpression(f"{_MAP_IMAGE} <> ''"))
+        pal.setDataDefinedProperties(props)
     return pal
 
 
@@ -504,8 +511,10 @@ def build_labeling(settings: LabelSettings, line: bool) -> QgsRuleBasedLabeling:
     if settings.numbers and int(settings.number_scale) > inner:
         rules.insert(0, QgsRuleBasedLabeling.Rule(_pal(LABEL_PARTS[0][2], settings, line), _inclusive(inner),
                                                   _inclusive(int(settings.number_scale)), "", "Number"))
-    rules.append(QgsRuleBasedLabeling.Rule(_pal(settings.label_expression(), settings, line, bold=False,
-                                                html=settings.images), 0, _inclusive(detail), "", "Details"))
+    images = settings.images and Qgis.QGIS_VERSION_INT >= 34000
+    expression = settings.label_expression() if images else settings.detail_expression()
+    rules.append(QgsRuleBasedLabeling.Rule(_pal(expression, settings, line, bold=False,
+                                                html=images), 0, _inclusive(detail), "", "Details"))
     for rule in rules:
         root.appendChild(rule)
     return QgsRuleBasedLabeling(root)
@@ -529,17 +538,20 @@ def labels_show_images(layer: Optional[QgsVectorLayer]) -> bool:
     labeling = layer.labeling() if layer is not None else None
     if labeling is None:
         return False
-    expressions = []
+    candidates = []
     if isinstance(labeling, QgsRuleBasedLabeling):
         pending = list(labeling.rootRule().children())
         while pending:
             rule = pending.pop()
+            if not rule.active():
+                continue
             pending.extend(rule.children())
             if rule.settings() is not None:
-                expressions.append(rule.settings().fieldName)
+                candidates.append(rule.settings())
     elif isinstance(labeling, QgsVectorLayerSimpleLabeling):
-        expressions.append(labeling.settings().fieldName)
-    return any("<img src=" in str(e or "") for e in expressions)
+        candidates.append(labeling.settings())
+    return any(pal.isExpression and "<img src=" in pal.fieldName and pal.format().allowHtmlFormatting()
+               for pal in candidates)
 
 
 def labels_predate_images(layer: Optional[QgsVectorLayer]) -> bool:
@@ -617,6 +629,11 @@ class CommentLayers:
 
     def layers(self) -> List[QgsVectorLayer]:
         return [layer for layer in (self.find("points"), self.find("ranges")) if layer is not None]
+
+    def visible_layers(self) -> List[QgsVectorLayer]:
+        root = self.project.layerTreeRoot()
+        return [layer for layer in self.layers()
+                if (node := root.findLayer(layer.id())) is not None and node.isVisible()]
 
     def register_path(self) -> str:
         """The register the comment layers read, as QGIS resolved it against

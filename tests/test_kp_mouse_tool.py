@@ -379,6 +379,8 @@ def test_canvas_move_event():
         expected = tool._locate(tool.toMapCoordinates(pos))
         ok = (expected is not None and tool.last_chainage == expected.kp_km
               and tool.rubberBand.numberOfVertices() == 2
+              and "RPL: " + layer.name() in iface.window.statusBar().currentMessage()
+              and "RPL:" not in tool.last_message
               and "KP: %.3f" % expected.kp_km in tool.last_message)
         return _result("canvasMoveEvent reports the indexed KP and draws one band", ok,
                        "KP %.6f" % (tool.last_chainage or float("nan")))
@@ -658,6 +660,35 @@ def test_cleanup_detaches_canvas_items():
                    "items before %d, with tool %d, after cleanup %d" % (before, during, after))
 
 
+def test_station_lifecycle():
+    from qgis.PyQt.QtWidgets import QGraphicsSimpleTextItem
+    from qgis.gui import QgsMapToolPan
+
+    iface = _Iface()
+    canvas = iface.canvas
+    layer = _layer(_FEATURES)
+    canvas.setExtent(layer.extent())
+    before = len(canvas.scene().items())
+    tool = KPMouseMapTool(canvas, layer, iface, station_interval_km=0)
+    pan = QgsMapToolPan(canvas)
+    try:
+        canvas.setMapTool(tool)
+        labels = [item.text() for item in canvas.scene().items() if isinstance(item, QGraphicsSimpleTextItem)]
+        assert labels and all(len(label.split(".")[-1]) == 3 for label in labels)
+        canvas.setMapTool(pan)
+        canvas.zoomByFactor(0.5)
+        assert not tool.markers.items
+        canvas.setMapTool(tool)
+        assert tool.markers.items
+        canvas.unsetMapTool(tool)
+        tool.cleanup_resources()
+        assert len(canvas.scene().items()) == before
+        return _result("zoom-dependent station labels follow map tool activation and disposal", True)
+    finally:
+        tool.cleanup_resources()
+        iface.close()
+
+
 def test_layer_has_features():
     empty = QgsVectorLayer("LineString?crs=%s" % _WGS84, "empty", "memory")
     ok = not _layer_has_features(empty) and _layer_has_features(_layer(_FEATURES))
@@ -773,6 +804,7 @@ def run_all():
         test_canvas_move_event(),
         test_range_ring_cached_and_unchanged(),
         test_cleanup_detaches_canvas_items(),
+        test_station_lifecycle(),
         test_layer_has_features(),
         test_wrapper_menu_icon_and_unload(),
         test_start_kp_from_workbench_rpl(),

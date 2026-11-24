@@ -30,7 +30,7 @@ The KP Mouse Tool's other right-click entries are unchanged.
 
 **Plugins ▸ Subsea Cable Tools ▸ Route Comments** (also in the toolbar's *Experimental* dropdown). Drag its title bar off the QGIS window to use it as a separate window with minimise and maximise buttons; it reopens the way you left it.
 
-- **Register button**: create a register, **duplicate** it (a copy under a new name, with its images; you are asked whether this project should use the copy), open one, recent registers, show the folder.
+- **Register button**: create a register, **duplicate** it (a copy under a new name, with its images; you are asked whether this project should use the copy), open one, revisit registers used in this QGIS project, or show the register folder. Recent history is kept locally. A new unsaved project starts with an empty history.
 - **Set combo / Set menu**: switch comment sets. You can also create, **duplicate**, rename or delete a set, **renumber it by KP**, edit its custom fields (text, number, date, yes/no, choice), and edit its status and priority choices. Statuses marked *counts as closed* are drawn grey and can be hidden. See [Copying, moving and renumbering](#copying-moving-and-renumbering).
 - **Search** matches every word typed against the text, replies, number (`#12`), author, tags, route and custom values. **Filter** narrows by status, priority, reference condition and type.
 - **Table** (across the top): click a header to sort. Right-click a header to show or hide columns or reset them. Column order, widths, visibility and sort are remembered. Double-click (or F2) the comment, status, priority, author, date, tags, external ID or a custom field to edit it in place; it is saved straight away, with the same check against changes made elsewhere as **Save**. Double-click a number to zoom to it. Double-click a KP (or press F2) to edit a route point or range, with a confirmation before it moves. A map location's **~** nearest KP is calculated from its position: double-click it to edit its coordinates. Right-click rows to zoom to them, set their status or priority, **copy or move them to another set**, copy their IDs or delete them.
@@ -52,6 +52,8 @@ Below the table is the selected comment. Drag the bar between them to share the 
 - A message above the table gives the new numbers, with a link to show that set.
 
 **Duplicate a set** (*Set ▸ Duplicate set…*): everything (its comments with the same numbers and new IDs, with or without their replies and images), or the set-up only (statuses, priorities and custom fields, no comments), for example to start the next review round. The dock then shows the copy, with a link back to the original.
+
+**Merge with another set…** combines two sets in the open register into a new, named set. It copies every comment, reply and image and combines the status, priority and custom-field lists. The originals keep their IDs and numbers. Copies get new IDs and consecutive numbers, starting with the current set. Identical comment text can represent different observations, so both entries are kept. A missing attachment, conflicting field types, or inconsistent open/closed status definitions stop the merge before the new set is saved.
 
 **Duplicate the register** (*Register ▸ Duplicate register…*): a consistent copy of the GeoPackage and its attachments folder under a new name, made even while others have the register open. An existing file is never overwritten. You can use the copy in this project (the comment layers are pointed at it) or keep the original; the copy is then in *Recent registers*.
 
@@ -89,6 +91,8 @@ A general comment has no position to edit: **Edit position…** reads **Place on
 Position edits use the comment's saved start KP, measurement convention and route revision, even if the current KP settings differ. The original route must be available and its geometry unchanged; restore it first if it has changed or is missing. A newer Workbench revision is not substituted. A concurrent change to the comment is reported without overwriting it; reload before trying again. Existing registers need no schema changes for position editing.
 
 ## On the map
+
+Closing Route Comments hides its layers and clears its selection overlay and map tools. Reopening the dock restores the layers it hid. Unchecking a comment layer or its parent group in the Layers panel also hides its selection highlight.
 
 The current set is drawn in a **Route comments** layer group, with points and map locations in one layer and KP ranges in another (general comments have no location and are not drawn). Both layers read the register directly, filtered to the set: there is no copy of the comments to refill or clean up, and they are saved with the project like any other layer. Open comments are amber, closed ones grey, and comments whose route reference has changed or is unavailable are red. A KP range is a wide translucent band with a dark centre line, so it shows over a route line. Points that crowd together are clustered.
 
@@ -177,8 +181,8 @@ For pictures off the route, use **Filename**, **Latitude** and **Longitude** ins
 
 Keep ordinary comments in their existing set and switch sets to review either collection. The dock shows **one set at a time**; it does not overlay both sets together. Imported images are copied into the register's attachments folder, so keep that folder beside the GeoPackage when sharing it.
 
-Pictures use the existing scale-dependent QGIS labels and their collision handling. Crowded pictures may be hidden until you zoom in. Map labels draw the full-size image files from the attachments folder, so reducing the label width does not create smaller source files: for many large PNGs, import suitably reduced copies to limit image decoding and memory use. Performance depends on image dimensions and how many labels are in view; the tool does not guarantee every picture will be visible at once.
+Pictures use the existing scale-dependent QGIS labels and their collision handling. At the detail scale, zoom in or enable **Allow map images to overlap other labels** in **Label contents…** if nearby labels crowd out a picture. Native image labels require QGIS 3.40 or later. On earlier versions the image is available in the dock. Map labels draw the full-size image files from the attachments folder, so reducing the label width does not create smaller source files: for many large PNGs, import suitably reduced copies to limit image decoding and memory use. Performance depends on image dimensions and how many labels are in view; the tool does not guarantee every picture will be visible at once.
 
 ## Not in this version
 
-KP schematic view, a browser interface, a formal audit trail, a revision transfer wizard, merge tools and agent integrations.
+KP schematic view, a browser interface, a formal audit trail, a revision transfer wizard and agent integrations.

@@ -39,7 +39,8 @@ from ...qgis_compat import (
     HEADER_RESIZE_MODE_STRETCH,
     qt_exec,
 )
-from .. import attribute_rules, map_layers, schema
+from .. import attribute_rules, map_layers
+from ..risk_scale import DEFAULT_SCALE
 
 _ITEM_FLAG = getattr(Qt, "ItemFlag", Qt)
 _FLAGS_EDITABLE = (_ITEM_FLAG.ItemIsEnabled | _ITEM_FLAG.ItemIsSelectable
@@ -196,8 +197,9 @@ class AttributeRulesTable(QWidget):
     _UPPER_BOUNDS = (("<", False), ("≤", True))
 
     def __init__(self, with_kind: bool = True, with_risk: bool = True,
-                 parent=None):
+                 parent=None, risk_scale=DEFAULT_SCALE):
         super().__init__(parent)
+        self.risk_scale = risk_scale
         self.with_kind = with_kind
         self.with_risk = with_risk
         self._layer = None
@@ -328,10 +330,10 @@ class AttributeRulesTable(QWidget):
 
         if self.with_risk:
             risk_combo = QComboBox()
-            for level in schema.RISK_LEVELS:
-                risk_combo.addItem(schema.RISK_LABELS[level], level)
+            for level in self.risk_scale.levels:
+                risk_combo.addItem(self.risk_scale.caption(level), level)
             risk_combo.setCurrentIndex(max(0, risk_combo.findData(
-                rule.get("risk") or schema.RISK_LOW)))
+                rule.get("risk") or self.risk_scale.levels[0])))
             self.table.setCellWidget(row, self.col_risk, risk_combo)
         self._sync_row(row)
         self.table.setCurrentCell(row, self.col_value)
@@ -435,7 +437,7 @@ class AttributeRulesTable(QWidget):
         if self.with_risk:
             risk_combo = self.table.cellWidget(row, self.col_risk)
             rule["risk"] = (risk_combo.currentData() if risk_combo is not None
-                            else "") or schema.RISK_LOW
+                            else "") or self.risk_scale.levels[0]
         return rule
 
     def rules(self) -> List[Dict]:

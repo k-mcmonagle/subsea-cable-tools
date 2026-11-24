@@ -1166,6 +1166,8 @@ def test_new_register_in_a_new_project(folder):
     dock = dock_module.RouteCommentsDock(iface)
     checks = {}
     try:
+        iface.window.show()
+        dock.show()
         checks["first register at the default"] = dock.new_register() and dock.store.path == default and \
             calls[-1][1] == QFileDialog.Option.DontConfirmOverwrite
         dock.store.add_comment(dock.set_row["set_id"], {"text": "old", "ref_kind": model.REF_LOCATION,
@@ -1175,7 +1177,32 @@ def test_new_register_in_a_new_project(folder):
         checks["old comment on the map, highlighted"] = _n(dock.layers.find("points")) == 1 and \
             len(iface.canvas.scene().items()) > canvas_items
 
+        root = project.layerTreeRoot()
+        point_node = root.findLayer(dock.layers.find("points").id())
+        range_node = root.findLayer(dock.layers.find("ranges").id())
+        point_node.setItemVisibilityChecked(False)
+        checks["hidden layer clears selection overlay"] = not dock.highlight.bands
+        dock._after_selection(sync_map=True)
+        checks["selection respects hidden layer"] = not dock.highlight.bands
+        point_node.setItemVisibilityChecked(True)
+        group = root.findGroup(map_layers.GROUP_NAME)
+        group.setItemVisibilityChecked(False)
+        checks["parent visibility hides highlight"] = not dock.highlight.bands
+        group.setItemVisibilityChecked(True)
+        range_node.setItemVisibilityChecked(False)
+        dock.close()
+        dock.reload()
+        checks["closed dock stays clear"] = not dock.layers.visible_layers() and not dock.highlight.bands and \
+            not dock.layers.selected_ids()
+        dock.show()
+        checks["reopen respects prior layer visibility"] = point_node.isVisible() and not range_node.isVisible()
+        checks["unsaved project remembers current register"] = dock._recent() == [default]
+        # First save carries this unsaved workspace's history to its new identity.
+        project_a = os.path.join(folder, "A.qgz")
+        assert project.write(project_a)
+        checks["first save keeps local history"] = dock._recent() == [default]
         project.clear()   # File > New
+        checks["another unsaved project starts with no recent registers"] = not dock._recent()
         checks["new project: no register, layers or highlight"] = dock.store is None and \
             not dock.layers.layers() and len(iface.canvas.scene().items()) == canvas_items and \
             project.layerTreeRoot().findGroup(map_layers.GROUP_NAME) is None
@@ -1192,6 +1219,11 @@ def test_new_register_in_a_new_project(folder):
         answers.update(paths=[default], choice="open")
         checks["open it: the old comments"] = dock.new_register() and dock.store.path == default and \
             [c["text"] for c in dock.comments] == ["old"]
+        assert project.write(os.path.join(folder, "B.qgz"))
+        dock._remember(fresh)
+        checks["second saved project has its own history"] = dock._recent()[0] == fresh
+        assert project.read(project_a)
+        checks["reopening first project restores only its history"] = dock._recent() == [default]
     finally:
         dock.shutdown()
         dock.layers.remove()

@@ -19,6 +19,8 @@ from ..workbench import schema as wb_schema
 from . import attribute_rules
 from . import events as ev
 from . import schema
+from . import risk
+from .risk_scale import RiskScale
 from . import target_depth
 from . import tools as tools_mod
 
@@ -665,13 +667,11 @@ def build_report_html(plan: Dict,
     # -- risk profile ---------------------------------------------------------
     if hazards:
         parts.append("<h2>Risk profile</h2>")
-        counts: Dict[str, int] = {}
-        for hazard in hazards:
-            level = hazard.get("risk") or ""
-            counts[level] = counts.get(level, 0) + 1
+        scale = RiskScale.from_plan(plan)
+        counts = risk.summarise_hazards(hazards, scale)
         summary_bits = [
-            f"{counts.get(level, 0)} {schema.RISK_LABELS[level].lower()}"
-            for level in (schema.RISK_HIGH, schema.RISK_MEDIUM, schema.RISK_LOW)
+            f"{counts[level]} {_esc(scale.label(level))}"
+            for level in reversed(scale.levels)
             if counts.get(level)]
         if counts.get(""):
             summary_bits.append(f"{counts['']} unassigned")
@@ -683,13 +683,13 @@ def build_report_html(plan: Dict,
         hazard_rows = []
         for hazard in hazards:
             hazard_rows.append((
-                _esc(schema.RISK_LABELS.get(hazard.get("risk") or "", "")),
+                _esc(scale.caption(hazard.get("risk"))),
                 _esc(schema.HAZARD_STATUS_LABELS.get(
                     hazard.get("status") or "", "")),
                 _kp(hazard.get("kp")),
                 _kp(hazard.get("end_kp")),
-                _num(hazard.get("offset_m"), 1),
-                "yes" if int(hazard.get("crossing") or 0) else "",
+                _num(risk.measured_offset(hazard), 1),
+                risk.interaction(hazard),
                 _num(hazard.get("crossing_angle_deg"), 1),
                 _esc(hazard.get("label")),
                 _esc(check_names.get(str(hazard.get("check_id") or ""),
@@ -697,7 +697,7 @@ def build_report_html(plan: Dict,
                 _esc(hazard.get("notes")),
             ))
         parts.append(_table(("Risk", "Status", "KP", "End KP",
-                             "Offset (m, +stbd/−port)", "Crossing",
+                             "Offset (m, +stbd/−port)", "Interaction",
                              "Angle (°)", "Feature", "Check", "Notes"),
                             hazard_rows, raw=True))
 

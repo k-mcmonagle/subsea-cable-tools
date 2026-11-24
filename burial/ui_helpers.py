@@ -402,12 +402,21 @@ class ContentSizedColumn(QObject):
             self._timer.start(0)
 
 
+def risk_colors(scale):
+    from .risk_scale import DEFAULT_SCALE
+
+    return {key: (qcolor(f"risk_{key or 'unassigned'}") if DEFAULT_SCALE.colors.get(key) == color
+                  else QColor(color))
+            for key, color in scale.colors.items()}
+
+
 def _column_labels(table) -> List[str]:
-    labels = []
-    for column in range(table.columnCount()):
-        item = table.horizontalHeaderItem(column)
-        labels.append(item.text() if item is not None else f"Column {column + 1}")
-    return labels
+    model = table.model()
+    if hasattr(table, "horizontalHeaderItem"):
+        labels = [table.horizontalHeaderItem(i) for i in range(model.columnCount())]
+        return [item.text() if item is not None else f"Column {i + 1}" for i, item in enumerate(labels)]
+    return [str(model.headerData(column, Qt.Orientation.Horizontal) or f"Column {column + 1}")
+            for column in range(model.columnCount())]
 
 
 class _ColumnMenu(QObject):
@@ -454,7 +463,7 @@ class _ColumnMenu(QObject):
         if not self._alive():
             return
         table = self._table
-        hidden = [self._labels[column] for column in range(table.columnCount())
+        hidden = [self._labels[column] for column in range(table.model().columnCount())
                   if column < len(self._labels)
                   and table.isColumnHidden(column)]
         QSettings().setValue(self._settings_key, json.dumps(
@@ -463,14 +472,14 @@ class _ColumnMenu(QObject):
     def show_all(self) -> None:
         if not self._alive():
             return
-        for column in range(self._table.columnCount()):
+        for column in range(self._table.model().columnCount()):
             self._table.setColumnHidden(column, False)
         self.save()
 
     def reset(self) -> None:
         if not self._alive():
             return
-        for column in range(self._table.columnCount()):
+        for column in range(self._table.model().columnCount()):
             self._table.setColumnHidden(
                 column, column not in self._always_visible
                 and self._label(column) in self._default_hidden)
@@ -485,7 +494,7 @@ class _ColumnMenu(QObject):
         # No parent: the menu is a one-shot local. A table-parented menu
         # would outlive every right-click and pile up on the table.
         menu = QMenu()
-        for column in range(table.columnCount()):
+        for column in range(table.model().columnCount()):
             action = menu.addAction(self._label(column))
             action.setCheckable(True)
             action.setChecked(not table.isColumnHidden(column))
@@ -511,7 +520,7 @@ class _ColumnMenu(QObject):
                 column = int(data)
             except (TypeError, ValueError):
                 return
-            if 0 <= column < table.columnCount():
+            if 0 <= column < table.model().columnCount():
                 table.setColumnHidden(column, not table.isColumnHidden(column))
                 self.save()
 

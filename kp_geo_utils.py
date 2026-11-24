@@ -1259,6 +1259,32 @@ class RouteFrame:
             yield (p1, p2, self.start_kp_km + offset / 1000.0,
                    self.start_kp_km + (offset + length) / 1000.0)
 
+    def kp_ranges_in_rect(self, rect):
+        """Chainage intervals inside a rectangle in the frame CRS, in route order."""
+        self._ensure_kp_index()
+        ranges = []
+        for index in sorted(self._kp_index.intersects(rect)):
+            p, q, length, offset = self._segs[index]
+            lo, hi = 0.0, 1.0
+            for start, delta, lower, upper in (
+                    (p.x(), q.x() - p.x(), rect.xMinimum(), rect.xMaximum()),
+                    (p.y(), q.y() - p.y(), rect.yMinimum(), rect.yMaximum())):
+                if delta:
+                    a, b = (lower - start) / delta, (upper - start) / delta
+                    lo, hi = max(lo, min(a, b)), min(hi, max(a, b))
+                elif not lower <= start <= upper:
+                    hi = -1
+                    break
+            if hi < lo:
+                continue
+            a = self.start_kp_km + (offset + lo * length) / 1000
+            b = self.start_kp_km + (offset + hi * length) / 1000
+            if ranges and a <= ranges[-1][1] + 1e-10:
+                ranges[-1] = (ranges[-1][0], b)
+            else:
+                ranges.append((a, b))
+        return ranges
+
     def point_at_kp(self, kp_km: float, *, clamp: bool = False) -> Optional[QgsPointXY]:
         try:
             target_m = (float(kp_km) - self._start_kp_km) * 1000.0

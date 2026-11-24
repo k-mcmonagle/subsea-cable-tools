@@ -862,10 +862,58 @@ def test_save_copy() -> bool:
     return _result("duplicate a register with its images; never overwrites", ok)
 
 
+def test_merge_sets():
+    store = CommentStore.create(os.path.join(_folder(), "merge.gpkg"))
+    try:
+        a = store.list_sets()[0]["set_id"]
+        b = store.create_set("Second", priorities=["Check"])["set_id"]
+        ids = [store.add_comment(s, _point(text="Same text"))["comment_id"] for s in (a, b)]
+        store.add_reply(ids[0], "Reviewer", "Reviewed")
+        image = store.add_image_bytes(ids[0], b"attachment bytes", "panel.png")
+        store.set_map_image(ids[0], image["attachment_id"])
+        missing = store.add_image_bytes(ids[1], b"other bytes", "other.png")
+        os.remove(store.attachment_path(missing))
+        original_files = set(os.listdir(store.attachments_dir))
+        try:
+            store.merge_sets(a, b, "Combined")
+            raise AssertionError("Merge accepted a missing source attachment")
+        except CommentStoreError:
+            assert len(store.list_sets()) == 2 and set(os.listdir(store.attachments_dir)) == original_files
+        store.delete_attachment(missing["attachment_id"])
+        first_field = model.CustomField("field-a", "Inspection", model.FIELD_TEXT)
+        second_field = model.CustomField("field-b", "Inspection", model.FIELD_NUMBER)
+        store.save_fields(a, [first_field])
+        store.save_fields(b, [second_field])
+        try:
+            store.merge_sets(a, b, "Combined")
+            raise AssertionError("Merge accepted conflicting field types")
+        except CommentStoreError:
+            assert len(store.list_sets()) == 2
+        second_field.kind = model.FIELD_TEXT
+        store.save_fields(b, [second_field])
+        for cid, field, value in zip(ids, (first_field, second_field), ("Checked", "Pending")):
+            store.update_comment(cid, {"custom_json": model.dump_custom({field.field_id: value})})
+        merged = store.merge_sets(a, b, "Combined")
+        rows = store.list_comments(merged["set_id"])
+        assert len(rows) == 2 and [c["ref_no"] for c in rows] == [1, 2]
+        assert all(c["comment_id"] not in ids for c in rows)
+        assert len(store.list_replies(rows[0]["comment_id"])) == 1
+        assert rows[0]["map_image"] and rows[0]["map_image"] != image["file_name"]
+        fields = store.list_fields(merged["set_id"])
+        assert len(fields) == 1
+        assert [model.load_custom(row)[fields[0].field_id] for row in rows] == ["Checked", "Pending"]
+        assert "Check" in store.priorities_of(merged)
+        assert [store.get_comment(cid)["set_id"] for cid in ids] == [a, b]
+        return _result("merge preserves originals and rolls back an incomplete image copy", True)
+    finally:
+        store.close()
+
+
 def run_all() -> list:
     return [
         test_general_comments(),
         test_copy_move_duplicate(),
+        test_merge_sets(),
         test_renumber_by_kp(),
         test_save_copy(),
         test_gpkg_structure_and_geometry(),

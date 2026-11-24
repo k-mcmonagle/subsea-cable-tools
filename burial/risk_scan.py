@@ -6,8 +6,8 @@ each check scans one registered input layer for features on or near the
 route and yields one hazard row per interaction —
 
 - point features: nearest approach KP + geodesic offset;
-- line features: one hazard per route crossing (offset 0, crossing angle)
-  or the nearest approach when not crossing;
+- line features: one hazard per crossing or continuous overlap with the
+  route, or the nearest approach within a positive search distance;
 - polygon features: the KP range where the route runs inside the polygon,
   or the nearest approach when not crossing.
 
@@ -58,6 +58,7 @@ from ..workbench import rules_inputs as ri
 from ..workbench.rules_inputs import _filter_expression, _load_features_wgs84
 from ..workbench.rules_engine import Interval
 from . import attribute_rules, kp_table, risk
+from .risk_scale import DEFAULT_SCALE
 
 WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
 
@@ -163,11 +164,10 @@ def _side_sign(route, distance, kp: float, route_pt: Optional[QgsPointXY],
 
 
 def _geometry_parts(geom: QgsGeometry) -> List[QgsGeometry]:
+    if geom.isEmpty():
+        return []
     if geom.isMultipart():
-        try:
-            return [QgsGeometry(part) for part in geom.asGeometryCollection()]
-        except Exception:
-            return [geom]
+        return [simple for part in geom.asGeometryCollection() for simple in _geometry_parts(part)]
     return [geom]
 
 
@@ -203,18 +203,45 @@ def _dedupe_points(points: List[QgsPointXY], tol_deg: float = 1e-7
     return unique
 
 
-def _crossing_points(feat_geom: QgsGeometry, route_geom: QgsGeometry
-                     ) -> List[QgsPointXY]:
-    inter = feat_geom.intersection(route_geom)
-    if inter is None or inter.isEmpty():
-        return []
-    points = []
+def _contact_parts(intersection, is_line):
+    """Contacts and ranges with stable review keys for the scanned feature."""
+    parts = _geometry_parts(intersection)
+    if not is_line:
+        # Polygon ranges and vertex touches already used the intersection
+        # part number as their review key, including in mixed collections.
+        return ([(i, QgsPointXY(part.constGet())) for i, part in enumerate(parts)
+                 if int(part.type()) == int(GEOMETRY_POINT)],
+                [(i, part) for i, part in enumerate(parts) if int(part.type()) == int(GEOMETRY_LINE)])
+    points, lines = [], []
+    for part in parts:
+        if int(part.type()) == int(GEOMETRY_POINT):
+            points.extend(QgsPointXY(v) for v in part.vertices())
+        elif int(part.type()) == int(GEOMETRY_LINE):
+            lines.append(part)
+    points = _dedupe_points(points)
+    contacts = list(enumerate(points))
+    if points and lines:
+        # Previous versions numbered every intersection vertex, including
+        # vertices on overlaps. Keep the original IDs of isolated crossings.
+        old_vertices = _dedupe_points([QgsPointXY(v) for v in intersection.vertices()])
+        old_ids = {(v.x(), v.y()): i for i, v in enumerate(old_vertices)}
+        contacts = [(old_ids.get((v.x(), v.y()), f"contact{i}"), v) for i, v in contacts]
+    if len(lines) > 1:
+        merged = QgsGeometry.collectGeometry(lines).mergeLines()
+        if not merged.isEmpty():
+            lines = _geometry_parts(merged)
+    # A continuous overlap gets its own ID, separate from the old vertex findings.
+    return contacts, [(f"overlap{i}", line) for i, line in enumerate(lines)]
+
+
+def _search_distance(config, name):
     try:
-        for vertex in inter.vertices():
-            points.append(QgsPointXY(vertex.x(), vertex.y()))
-    except Exception:
+        radius = float(config.get("distance_m", 0))
+        if math.isfinite(radius) and radius >= 0:
+            return radius
+    except (TypeError, ValueError):
         pass
-    return _dedupe_points(points)
+    raise RiskScanError(f"Check '{name}' needs a search distance of zero or more metres.")
 
 
 def _nearest_approach(route, route_geom: QgsGeometry, feat_geom: QgsGeometry,
@@ -280,10 +307,7 @@ def snapshot_check_features(check_row: Dict, layer, route_geom: QgsGeometry,
     """
     config = risk.check_config(check_row)
     check_name = check_row.get("name") or "check"
-    search_m = float(config.get("distance_m") or 0.0)
-    if search_m <= 0:
-        raise RiskScanError(
-            f"Check '{check_name}' has no search distance configured.")
+    search_m = _search_distance(config, check_name)
     if layer is None or not layer.isValid():
         raise RiskScanError(
             f"Check '{check_name}': the input layer could not be opened.")
@@ -437,7 +461,7 @@ def snapshot_kp_table(check_row: Dict, layer,
 
 
 def scan_kp_table(plan_id: str, check_row: Dict, entries: List[Dict], route,
-                  scope: Optional[Interval] = None
+                  scope: Optional[Interval] = None, scale=DEFAULT_SCALE
                   ) -> Tuple[List[Dict], List[str]]:
     """Hazards from a snapshotted KP-range table (thread-safe).
 
@@ -468,7 +492,7 @@ def scan_kp_table(plan_id: str, check_row: Dict, entries: List[Dict], route,
             break
         lo, hi = max(lo, lo_bound), min(hi, hi_bound)
         auto = risk.evaluate_risk(config, None, entry["attrs"],
-                                  entry.get("expression_hits"))
+                                  entry.get("expression_hits"), scale=scale)
         mid = route.point_at_kp((lo + hi) / 2.0, clamp=True)
         attributes = dict(entry["attrs"])
         attributes["Quoted KP"] = entry["quoted"]
@@ -481,7 +505,7 @@ def scan_kp_table(plan_id: str, check_row: Dict, entries: List[Dict], route,
         warnings.append(
             f"Check '{check_name}': none of its {len(entries)} range(s) "
             "overlap the plan scope — check the KP unit and reference RPL.")
-    return risk.sort_hazards(hazards), warnings
+    return risk.sort_hazards(hazards, scale), warnings
 
 
 def scan_snapshot(plan_id: str, check_row: Dict, features: List[Dict],
@@ -489,7 +513,7 @@ def scan_snapshot(plan_id: str, check_row: Dict, features: List[Dict],
                   direction: int = 1,
                   progress: Optional[Callable[[str], None]] = None,
                   cancel: Optional[Callable[[], bool]] = None,
-                  route_geom: Optional[QgsGeometry] = None
+                  route_geom: Optional[QgsGeometry] = None, scale=DEFAULT_SCALE
                   ) -> Tuple[List[Dict], List[str]]:
     """Run one features check over snapshotted features (thread-safe).
 
@@ -500,12 +524,14 @@ def scan_snapshot(plan_id: str, check_row: Dict, features: List[Dict],
     config = risk.check_config(check_row)
     check_id = str(check_row.get("check_id") or "")
     check_name = check_row.get("name") or "check"
-    search_m = float(config.get("distance_m") or 0.0)
+    search_m = _search_distance(config, check_name)
     scaled_cache: Dict = {}
 
     if route_geom is None:
         route_geom = QgsGeometry.collectGeometry(
             [QgsGeometry(g) for g in route.geometries])
+    route_engine = QgsGeometry.createGeometryEngine(route_geom.constGet())
+    route_engine.prepareGeometry()
     scope_lo = scope_hi = None
     if scope is not None:
         scope_lo = min(scope.start_km, scope.end_km)
@@ -519,15 +545,23 @@ def scan_snapshot(plan_id: str, check_row: Dict, features: List[Dict],
     hazards: List[Dict] = []
     warnings: List[str] = []
 
-    def add(entry: Dict, part: int, kp: float, end_kp: Optional[float],
+    capped = False
+
+    def at_limit():
+        nonlocal capped
+        capped = len(hazards) >= MAX_HAZARDS_PER_CHECK
+        return capped
+
+    def add(entry: Dict, part, kp: float, end_kp: Optional[float],
             offset_m: float, crossing: bool, angle: Optional[float],
-            lat: Optional[float], lon: Optional[float]) -> None:
+            lat: Optional[float], lon: Optional[float], *, on_route=False) -> None:
         lo = min(kp, end_kp if end_kp is not None else kp)
         hi = max(kp, end_kp if end_kp is not None else kp)
         if not in_scope(lo, hi):
             return
         auto = risk.evaluate_risk(config, abs(offset_m), entry["attrs"],
-                                  entry.get("expression_hits"))
+                                  entry.get("expression_hits"),
+                                  intersects=on_route or crossing, scale=scale)
         hazards.append(risk.new_hazard_row(
             plan_id, check_id, f"{entry['fid']}#{part}", entry["label"],
             lo, hi, offset_m, crossing, angle, lat, lon, auto,
@@ -536,12 +570,7 @@ def scan_snapshot(plan_id: str, check_row: Dict, features: List[Dict],
     for done, entry in enumerate(features):
         if cancel is not None and done % 50 == 0 and cancel():
             return hazards, warnings
-        if len(hazards) >= MAX_HAZARDS_PER_CHECK:
-            warnings.append(
-                f"Check '{check_name}' hit the {MAX_HAZARDS_PER_CHECK}-"
-                f"hazard cap with {len(features) - done} feature(s) left "
-                "unscanned — tighten the search distance or add a feature "
-                "filter.")
+        if at_limit():
             break
         if progress is not None and done % 200 == 0:
             progress(f"{check_name}: {done}/{len(features)} features…")
@@ -555,85 +584,75 @@ def scan_snapshot(plan_id: str, check_row: Dict, features: List[Dict],
             except Exception:
                 points = []
             for part, point in enumerate(points):
-                hit = route.kp_at_point(point)
-                if hit.snapped_xy is None or hit.dcc_m > search_m:
+                if at_limit():
+                    break
+                point_geom = QgsGeometry.fromPointXY(point)
+                on_route = route_engine.intersects(point_geom.constGet())
+                if search_m == 0 and not on_route:
                     continue
-                sign = _side_sign(route, distance, hit.kp_km,
-                                  hit.snapped_xy, point, direction)
-                add(entry, part, hit.kp_km, None, sign * hit.dcc_m,
-                    False, None, point.y(), point.x())
+                hit = route.kp_at_point(point)
+                if hit.snapped_xy is None or (not on_route and hit.dcc_m > search_m):
+                    continue
+                offset = 0.0 if on_route else hit.dcc_m * _side_sign(
+                    route, distance, hit.kp_km, hit.snapped_xy, point, direction)
+                add(entry, part, hit.kp_km, None, offset, False, None,
+                    point.y(), point.x(), on_route=on_route)
             continue
 
-        if geom_type == int(GEOMETRY_LINE):
-            crossings = _crossing_points(geom, route_geom)
-            if crossings:
-                for part, point in enumerate(crossings):
+        if geom_type in (int(GEOMETRY_LINE), int(GEOMETRY_POLYGON)):
+            if route_engine.intersects(geom.constGet()):
+                # Keep the previous operand order for ordinary crossings so
+                # their feature-part IDs still match the engineer's reviews.
+                is_line = geom_type == int(GEOMETRY_LINE)
+                inter = geom.intersection(route_geom) if is_line else route_geom.intersection(geom)
+                contacts, overlaps = _contact_parts(inter, is_line)
+                for part, point in contacts:
+                    if at_limit():
+                        break
                     hit = route.kp_at_point(point)
                     if hit.snapped_xy is None:
                         continue
                     angle = None
-                    route_bearing = _route_bearing(route, distance, hit.kp_km)
-                    feat_bearing = _feature_bearing(geom, point, distance)
-                    if route_bearing is not None and feat_bearing is not None:
-                        angle = round(_acute_angle_deg(route_bearing,
-                                                       feat_bearing), 1)
+                    if is_line:
+                        route_bearing = _route_bearing(route, distance, hit.kp_km)
+                        feat_bearing = _feature_bearing(geom, point, distance)
+                        if route_bearing is not None and feat_bearing is not None:
+                            angle = round(_acute_angle_deg(route_bearing, feat_bearing), 1)
                     add(entry, part, hit.kp_km, None, 0.0, True, angle,
                         point.y(), point.x())
-                continue
-            near = _nearest_approach(route, route_geom, geom, distance,
-                                     scaled_cache)
-            if near is not None and near[1] <= search_m:
-                kp, offset, route_pt, feat_pt = near
-                sign = _side_sign(route, distance, kp, route_pt, feat_pt,
-                                  direction)
-                add(entry, 0, kp, None, sign * offset, False, None,
-                    feat_pt.y(), feat_pt.x())
-            continue
-
-        if geom_type == int(GEOMETRY_POLYGON):
-            if geom.intersects(route_geom):
-                inside = route_geom.intersection(geom)
-                parts = _geometry_parts(inside) if inside is not None else []
-                emitted = 0
-                for part_geom in parts:
-                    if part_geom is None or part_geom.isEmpty():
+                for part, line in overlaps:
+                    if at_limit():
+                        break
+                    curve = line.constGet()
+                    ends = [route.kp_at_point(QgsPointXY(p))
+                            for p in (curve.startPoint(), curve.endPoint())]
+                    if any(hit.snapped_xy is None for hit in ends):
                         continue
-                    points = []
-                    try:
-                        points = [QgsPointXY(v.x(), v.y())
-                                  for v in part_geom.vertices()]
-                    except Exception:
-                        points = []
-                    if not points:
+                    lo, hi = sorted(hit.kp_km for hit in ends)
+                    if not in_scope(lo, hi):
                         continue
-                    kp_values = []
-                    for point in (points[0], points[-1]):
-                        hit = route.kp_at_point(point)
-                        if hit.snapped_xy is not None:
-                            kp_values.append(hit.kp_km)
-                    if not kp_values:
-                        continue
-                    lo, hi = min(kp_values), max(kp_values)
+                    if scope_lo is not None:
+                        lo, hi = max(lo, scope_lo), min(hi, scope_hi)
                     mid = route.point_at_kp((lo + hi) / 2.0, clamp=True)
-                    add(entry, emitted, lo, hi, 0.0, True, None,
+                    add(entry, part, lo, hi, 0.0, True, None,
                         mid.y() if mid else None, mid.x() if mid else None)
-                    emitted += 1
-                continue
-            near = _nearest_approach(route, route_geom, geom, distance,
-                                     scaled_cache)
-            if near is not None and near[1] <= search_m:
-                kp, offset, route_pt, feat_pt = near
-                sign = _side_sign(route, distance, kp, route_pt, feat_pt,
-                                  direction)
-                add(entry, 0, kp, None, sign * offset, False, None,
-                    feat_pt.y(), feat_pt.x())
+            elif search_m > 0:
+                near = _nearest_approach(route, route_geom, geom, distance, scaled_cache)
+                if near is not None and near[1] <= search_m:
+                    kp, offset, route_pt, feat_pt = near
+                    sign = _side_sign(route, distance, kp, route_pt, feat_pt, direction)
+                    add(entry, 0, kp, None, sign * offset, False, None,
+                        feat_pt.y(), feat_pt.x())
             continue
 
         warnings.append(
             f"Check '{check_name}': feature {entry['fid']} has an "
             "unsupported geometry type and was skipped.")
 
-    return risk.sort_hazards(hazards), warnings
+    if capped:
+        warnings.append(f"Check '{check_name}' reached the {MAX_HAZARDS_PER_CHECK}-hazard cap. "
+                        "Additional candidates remain. Narrow the search or add a feature filter.")
+    return risk.sort_hazards(hazards, scale), warnings
 
 
 def _route_vertices(route) -> List[QgsPointXY]:
@@ -654,7 +673,7 @@ def _route_vertices(route) -> List[QgsPointXY]:
 
 def scan_route_turns(plan_id: str, check_row: Dict, route, distance,
                      scope: Optional[Interval] = None, direction: int = 1,
-                     cancel: Optional[Callable[[], bool]] = None
+                     cancel: Optional[Callable[[], bool]] = None, scale=DEFAULT_SCALE
                      ) -> Tuple[List[Dict], List[str]]:
     """Alter-course scan over the route geometry (thread-safe).
 
@@ -722,7 +741,7 @@ def scan_route_turns(plan_id: str, check_row: Dict, route, distance,
             continue
         attributes = {TURN_SIGNED_ATTR: round(turn, 2),
                       TURN_ABS_ATTR: round(turn_abs, 2)}
-        auto = risk.evaluate_risk(config, None, attributes)
+        auto = risk.evaluate_risk(config, None, attributes, scale=scale)
         if not auto:
             continue  # compliant A/C — not a hazard
         side = "stbd" if turn >= 0 else "port"
@@ -730,24 +749,24 @@ def scan_route_turns(plan_id: str, check_row: Dict, route, distance,
             plan_id, check_id, f"ac#{i}",
             f"A/C {turn_abs:.1f}° {side}", kp, None, 0.0, False, None,
             p_curr.y(), p_curr.x(), auto, attributes))
-    return risk.sort_hazards(hazards), warnings
+    return risk.sort_hazards(hazards, scale), warnings
 
 
 def scan_check(plan_id: str, check_row: Dict, layer, route, distance,
                scope: Optional[Interval] = None,
                project: Optional[QgsProject] = None,
                progress: Optional[Callable[[str], None]] = None,
-               direction: int = 1) -> Tuple[List[Dict], List[str]]:
+               direction: int = 1, scale=DEFAULT_SCALE) -> Tuple[List[Dict], List[str]]:
     """Synchronous scan of one check (used by tests and small runs)."""
     config = risk.check_config(check_row)
     if check_kind(config) == CHECK_KIND_ROUTE_TURNS:
         return scan_route_turns(plan_id, check_row, route, distance,
-                                scope=scope, direction=direction)
+                                scope=scope, direction=direction, scale=scale)
     route_geom = QgsGeometry.collectGeometry(
         [QgsGeometry(g) for g in route.geometries])
     features = snapshot_check_features(check_row, layer, route_geom, project)
     return scan_snapshot(plan_id, check_row, features, route, distance,
-                         scope=scope, direction=direction, progress=progress)
+                         scope=scope, direction=direction, progress=progress, scale=scale)
 
 
 # ---------------------------------------------------------------------------
@@ -771,12 +790,13 @@ class RiskScanTask(QgsTask):
                  scope: Optional[Interval], direction: int,
                  on_finished: Callable[["RiskScanTask"], None],
                  description: str = "Burial Planner risk scan",
-                 start_kp_km: float = 0.0, kp_mode=("", "")):
+                 start_kp_km: float = 0.0, kp_mode=("", ""), scale=DEFAULT_SCALE):
         super().__init__(description, _CAN_CANCEL)
         self.plan_id = plan_id
         self._start_kp_km = float(start_kp_km or 0.0)
         self._kp_mode = tuple(kp_mode or ("", ""))
         self.jobs = jobs
+        self.scale = scale
         self._route_geoms = route_geoms
         self._transform_context = transform_context
         self.scope = scope
@@ -816,17 +836,17 @@ class RiskScanTask(QgsTask):
                     found, warnings = scan_route_turns(
                         self.plan_id, check_row, route, distance,
                         scope=self.scope, direction=self.direction,
-                        cancel=self.isCanceled)
+                        cancel=self.isCanceled, scale=self.scale)
                 elif check_kind(config) == CHECK_KIND_KP_TABLE:
                     found, warnings = scan_kp_table(
                         self.plan_id, check_row, features or [], route,
-                        scope=self.scope)
+                        scope=self.scope, scale=self.scale)
                 else:
                     found, warnings = scan_snapshot(
                         self.plan_id, check_row, features or [], route,
                         distance, scope=self.scope, direction=self.direction,
                         progress=self.progressMessage.emit,
-                        cancel=self.isCanceled, route_geom=route_geom)
+                        cancel=self.isCanceled, route_geom=route_geom, scale=self.scale)
                 if self.isCanceled():
                     self.cancelled = True
                     return False

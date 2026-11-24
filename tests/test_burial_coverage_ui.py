@@ -134,6 +134,11 @@ def test_risk_total_unique_disabled_and_unscanned_checks():
         model.risk_checks[1]["enabled"] = 0
         tab.refresh()
         assert tab.check_table.item(0, 4).text() == "5.000 km · 50.0%"
+        model.hazards[0].update(kp=14, end_kp=14)
+        tab.refresh()
+        assert tab.check_table.item(0, 3).text() == "1 · 0.000 km · 0.0%"
+        assert tab.check_table.item(0, 4).text() == "0.000 km · 0.0%"
+        assert tab.check_table.item(0, 2).data(Qt.ItemDataRole.UserRole)[1]
     finally:
         tab.deleteLater()
 

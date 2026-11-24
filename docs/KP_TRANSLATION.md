@@ -59,6 +59,16 @@ Multipart inputs must use explicit KP fields because their endpoint order may be
 Numeric input is just as well defined as geometry input when its KP basis is known: the old RPL supplies the
 positions. Any rounding in the delivered KPs remains a limit on the original boundary positions.
 
+## Changing the route in Burial Planner
+
+In **Inputs → Route (RPL)**, select the Workbench revision or project line and choose **Set route**. A newer Workbench revision is available for review until you choose to adopt it. For a plan with saved KPs, the preview shows the new extent and any ranges that need checking.
+
+- **Translate KPs** matches positions along the shared parts of the routes. On a diversion, inspect the flagged stretches. For polygon-derived BAS sections, check the new soil crossings before applying any replacement rows.
+- **Keep KP numbers** retains the recorded chainages and locates events on the selected line. The preview identifies saved values beyond the new route extent.
+- **Cancel** leaves the plan on its existing reference.
+
+Use **Review & Export** to roll back to just before the change. Keep the original RPL revision or line layer when you need to reproduce the earlier map. If a source is overwritten and the plan reopens, the planner can detect a change against its saved geometry fingerprint. Translating the old KPs then requires the original geometry. For older plans, the first load with this version establishes the fingerprint.
+
 ## Calculation and review
 
 Each boundary follows **old KP → position on old RPL → nearest position on new RPL → new KP** using

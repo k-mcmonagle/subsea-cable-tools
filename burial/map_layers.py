@@ -34,6 +34,8 @@ from ..qgis_compat import WKB_LINESTRING, WKB_POINT
 from ..workbench.project_layers import layer_name_from_source, normalised_path
 from . import events as ev
 from . import schema
+from . import risk
+from .risk_scale import DEFAULT_SCALE, RiskScale
 from . import tools as tools_mod
 
 BURIAL_GROUP = "Burial Planner"
@@ -488,6 +490,13 @@ def route_geometry_fingerprint(route) -> str:
 ALL_PLAN_LAYER_PARTS = ("sections", "events", "hazards", "ground", "bas")
 
 
+def point_at_saved_kp(route, kp: float):
+    """Allow for rounding to displayed KP precision at the ends of a route."""
+    if route is None or kp < route.start_kp_km - 0.0005 or kp > route.end_kp_km + 0.0005:
+        return None
+    return route.point_at_kp(kp, clamp=True)
+
+
 def _section_wkt(route, start_kp: float, end_kp: float,
                  cache: Optional[Dict]) -> Optional[str]:
     """Route-slice WKT for a section, memoised across refreshes.
@@ -571,7 +580,7 @@ def write_plan_layers(store, plan: Dict, sections: Sequence[Dict],
 
     event_rows: List[Dict] = []
     for event in events if "events" in wanted else []:
-        point = route.point_at_kp(float(event.get("kp") or 0.0), clamp=True) if route else None
+        point = point_at_saved_kp(route, float(event.get("kp") or 0.0))
         if point is None:
             continue
         event_rows.append({
@@ -600,6 +609,7 @@ def write_plan_layers(store, plan: Dict, sections: Sequence[Dict],
                                   WKB_POINT, event_rows)
 
     if hazards is not None and "hazards" in wanted:
+        scale = RiskScale.from_plan(plan)
         check_names = {str(c.get("check_id") or ""): (c.get("name") or "")
                        for c in (risk_checks or [])}
         hazard_rows: List[Dict] = []
@@ -611,7 +621,7 @@ def write_plan_layers(store, plan: Dict, sections: Sequence[Dict],
                     end = float(hazard.get("end_kp") or start)
                 except (TypeError, ValueError):
                     continue
-                point = route.point_at_kp((start + end) / 2.0, clamp=True)
+                point = point_at_saved_kp(route, (start + end) / 2.0)
                 if point is None:
                     continue
                 lat, lon = point.y(), point.x()
@@ -625,10 +635,12 @@ def write_plan_layers(store, plan: Dict, sections: Sequence[Dict],
                                          "manual"),
                 "kp": hazard.get("kp"),
                 "end_kp": hazard.get("end_kp"),
-                "offset_m": hazard.get("offset_m"),
+                "offset_m": risk.measured_offset(hazard),
                 "crossing": int(hazard.get("crossing") or 0),
                 "crossing_angle_deg": hazard.get("crossing_angle_deg"),
                 "risk": hazard.get("risk") or "",
+                "risk_label": scale.label(hazard.get("risk")),
+                "risk_score": scale.scores.get(hazard.get("risk")),
                 "status": hazard.get("status") or "",
                 "source": hazard.get("source") or "",
                 "notes": hazard.get("notes") or "",
@@ -861,15 +873,10 @@ def apply_events_style(layer) -> None:
     layer.triggerRepaint()
 
 
-_RISK_COLORS = {
-    schema.RISK_HIGH: "#d62728",
-    schema.RISK_MEDIUM: "#ff8c00",
-    schema.RISK_LOW: "#e0b000",
-    schema.RISK_UNASSIGNED: "#909090",
-}
+_RISK_SCALE_PROPERTY = "SubseaCableTools/burialRiskScale"
 
 
-def apply_hazards_style(layer) -> None:
+def apply_hazards_style(layer, scale=None) -> None:
     """Risk-coloured markers; crossings ring-outlined; labelled by name."""
     try:
         from qgis.core import (
@@ -883,18 +890,25 @@ def apply_hazards_style(layer) -> None:
         return
     if layer is None or not layer.isValid():
         return
+    if scale is None:
+        stored = layer.customProperty(_RISK_SCALE_PROPERTY, "")
+        try:
+            scale = RiskScale.from_settings({"risk_scale": json.loads(stored)}) if stored else DEFAULT_SCALE
+        except (TypeError, ValueError):
+            scale = DEFAULT_SCALE
     root = QgsRuleBasedRenderer.Rule(None)
-    for level, color in _RISK_COLORS.items():
+    for level in (*reversed(scale.levels), ""):
         symbol = QgsMarkerSymbol.createSimple({
-            "name": "circle", "color": color,
+            "name": "circle", "color": scale.colors[level],
             "outline_color": "#40282828", "outline_width": "0.3",
             "size": "3.0",
         })
         child = QgsRuleBasedRenderer.Rule(symbol)
-        child.setLabel(schema.RISK_LABELS.get(level, level or "Unassigned"))
+        child.setLabel(scale.caption(level))
         child.setFilterExpression(f"\"risk\" = '{level}'")
         root.appendChild(child)
     layer.setRenderer(QgsRuleBasedRenderer(root))
+    layer.setCustomProperty(_RISK_SCALE_PROPERTY, json.dumps(scale.rows()))
     try:
         settings = QgsPalLayerSettings()
         settings.fieldName = "\"label\" || ' KP ' || format_number(\"kp\", 3)"
@@ -1345,11 +1359,15 @@ def ensure_plan_layers(project: Optional[QgsProject], gpkg_path: str, plan: Dict
                            apply_events_style,
                            expected_fields=schema.EVENTS_LAYER_FIELDS,
                            reload="events" in wanted, plan=plan)
-    _ensure_layer(project, gpkg_path,
-                  schema.hazards_layer_name(*base_args),
-                  apply_hazards_style,
-                  expected_fields=schema.HAZARDS_LAYER_FIELDS,
-                  reload="hazards" in wanted, plan=plan)
+    scale = RiskScale.from_plan(plan)
+    hazards = _ensure_layer(project, gpkg_path,
+                            schema.hazards_layer_name(*base_args),
+                            lambda layer: apply_hazards_style(layer, scale),
+                            expected_fields=schema.HAZARDS_LAYER_FIELDS,
+                            reload="hazards" in wanted, plan=plan)
+    if hazards is not None and hazards.customProperty(_RISK_SCALE_PROPERTY, "") != json.dumps(scale.rows()):
+        apply_hazards_style(hazards, scale)
+        hazards.triggerRepaint()
     _ensure_layer(project, gpkg_path,
                   schema.ground_layer_name(*base_args),
                   apply_ground_style,

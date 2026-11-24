@@ -32,6 +32,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Improved
 
+- **Burial Planner** now previews how saved KPs will change for Workbench revisions and project lines, and rollback restores the previous route reference. Existing risk scans and installation paths may need one rerun to verify their route geometry.
+- **Burial Planner BAS** can draft sections from route intersections with soil polygons and zoom to a section from its table row.
+- **Burial Planner Risk Profile** supports zero-distance checks for on-route points, crossings and overlaps. Review line overlaps previously recorded as individual vertices when rerunning those checks.
+- **Burial Planner hazard register** adds search, column filters, numeric sorting and configurable scored risk levels. Coverage uses each hazard’s recorded KP range, so a point contributes zero length.
+- **KP Mouse Tool** can display temporary, zoom-aware KP markers and leaders and shows the active RPL in its status bar.
+- **Route Comments** scopes recent registers to the current workspace, updates map highlights with layer visibility, and can merge two sets into a new set with their comments and attachments.
+
 - **Route Comments — KP editing:** KP values use 3 decimal places (1 m), and table KPs can be edited with route validation and an old/new confirmation; derived nearest KPs open coordinate editing instead. New-comment forms, position dialogs and table KP edits preview unsaved points and ranges in blue on the map, with **Zoom to preview** in the dialogs; untouched position precision, existing registers and saved table layouts are preserved.
 
 - **Route Comments:** edit an existing comment's KP, KP range or map coordinates through **Details ▸ Edit position…** or the table's right-click menu. Saving updates its map geometry and labels automatically; map locations also recalculate their nearest KP and distance off route. Edits keep the saved KP basis, untouched coordinate precision, IDs, replies and images, with no register schema changes or new dependencies. Changed or unavailable routes and concurrent comment edits are checked before saving.

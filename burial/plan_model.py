@@ -39,6 +39,7 @@ from . import (analysis_state, change_log, events as ev, generation,
                target_depth, tools)
 from .analysis_task import build_route_frame
 from .profile_data import PlanProfile
+from .risk_scale import DEFAULT_SCALE, RiskScale
 from .store import BurialStore
 
 
@@ -449,12 +450,14 @@ class PlanModel(QObject):
         out: List[Tuple[str, str]] = []
         if self.route_notice:
             out.append((self.route_notice, "warn"))
+        if self.route_baseline_changed():
+            out.append(("The source geometry or KP datum has changed since this plan's route "
+                        "was accepted. Choose Set route to review the saved KPs.", "warn"))
         if self.newer_rpl:
             out.append((
                 f"A newer revision of this RPL is in the Workbench "
                 f"({self.newer_rpl.get('rev_label') or self.newer_rpl.get('name') or ''}). "
-                "Select it and Set route to move the plan onto it — KPs are "
-                "re-referenced so everything keeps its seabed position.", "warn"))
+                "Select it and choose Set route to review the change.", "warn"))
         check = getattr(self, "kp_check", None)
         if check is not None and check.level != "ok":
             out.append((check.summary(), check.level))
@@ -527,7 +530,8 @@ class PlanModel(QObject):
         kp_mode, grid = mode if mode is not None else self.kp_mode(row)
         params["kp_datum"] = {"start_kp": round(float(start_kp), 6),
                               "rpl_id": self.resolved_rpl_id or row.get("rpl_id") or "",
-                              "mode": kp_mode, "grid_crs": grid}
+                              "mode": kp_mode, "grid_crs": grid,
+                              "route_geometry": self.route_geometry_fingerprint()}
         row["params_json"] = json.dumps(params)
         return row
 
@@ -541,6 +545,8 @@ class PlanModel(QObject):
         from .kp_rereference import KpMap
         if self.route is None:
             raise ValueError("Set the plan route first.")
+        if self.route_baseline_changed():
+            raise ValueError("Review the changed route using Set route before changing its KP distance.")
         old_route = self.route
         old_plan = dict(self.plan)
         self.plan = self._set_kp_datum(self.plan, old_route.start_kp_km, (mode, grid_crs))
@@ -555,15 +561,20 @@ class PlanModel(QObject):
         kp_map = KpMap.from_anchors(anchors, source_label=describe_kp(old_plan, self),
                                     target_label=self.kp_mode_text())
         if not self._plan_has_kp_data():
-            self._store_write("save the plan KP mode", self.store.save_plan, self.plan)
+            self.plan = self._set_kp_datum(self.plan, new_route.start_kp_km, (mode, grid_crs))
+            ok, _ = self._store_write("save the plan KP mode", self.store.save_plan, self.plan)
+            if not ok:
+                self.plan = old_plan
+                self._load_route()
+                return None
             self.planChanged.emit()
             return True
-        new_plan_row = dict(self.plan)
+        new_label = describe_kp(self.plan, self)
         self.plan = old_plan
         report = self.rereference_plan(
-            kp_map, f"KP distance → {describe_kp(new_plan_row, self)}",
+            kp_map, f"KP distance → {new_label}",
             reason or "KP distance mode changed; items keep their seabed position.",
-            plan_updates={"params_json": new_plan_row["params_json"]},
+            datum_mode=(mode, grid_crs),
             datum_start=new_route.start_kp_km)
         if report is None:
             self._load_route()
@@ -571,8 +582,16 @@ class PlanModel(QObject):
         return report
 
     def _plan_has_kp_data(self) -> bool:
+        settings = self._display_settings()
+        paths = settings.get("installation_paths")
+        rule_configs = (analysis_state.decode_json(rule.get("config_json"), {}) for rule in self.rules)
         return bool(self.events or self.sections or self.hazards
                     or self.ground_units or self.bas_rows
+                    or self.plan.get("scope_start_kp") or self.plan.get("scope_end_kp")
+                    or settings.get("dismissed_insufficient")
+                    or (isinstance(paths, dict) and paths.get("adjustments"))
+                    or any(rule.get("kind") == "kp_range_table" for rule in self.rules)
+                    or any(config.get("ranges") or config.get("scope_ranges") for config in rule_configs)
                     or target_depth.plan_ranges(self.plan))
 
     def _sync_kp_datum(self) -> None:
@@ -582,7 +601,7 @@ class PlanModel(QObject):
         RPL that starts at, say, KP 12.345 every stored KP is shifted once,
         as a logged, undoable edit. Plans on KP-0 RPLs only record the datum.
         """
-        if not self.plan or self.route is None:
+        if not self.plan or self.route is None or self.route_baseline_changed():
             return
         start = float(getattr(self.route, "start_kp_km", 0.0) or 0.0)
         stored = self.kp_datum_start()
@@ -602,13 +621,16 @@ class PlanModel(QObject):
                     f"KPs were renumbered by {delta:+.3f} km to match it "
                     "(logged; undo from Review && Export).")
             return
-        if stored is None or abs(start - previous) > 1e-9:
-            self.plan = self._set_kp_datum(self.plan, start)
-            self._store_write("record the plan KP datum", self.store.save_plan, self.plan)
+        if stored is None or abs(start - previous) > 1e-9 or not self._accepted_route_geometry():
+            anchored = self._set_kp_datum(self.plan, start)
+            ok, _ = self._store_write("record the plan KP datum", self.store.save_plan, anchored)
+            if ok:
+                self.plan = anchored
 
     def rereference_plan(self, kp_map, label: str, reason: str = "",
                          plan_updates: Optional[Dict] = None,
-                         datum_start: Optional[float] = None):
+                         datum_start: Optional[float] = None,
+                         datum_mode: Optional[Tuple[str, str]] = None):
         """Translate every stored KP through ``kp_map`` as one undoable edit.
 
         ``self.route`` must already be the route the new KPs refer to (event
@@ -631,7 +653,7 @@ class PlanModel(QObject):
         new_plan.update(plan_updates or {})
         new_plan = self._set_kp_datum(
             new_plan, datum_start if datum_start is not None
-            else getattr(self.route, "start_kp_km", 0.0))
+            else getattr(self.route, "start_kp_km", 0.0), mode=datum_mode)
         for event in mapped["events"]:
             self._stamp_position(event)
         report = mapped["report"]
@@ -699,8 +721,7 @@ class PlanModel(QObject):
         current route to the new one (items keep their seabed position) and
         what re-referencing would do. Raises ValueError.
         """
-        from . import bas_model, plan_rereference
-        from .rereference_qgis import geometry_map, rpl_label, rpl_route
+        from .rereference_qgis import rpl_label, rpl_route
 
         if self.route is None:
             raise ValueError("The plan's current route is not loaded.")
@@ -708,50 +729,105 @@ class PlanModel(QObject):
             raise ValueError("The Cable Workbench store is not available.")
         new_route, _distance, _positions = rpl_route(
             self.workbench_store, rpl, QgsProject.instance(), self.kp_mode())
+        kp_map, report = self.preview_route_frame(new_route, rpl_label(rpl))
+        return kp_map, report, new_route
+
+    def preview_route_frame(self, new_route, label: str):
+        """Compare two loaded routes without writing any plan data."""
+        from .rereference_qgis import geometry_map
+
+        if self.route is None or self.route_baseline_changed():
+            raise ValueError("The previously accepted geometry is unavailable. "
+                             "Recover the original route to translate its KPs.")
         kp_map = geometry_map(
             self.route, new_route,
             source_label=self.plan.get("rpl_name") or "current route",
-            target_label=rpl_label(rpl))
+            target_label=label)
+        if len(kp_map.anchors) < 2:
+            raise ValueError("Too little of the old and new routes coincides to translate KPs reliably.")
+        return kp_map, self.route_change_report(kp_map, new_route)
+
+    def route_change_report(self, kp_map, new_route):
+        from . import bas_model, plan_rereference
+
         mapped = plan_rereference.map_plan(
             kp_map, self.plan, self.events, self.sections, self.hazards,
             self.rules, self.ground_units,
             [bas_model.encode_row(r) for r in self.bas_rows],
             self.store.active_generation(self.plan_id),
             (new_route.start_kp_km, new_route.end_kp_km), self.event_labels())
-        return kp_map, mapped["report"], new_route
+        return mapped["report"]
 
-    def change_route(self, updates: Dict, kp_map=None, reason: str = ""):
+    def change_route(self, updates: Dict, kp_map=None, reason: str = "", expected_geometry: str = ""):
         """Point the plan at another RPL; with ``kp_map`` translate its KPs.
 
         Without a map the stored KP numbers are kept (they move with the new
         line). Returns the re-reference report (or True without a map).
         """
-        old_route = self.route
-        if kp_map is None or old_route is None or not self._plan_has_kp_data():
-            if not self.update_plan(updates, reason=reason or "route changed"):
-                return None
-            if self.route is not None:
-                self.plan = self._set_kp_datum(self.plan, self.route.start_kp_km)
-                self._store_write("record the plan KP datum", self.store.save_plan, self.plan)
-            return True
-        # Load the new route first so events are re-stamped on it; the plan
-        # row (with the new RPL identity) is written with the KPs.
-        previous_plan = dict(self.plan)
-        self.plan.update(updates)
-        self._load_route()
-        if self.route is None:
-            self.plan = previous_plan
+        previous_plan = self.plan
+        # An edited layer may be the only copy of the new geometry. Keep
+        # the old in-memory frame available for a retry if saving fails.
+        previous_route = (self.route, self.distance, self.resolved_rpl_id, self.route_notice,
+                          self.route_error, self.rpl_positions, self.kp_check, self.newer_rpl)
+        result = None
+        try:
+            self.plan = dict(previous_plan, **updates)
             self._load_route()
-            raise ValueError(self.route_error or "The new route could not be loaded.")
-        report = self.rereference_plan(
-            kp_map, str(updates.get("rpl_name") or updates.get("rpl_id") or "route"),
-            reason or "Plan moved to another RPL; items keep their seabed position.",
-            plan_updates=updates)
-        if report is None:
+            # Map and journal from the original RPL, stamp on the candidate.
             self.plan = previous_plan
-            self._load_route()
+            if self.route is None:
+                raise ValueError(self.route_error or "The new route could not be loaded.")
+            if expected_geometry and self.route_geometry_fingerprint() != expected_geometry:
+                raise ValueError("The route changed during review. Select Set route to compare it again.")
+            if kp_map is None:
+                result = self._keep_route_kps(updates, reason)
+            else:
+                result = self.rereference_plan(
+                    kp_map, str(updates.get("rpl_name") or updates.get("rpl_id") or "route"),
+                    reason or "Plan moved to another route; KPs translated.", plan_updates=updates)
+        finally:
+            if result is None:
+                self.plan = previous_plan
+                (self.route, self.distance, self.resolved_rpl_id, self.route_notice,
+                 self.route_error, self.rpl_positions, self.kp_check, self.newer_rpl) = previous_route
+                self._route_geom_fp = ""
+                self._kp_path_fp = None
+                self._segment_wkt_cache.clear()
+        if result is not None and self.path_result:
+            self.refresh_path_layers()
+            self.pathsChanged.emit()
+        return result
+
+    def _keep_route_kps(self, updates: Dict, reason: str):
+        """Keep the exact KP values. Save derived event positions with the new reference."""
+        new_plan = self._set_kp_datum(dict(self.plan, **updates), self.route.start_kp_km)
+        events = [dict(event) for event in self.events]
+        for event in events:
+            self._stamp_position(event)
+
+        def write():
+            before = {schema.TABLE_PLAN: [self.plan]}
+            after = {schema.TABLE_PLAN: [new_plan]}
+            self.store.save_plan(new_plan)
+            if events != self.events:
+                before[schema.TABLE_EVENT] = self.events
+                self.store.save_events(self.plan_id, events)
+                after[schema.TABLE_EVENT] = self.store.list_events(self.plan_id)
+            self.store.append_change(self.plan_id, change_log.ACTION_EDIT_PLAN,
+                                     self.plan_id, before=before, after=after,
+                                     reason=reason or "Route changed; KP numbers kept.")
+
+        ok, _ = self._store_transaction("set the plan route", write)
+        if not ok:
             return None
-        return report
+        self.plan = new_plan
+        self.events = self.store.list_events(self.plan_id)
+        self.acq_cache.clear()
+        self.refresh_layers()
+        self.planChanged.emit()
+        self.eventsChanged.emit()
+        self.logChanged.emit()
+        return True
 
     def _resolve_workbench_rpl(self):
         """Return ``(row, matched_snapshot)`` for the plan's Workbench RPL."""
@@ -809,6 +885,14 @@ class PlanModel(QObject):
                 self.plan = updated
 
     # -- route identity ------------------------------------------------------
+    def _accepted_route_geometry(self) -> str:
+        datum = self._display_settings().get("kp_datum")
+        return str(datum.get("route_geometry") or "") if isinstance(datum, dict) else ""
+
+    def route_baseline_changed(self) -> bool:
+        accepted = self._accepted_route_geometry()
+        return bool(accepted and self.route is not None and accepted != self.route_geometry_fingerprint())
+
     def route_geometry_fingerprint(self) -> str:
         """Content fingerprint of the route geometry (WGS84, ~1 cm).
 
@@ -1156,9 +1240,30 @@ class PlanModel(QObject):
         return status
 
     # -- risk scan records ---------------------------------------------------
+    def risk_scale(self):
+        return RiskScale.from_settings(self._display_settings())
+
+    def set_risk_scale(self, rows) -> bool:
+        scale = RiskScale(rows)
+        current = self.risk_scale()
+        if scale.rows() == current.rows():
+            return True
+        missing = risk.used_levels(self.risk_checks, self.hazards) - set(scale.levels)
+        if missing:
+            names = ", ".join(sorted(current.label(key) for key in missing))
+            raise ValueError(f"Checks or hazards still use these levels: {names}. Reassign them before removal.")
+        if not self.update_gen_params({"risk_scale": scale.rows()}, reason="Edit risk scoring scale"):
+            return False
+        self.refresh_layers(parts=("hazards",))
+        self.riskChanged.emit()
+        return True
+
     def risk_check_fingerprints(self) -> Dict[str, str]:
         by_id = {str(r.get("input_id") or ""): r for r in self.inputs}
-        return {str(c.get("check_id")): analysis_state.check_fingerprint(c, by_id)
+        scores = self.risk_scale().scores
+        scoring = scores if scores != DEFAULT_SCALE.scores else None
+        route_fp = self.route_geometry_fingerprint()
+        return {str(c.get("check_id")): analysis_state.check_fingerprint(c, by_id, scoring, route_fp)
                 for c in self.risk_checks}
 
     def risk_runs(self) -> Dict:
@@ -1450,7 +1555,7 @@ class PlanModel(QObject):
         kp = float(event.get("kp") or 0.0)
         lat = lon = depth = None
         if self.route is not None:
-            point = self.route.point_at_kp(kp, clamp=True)
+            point = map_layers.point_at_saved_kp(self.route, kp)
             if point is not None:
                 lat, lon = point.y(), point.x()
                 service = self._stamping_depth_service()
@@ -1624,7 +1729,7 @@ class PlanModel(QObject):
             else:
                 depth_basis += "|live-sampling"
         return path_data.build_fingerprints(
-            self.plan, self.current_rpl_fingerprint(), tool, tool_config,
+            self.plan, self.route_geometry_fingerprint(), tool, tool_config,
             config, layback, depth_basis, kp_path=self.kp_path_component())
 
     def path_state(self, config: Optional[Dict] = None) -> Dict[str, str]:
@@ -2233,31 +2338,50 @@ class PlanModel(QObject):
             return False
         from . import bas_model
 
-        before = {schema.TABLE_BAS_ROW: [bas_model.encode_row(r) for r in self.bas_rows]}
         ordered = [bas_model.encode_row(r) for r in bas_model.sort_rows(rows)]
         for row in ordered:
             row["plan_id"] = self.plan_id
             if not row.get("row_id"):
                 row["row_id"] = schema.new_id()
 
-        def write() -> None:
+        def write():
+            before = {schema.TABLE_BAS_ROW: self.store.list_bas_rows(self.plan_id)}
+            after = {schema.TABLE_BAS_ROW: ordered}
+            updated_plan = None
+            if columns is not None or meta_updates:
+                plan = self.store.get_plan(self.plan_id)
+                if not plan:
+                    raise ValueError("The plan was removed before the BAS register could be saved.")
+                try:
+                    params = json.loads(plan.get("params_json") or "{}")
+                except (TypeError, ValueError):
+                    params = {}
+                if not isinstance(params, dict):
+                    params = {}
+                meta = dict(params["bas"]) if isinstance(params.get("bas"), dict) else {}
+                if columns is not None:
+                    meta["columns"] = bas_model.normalise_columns(columns)
+                meta.update(meta_updates or {})
+                if meta != params.get("bas"):
+                    params["bas"] = meta
+                    updated_plan = dict(plan, params_json=json.dumps(params))
+                    self.store.save_plan(updated_plan)
+                    before[schema.TABLE_PLAN] = [plan]
+                    after[schema.TABLE_PLAN] = [updated_plan]
             self.store.save_bas_rows(self.plan_id, ordered)
-            self._load_bas_rows()
-            self.store.append_change(
-                self.plan_id, action, "", before=before,
-                after={schema.TABLE_BAS_ROW: [bas_model.encode_row(r) for r in self.bas_rows]},
-                reason=reason)
+            self.store.append_change(self.plan_id, action, "", before=before, after=after, reason=reason)
+            return updated_plan
 
-        ok, _ = self._store_transaction("save the BAS register", write)
+        ok, updated_plan = self._store_transaction("save the BAS register", write)
         if not ok:
             return False
-        meta = self.bas_meta()
-        if columns is not None:
-            meta["columns"] = bas_model.normalise_columns(columns)
-        if meta_updates:
-            meta.update(meta_updates)
-        if columns is not None or meta_updates:
-            self.update_gen_params({"bas": meta}, reason=reason or action, stale=False)
+        self._load_bas_rows()
+        if updated_plan is not None:
+            self.plan = updated_plan
+            if self.path_result:
+                self.refresh_path_layers()
+                self.pathsChanged.emit()
+            self.planChanged.emit()
         self.refresh_layers(parts=("bas",))
         self.basChanged.emit()
         self.logChanged.emit()
@@ -2327,7 +2451,7 @@ class PlanModel(QObject):
         def write() -> None:
             self.store.save_risk_checks(self.plan_id, checks)
             self.risk_checks = self.store.list_risk_checks(self.plan_id)
-            self.store.save_hazards(self.plan_id, risk.sort_hazards(hazards))
+            self.store.save_hazards(self.plan_id, risk.sort_hazards(hazards, self.risk_scale()))
             self.hazards = self.store.list_hazards(self.plan_id)
             self.store.append_change(
                 self.plan_id, change_log.ACTION_DELETE_RISK_CHECK, wanted,
@@ -2352,7 +2476,7 @@ class PlanModel(QObject):
 
         def write() -> None:
             self.store.save_hazards(self.plan_id,
-                                    risk.sort_hazards(new_hazards))
+                                    risk.sort_hazards(new_hazards, self.risk_scale()))
             self.hazards = self.store.list_hazards(self.plan_id)
             self.store.append_change(
                 self.plan_id, action, target_id, before=before,
@@ -2393,9 +2517,10 @@ class PlanModel(QObject):
                           label: str, risk_level: str, notes: str = "") -> bool:
         lo, hi = self._scope_bounds()
         lo, hi = min(lo, hi), max(lo, hi)
-        if not (lo - 1e-9 <= float(kp) <= hi + 1e-9):
+        end = float(kp) if end_kp is None else float(end_kp)
+        if not (lo - 1e-9 <= float(kp) <= end <= hi + 1e-9):
             raise ValueError(
-                f"The hazard KP must lie inside the plan scope "
+                f"Enter the hazard KP or an increasing range inside the plan scope "
                 f"KP {schema.format_kp(lo)}-{schema.format_kp(hi)}.")
         row = risk.new_hazard_row(
             self.plan_id, "", f"manual-{schema.new_id()[:8]}", label,
@@ -2418,14 +2543,17 @@ class PlanModel(QObject):
         if not wanted:
             return False
         changed = False
+        restoring = updates.get("risk_source") == schema.RISK_SOURCE_AUTO and "risk" not in updates
         rows = []
         for hazard in self.hazards:
             row = dict(hazard)
-            if str(row.get("hazard_id") or "") in wanted:
-                if "risk" in updates:
+            if str(row.get("hazard_id") or "") in wanted and (not restoring or row.get("check_id")):
+                if restoring:
+                    row["risk"] = row.get("auto_risk") or ""
+                elif "risk" in updates:
                     row["risk_source"] = schema.RISK_SOURCE_USER
                 row.update(updates)
-                changed = True
+                changed = changed or row != hazard
             rows.append(row)
         if not changed:
             return False

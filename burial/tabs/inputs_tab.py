@@ -296,7 +296,7 @@ class InputsTab(QWidget):
         route_row.addWidget(self.route_pages, 1)
         self.apply_rpl_button = QPushButton("Set route")
         self.apply_rpl_button.setToolTip(
-            "Anchor the plan to the selected route.")
+            "Review the selected route and how saved KPs will be handled.")
         self.apply_rpl_button.clicked.connect(self._set_route)
         route_row.addWidget(self.apply_rpl_button)
         rpl_form.addRow("Route:", route_row)
@@ -819,6 +819,7 @@ class InputsTab(QWidget):
             return
         rpl = store.get_rpl(rpl_id) or {}
         from .. import map_layers
+        from ..rereference_qgis import rpl_label, rpl_route
 
         # Keep the model's store handle current; the Workbench can be created
         # after the Burial Planner dock was first opened.
@@ -830,61 +831,108 @@ class InputsTab(QWidget):
             "rpl_gpkg_path": store.gpkg_path,
             "rpl_fingerprint": map_layers.rpl_fingerprint(rpl, store.gpkg_path),
         }
-        moving = (self.model.route is not None
-                  and str(self.model.resolved_rpl_id or self.model.plan.get("rpl_id") or "")
-                  != str(rpl_id) and self.model._plan_has_kp_data())
-        if moving:
-            result = self._change_route_with_rereference(rpl, updates)
-            if result is None:
-                return
-        elif not self.model.change_route(updates, reason="route set"):
-            return
-        if self.model.route is None:
-            # The reference saved but the route itself would not open —
-            # a success message here would mask the broken state.
-            self._set_status(
-                self.model.route_error
-                or "The route was saved but could not be opened.", "error")
-            return
-        self._set_status(
-            "Workbench route and revision applied. Continue to Bathymetry "
-            "Profile to review and rebuild the stored samples.", "ok")
-
-    def _change_route_with_rereference(self, rpl: Dict, updates: Dict):
-        """Move a plan with KP data onto another RPL, asking how to treat KPs."""
-        from ..rereference_qgis import rpl_label
         try:
-            kp_map, report, new_route = self.model.preview_route_change(rpl)
-        except ValueError as exc:
-            self._set_status(f"The new route could not be compared: {exc}", "error")
-            return None
+            route, _, _ = rpl_route(store, rpl, QgsProject.instance(), self.model.kp_mode())
+        except (ValueError, RuntimeError) as exc:
+            self._set_status(str(exc), "error")
+            return
+        same_source = str(self.model.resolved_rpl_id or self.model.plan.get("rpl_id") or "") == str(rpl_id)
+        self._apply_route_candidate(route, rpl_label(rpl), updates, same_source)
+
+    def _apply_route_candidate(self, route, label, updates, same_source):
+        from .. import map_layers
+
+        candidate_geometry = map_layers.route_geometry_fingerprint(route)
+        changed = (not same_source or self.model.route_baseline_changed()
+                   or self.model.route_geometry_fingerprint() != candidate_geometry)
+        kp_map = None
+        reason = "Route set."
+        outside = 0
+        if changed:
+            pending = []
+            if self._dirty:
+                pending.append("Inputs")
+            for title, tab in (("BAS", "bas_tab"), ("Ground Model", "ground_tab")):
+                if getattr(getattr(self.dock, tab, None), "_dirty", False):
+                    pending.append(title)
+            if pending and (self.model.route or self.model._plan_has_kp_data()):
+                self._set_status("Finish the pending edits in " + ", ".join(pending)
+                                 + " before changing the route.", "warn")
+                return
+        if changed and self.model._plan_has_kp_data():
+            choice = self._review_route_change(route, label, same_source)
+            if choice is None:
+                return
+            kp_map, reason, outside = choice
+        try:
+            result = self.model.change_route(updates, kp_map, reason, expected_geometry=candidate_geometry)
+        except (ValueError, RuntimeError) as exc:
+            self._set_status(str(exc), "error")
+            return
+        if result is None:
+            self._set_status("The plan route could not be saved.", "error")
+            return
+        message = f"{label} applied."
+        if kp_map is not None:
+            message += " " + result.summary()
+        elif outside:
+            message += f" {outside} retained KP value(s) fall outside the route."
+        if changed and self.model._plan_has_kp_data():
+            if self.model.bas_rows:
+                message += " Check BAS sections along any diversions."
+            message += " Review affected calculations. The change is recorded in Review & Export."
+        needs_review = outside or (kp_map is not None and (result.flagged or result.outside))
+        self._set_status(message, "warn" if needs_review else "ok")
+
+    def _review_route_change(self, route, label, same_source):
+        from ..kp_rereference import KpMap
+        from ..rereference_qgis import rpl_label
+
+        kp_map = None
+        report = None
+        explanation = "The previous route geometry is unavailable."
+        if self.model.route is not None:
+            try:
+                kp_map, report = self.model.preview_route_frame(route, label)
+            except ValueError as exc:
+                explanation = str(exc)
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Question)
-        box.setWindowTitle("Change the plan's RPL")
-        box.setText(
-            f"Move this plan onto '{rpl_label(rpl)}' "
-            f"(KP {new_route.start_kp_km:.3f}–{new_route.end_kp_km:.3f})?\n\n"
-            "Recommended: keep every event, section, target, hazard, BAS and "
-            "ground-model range at its seabed position and give it the new "
-            "route's KP.\n\n" + report.summary())
-        details = report.flagged[:40] + report.outside[:40]
+        box.setWindowTitle("Review route change")
+        old = rpl_label({"name": self.model.plan.get("rpl_name") or "Previous route",
+                         "rev_label": self.model.plan.get("rpl_revision")})
+        box.setText(f"{old} → {label}\nNew route extent is KP {route.start_kp_km:.3f}–{route.end_kp_km:.3f}.")
+        keep_position = None
+        details = []
+        if report is not None:
+            explanation = ("Match positions along the shared route and translate their KPs. "
+                           "Positions on diverted stretches are estimates.\n" + report.summary())
+            details = report.flagged + report.outside
+            keep_position = box.addButton("Translate KPs", QMessageBox.ButtonRole.AcceptRole)
+        else:
+            report = self.model.route_change_report(KpMap.identity(), route)
+        explanation += "\n\nKeep KP numbers uses the existing chainage values on the selected route."
+        if report.outside_if_kept:
+            explanation += f" {len(report.outside_if_kept)} saved KP value(s) would be outside its extent."
+            details += ["Outside the route if KP numbers are kept:"] + report.outside_if_kept
         if details:
             box.setDetailedText("\n".join(details))
-        keep_position = box.addButton("Keep seabed positions (re-reference KPs)",
-                                      QMessageBox.ButtonRole.AcceptRole)
+        if same_source:
+            explanation += "\nRollback can restore plan records. Restoring overwritten source geometry requires the original layer."
+        box.setInformativeText(explanation)
         keep_numbers = box.addButton("Keep KP numbers", QMessageBox.ButtonRole.DestructiveRole)
-        box.addButton(QMessageBox.StandardButton.Cancel)
-        box.setDefaultButton(keep_position)
+        cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(keep_position if keep_position is not None else cancel)
         qt_exec(box)
         clicked = box.clickedButton()
-        if clicked == keep_position:
-            result = self.model.change_route(updates, kp_map)
-            if result:
-                self._set_status("Plan moved to the new RPL; KPs re-referenced "
-                                 f"({result.summary()}) Undo from Review && Export.", "ok")
-            return result
+        if keep_position is not None and clicked == keep_position:
+            return kp_map, f"{old} → {label}. KPs translated.", len(report.outside)
         if clicked == keep_numbers:
-            return self.model.change_route(updates, None, reason="route set (KP numbers kept)")
+            outside = len(report.outside_if_kept)
+            reason = f"{old} → {label}. KP numbers kept."
+            if outside:
+                reason += f" {outside} KP value(s) outside the new route."
+            return None, reason, outside
         return None
 
     def _change_kp_mode(self) -> None:
@@ -931,22 +979,16 @@ class InputsTab(QWidget):
         except Exception as exc:
             self._set_status(f"Route was not changed: {exc}", "error")
             return
-        if not self.model.change_route({
+        updates = {
             "rpl_id": "",
             "rpl_name": layer.name(),
             "rpl_revision": "",
             "rpl_gpkg_path": layer.source(),
             "rpl_fingerprint": normalised_path(layer.source().split("|")[0]),
-        }, reason="route set (line layer)"):
-            return
-        if self.model.route is None:
-            self._set_status(
-                self.model.route_error
-                or "The route was saved but could not be opened.", "error")
-            return
-        self._set_status(
-            "Line-layer route applied. Continue to Bathymetry Profile to "
-            "review and rebuild the stored samples.", "ok")
+        }
+        same_source = (not self.model.plan.get("rpl_id")
+                       and self.model.plan.get("rpl_gpkg_path") == layer.source())
+        self._apply_route_candidate(route, layer.name(), updates, same_source)
 
     def _full_route(self) -> None:
         if self.model.route is None:

@@ -57,6 +57,8 @@ _CHECK_KEYS = ("config_json", "enabled")
 # metres along the route at high latitude), and positions between vertices
 # follow the KP path. Scans recorded before read "out of date".
 RISK_KP_METHOD = 2
+# Only feature-layer scans depend on the exact-contact and overlap geometry.
+RISK_CONTACT_METHOD = 2
 
 
 def canonical(value) -> str:
@@ -123,12 +125,18 @@ def rule_fingerprint(rule: Dict, inputs_by_id: Dict[str, Dict],
     return digest(payload)
 
 
-def check_fingerprint(check: Dict, inputs_by_id: Dict[str, Dict]) -> str:
+def check_fingerprint(check: Dict, inputs_by_id: Dict[str, Dict], scores=None, route_fp: str = "") -> str:
     config = _json_field(check.get("config_json"))
     payload = {key: (_json_field(check.get(key)) if key.endswith("_json")
                      else check.get(key)) for key in _CHECK_KEYS}
     payload["inputs"] = _input_binding(config, inputs_by_id)
     payload["kp_method"] = RISK_KP_METHOD
+    if route_fp:
+        payload["route"] = route_fp
+    if isinstance(config, dict) and config.get("kind") not in ("kp_table", "route_turns"):
+        payload["contact_method"] = RISK_CONTACT_METHOD
+    if scores is not None:
+        payload["risk_scores"] = scores
     return digest(payload)
 
 

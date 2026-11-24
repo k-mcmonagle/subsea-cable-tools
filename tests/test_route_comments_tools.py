@@ -127,6 +127,21 @@ def test_images_follow_the_register(folder):
         checks["upgraded once"] = not map_layers.upgrade_labels(points)
         checks["earlier labels drawn after the upgrade"] = drawn() and drawn(50000)
         checks["labels_show_images"] = map_layers.labels_show_images(points)
+        no_html = points.labeling().clone()
+        detail = no_html.rootRule().children()[-1]
+        pal = QgsPalLayerSettings(detail.settings())
+        fmt = pal.format()
+        fmt.setAllowHtmlFormatting(False)
+        pal.setFormat(fmt)
+        detail.setSettings(pal)
+        points.setLabeling(no_html)
+        checks["image markup requires HTML formatting"] = not map_layers.labels_show_images(points) and not drawn()
+        crowded = map_layers.LabelSettings(image_overlap=True)
+        crowded_style = map_layers.build_labeling(crowded, False)
+        details = crowded_style.rootRule().children()[-1].settings()
+        key = map_layers._scoped(QgsPalLayerSettings, "Property", "AlwaysShow")
+        checks["overlap override applies only to chosen pictures"] = "map_image" in (
+            details.dataDefinedProperties().property(key).expressionString())
         # The dock's show() upgrades too (a layer opened from an older project).
         points.setLabeling(_legacy_labeling(settings, width))
         layers.show(register, set_id, "Comments")

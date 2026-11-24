@@ -8,9 +8,10 @@ plain dicts shaped like ``bp_hazard`` rows.
 A check's criteria (``bp_risk_check.config_json``) assign risk two ways,
 and the effective auto risk is the *most severe* of the two:
 
-- proximity bands: ``band_high_m`` / ``band_medium_m`` / ``band_low_m`` —
-  a feature whose nearest approach is within the band gets that level
-  (0 disables a band; crossings are offset 0 and hit the tightest band);
+- route contact and proximity bands: ``on_route_risk`` applies to an
+  intersection. Independently, ``band_<level>_m`` assigns
+  a level to features within that distance (0 disables a band). The
+  highest scoring match on the plan's scale wins;
 - attribute rules: ordered ``attribute_rules`` over one feature attribute,
   each an exact value match, a numeric range (with explicit inclusive /
   exclusive bounds) or a QGIS expression over the whole feature — first
@@ -29,6 +30,7 @@ import json
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import attribute_rules, schema
+from .risk_scale import DEFAULT_SCALE
 
 
 def check_config(check_row: Dict) -> Dict:
@@ -39,17 +41,17 @@ def check_config(check_row: Dict) -> Dict:
     return config if isinstance(config, dict) else {}
 
 
-def risk_max(*levels: str) -> str:
+def risk_max(*levels: str, scale=DEFAULT_SCALE) -> str:
     """The most severe of the given levels ('' = unassigned sorts lowest)."""
     best = schema.RISK_UNASSIGNED
     for level in levels:
         level = level or ""
-        if schema.RISK_ORDER.get(level, 0) > schema.RISK_ORDER.get(best, 0):
+        if scale.rank(level) > scale.rank(best):
             best = level
     return best
 
 
-def proximity_risk(config: Dict, offset_m: Optional[float]) -> str:
+def proximity_risk(config: Dict, offset_m: Optional[float], scale=DEFAULT_SCALE) -> str:
     """Risk from the nearest-approach bands; '' when no band matches.
 
     Offsets are signed (+ starboard / − port); bands apply to the magnitude.
@@ -57,11 +59,9 @@ def proximity_risk(config: Dict, offset_m: Optional[float]) -> str:
     if offset_m is None:
         return schema.RISK_UNASSIGNED
     offset = abs(float(offset_m))
-    for key, level in (("band_high_m", schema.RISK_HIGH),
-                       ("band_medium_m", schema.RISK_MEDIUM),
-                       ("band_low_m", schema.RISK_LOW)):
+    for level in reversed(scale.levels):
         try:
-            band = float(config.get(key) or 0.0)
+            band = float(config.get(f"band_{level}_m") or 0.0)
         except (TypeError, ValueError):
             band = 0.0
         if band > 0 and offset <= band + 1e-9:
@@ -75,7 +75,8 @@ def _rule_matches(rule: Dict, value) -> bool:
 
 
 def attribute_risk(config: Dict, attributes: Dict,
-                   expression_hits: Optional[Sequence[bool]] = None) -> str:
+                   expression_hits: Optional[Sequence[bool]] = None,
+                   scale=DEFAULT_SCALE) -> str:
     """Risk from the check's attribute rules; '' when none match.
 
     Value and range rules read ``config['attribute']`` from ``attributes``
@@ -105,22 +106,64 @@ def attribute_risk(config: Dict, attributes: Dict,
             fired = has_value and attribute_rules.rule_matches(rule, value)
         if fired:
             level = rule.get("risk") or ""
-            if level in schema.RISK_ORDER:
+            if level in scale.labels:
                 return level
     return schema.RISK_UNASSIGNED
 
 
 def evaluate_risk(config: Dict, offset_m: Optional[float],
                   attributes: Optional[Dict] = None,
-                  expression_hits: Optional[Sequence[bool]] = None) -> str:
-    """Effective auto risk: max(proximity, attribute), else default_risk."""
-    level = risk_max(proximity_risk(config, offset_m),
+                  expression_hits: Optional[Sequence[bool]] = None,
+                  *, intersects=False, scale=DEFAULT_SCALE) -> str:
+    """Highest scoring spatial or attribute match, otherwise the check default."""
+    level = risk_max(config.get("on_route_risk") if intersects else "",
+                     proximity_risk(config, offset_m, scale),
                      attribute_risk(config, attributes or {},
-                                    expression_hits))
+                                    expression_hits, scale), scale=scale)
     if level:
         return level
     default = config.get("default_risk") or ""
-    return default if default in schema.RISK_ORDER else schema.RISK_UNASSIGNED
+    return default if default in scale.labels else schema.RISK_UNASSIGNED
+
+
+def used_levels(checks, hazards):
+    """References that must stay resolvable if a level is renamed or removed."""
+    used = set()
+    for hazard in hazards:
+        used.update((hazard.get("risk"), hazard.get("auto_risk")))
+    for check in checks:
+        config = check_config(check)
+        used.update((config.get("on_route_risk"), config.get("default_risk")))
+        used.update(rule.get("risk") for rule in (config.get("attribute_rules") or []) if isinstance(rule, dict))
+        used.update(key[5:-2] for key, value in config.items()
+                    if key.startswith("band_") and key.endswith("_m") and value)
+    return used - {None, ""}
+
+
+def measured_offset(hazard):
+    """Offset in metres for a spatial feature. KP-only records have no measurement."""
+    ref = str(hazard.get("feature_ref") or "")
+    if hazard.get("source") == schema.HAZARD_SOURCE_MANUAL or ref.startswith(("row:", "ac#")):
+        return None
+    return hazard.get("offset_m")
+
+
+def interaction(hazard):
+    if hazard.get("source") == schema.HAZARD_SOURCE_MANUAL:
+        return "Manual"
+    ref = str(hazard.get("feature_ref") or "")
+    if ref.startswith("row:"):
+        return "KP table"
+    if ref.startswith("ac#"):
+        return "Route turn"
+    if int(hazard.get("crossing") or 0):
+        if hazard.get("end_kp") is not None and float(hazard["end_kp"]) != float(hazard.get("kp") or 0):
+            return "Overlap"
+        return "Crossing" if hazard.get("crossing_angle_deg") is not None else "Touches route"
+    offset = measured_offset(hazard)
+    if offset is None:
+        return ""
+    return "On route" if float(offset) == 0 else "Nearby"
 
 
 # ---------------------------------------------------------------------------
@@ -210,19 +253,19 @@ def carry_over_hazards(new_hazards: Sequence[Dict],
     return merged
 
 
-def sort_hazards(hazards: Sequence[Dict]) -> List[Dict]:
+def sort_hazards(hazards: Sequence[Dict], scale=DEFAULT_SCALE) -> List[Dict]:
     def key(hazard: Dict) -> Tuple[float, int, str]:
         try:
             kp = float(hazard.get("kp") or 0.0)
         except (TypeError, ValueError):
             kp = 0.0
-        severity = -schema.RISK_ORDER.get(hazard.get("risk") or "", 0)
+        severity = -scale.rank(hazard.get("risk") or "")
         return (kp, severity, str(hazard.get("hazard_id") or ""))
 
     return sorted(hazards, key=key)
 
 
-def merge_risk_spans(spans: Sequence[Tuple[float, float, str]]
+def merge_risk_spans(spans: Sequence[Tuple[float, float, str]], scale=DEFAULT_SCALE
                      ) -> List[Tuple[float, float, str]]:
     """Merge overlapping/adjacent spans of the same risk level.
 
@@ -245,11 +288,11 @@ def merge_risk_spans(spans: Sequence[Tuple[float, float, str]]
                 current_start, current_end = start, end
         merged.append((current_start, current_end, level))
     # Severe spans last so they draw on top of milder overlapping ones.
-    merged.sort(key=lambda s: (schema.RISK_ORDER.get(s[2], 0), s[0]))
+    merged.sort(key=lambda s: (scale.rank(s[2]), s[0]))
     return merged
 
 
-def hazard_spans(hazards: Sequence[Dict], point_halfwidth_km: float = 0.025
+def hazard_spans(hazards: Sequence[Dict], point_halfwidth_km: float = 0.025, scale=DEFAULT_SCALE
                  ) -> List[Tuple[float, float, str]]:
     """(start_km, end_km, risk) spans for the overview strip.
 
@@ -271,12 +314,11 @@ def hazard_spans(hazards: Sequence[Dict], point_halfwidth_km: float = 0.025
             lo = centre - point_halfwidth_km
             hi = centre + point_halfwidth_km
         spans.append((lo, hi, hazard.get("risk") or ""))
-    return merge_risk_spans(spans)
+    return merge_risk_spans(spans, scale)
 
 
-def summarise_hazards(hazards: Sequence[Dict]) -> Dict[str, int]:
-    counts: Dict[str, int] = {level: 0 for level in
-                              [schema.RISK_UNASSIGNED] + schema.RISK_LEVELS}
+def summarise_hazards(hazards: Sequence[Dict], scale=DEFAULT_SCALE) -> Dict[str, int]:
+    counts: Dict[str, int] = dict.fromkeys(scale.labels, 0)
     open_count = 0
     for hazard in hazards:
         level = hazard.get("risk") or ""
@@ -285,7 +327,7 @@ def summarise_hazards(hazards: Sequence[Dict]) -> Dict[str, int]:
                 == schema.HAZARD_STATUS_OPEN:
             open_count += 1
     counts["open"] = open_count
-    counts["total"] = len(list(hazards))
+    counts["total"] = len(hazards)
     return counts
 
 

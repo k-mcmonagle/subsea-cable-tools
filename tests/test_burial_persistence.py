@@ -118,6 +118,10 @@ def test_analysis_persists_across_reload() -> bool:
     ok = ok and again.record_risk_run(["c1"], {}, {}, "Scanned 1 check(s).")
     third = PlanModel(store)
     third.load_plan(plan_id)
+    # This fixture supplies its route in memory. Until it is reattached,
+    # the scanner cannot verify the route used for the saved checks.
+    ok = ok and third.risk_status()["c1"]["state"] == "changed"
+    third.route = route
     state = third.risk_status()["c1"]
     ok = ok and state["state"] == "current" and state["count"] == 0
     ok = ok and third.risk_runs()["message"] == "Scanned 1 check(s)."

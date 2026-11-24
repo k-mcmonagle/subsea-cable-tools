@@ -1296,6 +1296,13 @@ class LabelDialog(QDialog):
         pictures.addWidget(self.image_mm)
         pictures.addStretch(1)
         layout.addLayout(pictures)
+        self.image_overlap = QCheckBox("Allow map images to overlap other labels")
+        self.image_overlap.setToolTip("Use this when QGIS hides a picture because its label will not fit "
+                                      "between nearby comments. The detail scale still applies.")
+        self.image_overlap.setChecked(settings.image_overlap)
+        self.image_overlap.setEnabled(self.images.isChecked())
+        self.images.toggled.connect(self.image_overlap.setEnabled)
+        layout.addWidget(self.image_overlap)
         self.example = QLabel()
         self.example.setWordWrap(True)
         self.example.setStyleSheet("color: palette(mid);")
@@ -1340,6 +1347,7 @@ class LabelDialog(QDialog):
         self.background.setChecked(default.background)
         self.images.setChecked(default.images)
         self.image_mm.setValue(float(default.image_mm))
+        self.image_overlap.setChecked(default.image_overlap)
         self._update()
 
     @staticmethod
@@ -1374,7 +1382,8 @@ class LabelDialog(QDialog):
             custom=self.custom.expression() if custom and self.use_custom.isChecked() else "",
             size=self.size.value(), background=self.background.isChecked(),
             style=self.style.currentData(), leader_mm=self.leader.value(),
-            images=self.images.isChecked(), image_mm=self.image_mm.value())
+            images=self.images.isChecked(), image_mm=self.image_mm.value(),
+            image_overlap=self.image_overlap.isChecked())
 
     def result_settings(self):
         return self._settings()

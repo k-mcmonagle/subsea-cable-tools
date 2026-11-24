@@ -843,6 +843,53 @@ class CommentStore:
             raise
         return new, {"missing_images": missing}
 
+    def merge_sets(self, first_id: str, second_id: str, name: str) -> Dict:
+        """Copy two complete sets into a fresh set from one consistent snapshot."""
+        if first_id == second_id:
+            raise CommentStoreError("Choose two different comment sets.")
+        written = []
+        try:
+            with self._write("merge the comment sets") as conn:
+                statuses, priorities, fields = {}, [], {}
+                mappings = {}
+                for set_id in (first_id, second_id):
+                    source = self.get_set(set_id)
+                    if source is None:
+                        raise ConflictError("A source set was removed. Choose the sets again.")
+                    for status in self.statuses_of(source):
+                        key = status["name"].casefold()
+                        if key in statuses and statuses[key]["closed"] != status["closed"]:
+                            raise CommentStoreError(f"'{status['name']}' is open in one set and closed in the "
+                                                    "other. Align the statuses before merging.")
+                        statuses.setdefault(key, status)
+                    priorities.extend(self.priorities_of(source))
+                    mapping = mappings[set_id] = {}
+                    for field in self.list_fields(set_id):
+                        key = field.name.casefold()
+                        if key not in fields:
+                            fields[key] = model.CustomField(new_id(), field.name, field.kind)
+                        target = fields[key]
+                        if target.kind != field.kind:
+                            raise CommentStoreError(f"The custom field '{field.name}' has different types. "
+                                                    "Rename one field before merging.")
+                        target.choices = list(dict.fromkeys(target.choices + field.choices))
+                        mapping[field.field_id] = target.field_id
+                merged = self.create_set(name, list(statuses.values()), priorities)
+                self.save_fields(merged["set_id"], list(fields.values()))
+                for set_id, mapping in mappings.items():
+                    ids = [r[0] for r in conn.execute(
+                        f"SELECT comment_id FROM {_Q(T_COMMENT)} WHERE set_id = ?", (set_id,))]
+                    staged, missing = self._stage_copies(self._rows_in(T_ATTACH, ATTACH_COLUMNS, ids), written)
+                    if missing:
+                        raise CommentStoreError("A source image file is missing. Restore the attachments "
+                                                "folder before merging.")
+                    self._insert_copies(conn, self._comment_rows(ids), merged["set_id"], mapping, False,
+                                        self._rows_in(T_REPLY, REPLY_COLUMNS, ids), staged)
+            return merged
+        except Exception:
+            self._remove_paths(written)
+            raise
+
     def renumber_by_kp(self, set_id: str, keep_previous: bool = True) -> List[Tuple[str, int, int]]:
         """Number the set's comments 1, 2, 3… in KP order (:func:`model.kp_order`),
         in one transaction. With ``keep_previous`` each comment's number before

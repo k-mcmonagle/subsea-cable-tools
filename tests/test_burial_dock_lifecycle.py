@@ -219,8 +219,14 @@ def test_late_analysis_results_are_ignored() -> bool:
         # The current task's results are still applied.
         current = _FakeTask()
         dock._task = current
+        dock._task_basis = dock.model.analysis_basis()
         dock._analysis_finished(current)
         ok = ok and applied == [current]
+        previous_route = _FakeTask()
+        dock._task = previous_route
+        dock._task_basis["fingerprints"]["global"]["route"] = "previous-route"
+        dock._analysis_finished(previous_route)
+        ok = ok and applied == [current] and "route changed" in dock.builder_tab.run_status.text()
         return _result("late / stopped analysis results are ignored; a lost "
                        "callback cannot block runs", ok)
 
