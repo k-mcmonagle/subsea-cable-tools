@@ -3,15 +3,44 @@ from __future__ import annotations
 
 import html
 import math
+from bisect import bisect_right
 
 import pyqtgraph as pg
 from qgis.PyQt.QtCore import Qt, pyqtSignal
+from qgis.PyQt.QtGui import QColor
 
 from ..kp_axis_item import KPAxisItem
 from ..span_analysis.event_lane import LABEL_NAME_KP, EventLaneItem, EventLayer, EventLeaderItem
-from ..span_analysis.events import GROUP_OPERATIONS, SRC_BURIAL, ProfileEvent
+from ..span_analysis.events import GROUP_OPERATIONS, SRC_BURIAL, SRC_RPL, ProfileEvent
 from . import events as plan_events
 from . import schema
+
+
+def read_rpl_lane_events(model):
+    from ..span_analysis.events import GROUP_ALTER, GROUP_BODIES, GROUP_CROSSINGS, rpl_point_event
+    from ..workbench.assembly_model import EventClassifier
+    from ..plugin_log import log_exception
+    from .rpl_reference import rpl_event_rows
+
+    rows, _ = rpl_event_rows(model, "", events_only=True)
+    try:
+        classifier = EventClassifier(model.workbench_store.list_event_rules())
+    except Exception:
+        log_exception("Burial Planner: using default RPL event rules")
+        classifier = EventClassifier.with_defaults()
+    entries = []
+    for row in rows:
+        if _finite_kp(row.kp) is None:
+            continue
+        event = rpl_point_event(row.event, row.kp, row.stated_kp, row.pos_no,
+                                row.remarks, classifier.classify, f"rpl:{row.seq}")
+        if event.kind == "repeater":
+            category = "repeater"
+            event.priority = 5
+        else:
+            category = event.group if event.group in (GROUP_ALTER, GROUP_BODIES, GROUP_CROSSINGS) else "other"
+        entries.append((category, event))
+    return entries
 
 
 def _finite_kp(value):
@@ -22,11 +51,11 @@ def _finite_kp(value):
     return kp if math.isfinite(kp) else None
 
 
-class PlanEventLane(pg.PlotWidget):
+class _ProfileLane(pg.PlotWidget):
     kpHovered = pyqtSignal(float)
     kpClicked = pyqtSignal(float)
 
-    def __init__(self, depth_plot):
+    def __init__(self, *, compact_when_crowded=False):
         super().__init__(background="w")
         item = self.getPlotItem()
         axis = item.getAxis("left")
@@ -37,18 +66,54 @@ class PlanEventLane(pg.PlotWidget):
         item.hideButtons()
         item.setMouseEnabled(x=True, y=False)
         item.setYRange(0, 1, padding=0)
-        self.layer = EventLayer(item.vb, self)
+        self.layer = EventLayer(item.vb, self, compact_when_crowded=compact_when_crowded)
         self.layer.set_style(label_mode=LABEL_NAME_KP)
         item.addItem(EventLaneItem(self.layer), ignoreBounds=True)
-        self.leaders = EventLeaderItem(self.layer)
-        self.leaders.setZValue(9)
-        depth_plot.addItem(self.leaders, ignoreBounds=True)
-        item.vb.sigXRangeChanged.connect(lambda *_: self.leaders.update())
         self.scene().sigMouseMoved.connect(self._hover)
         self.scene().sigMouseClicked.connect(self._click)
 
-    def set_rows(self, events, sections, labels, method, event_color, section_styles):
-        entries = []
+    def _set_entries(self, entries):
+        self.layer.set_events(entries)
+        self.setFixedHeight(self.layer.lane_height() + 2)
+        self.setVisible(bool(entries))
+
+    def _at(self, pos):
+        vb = self.getViewBox()
+        rect = vb.sceneBoundingRect()
+        if not rect.contains(pos):
+            return None, []
+        hits = self.layer.events_at(pos.x() - rect.left(), pos.y(), rect.top())
+        kp = vb.mapSceneToView(pos).x()
+        hits.sort(key=lambda e: (abs(e.kp - kp), e.priority))
+        point = next((e for e in hits if not e.is_range), None)
+        return (point.kp if point else kp), hits
+
+    def _hover(self, pos):
+        kp, hits = self._at(pos)
+        details = [html.escape(e.detail).replace("\n", "<br>") for e in hits[:12]]
+        if len(hits) > len(details):
+            details.append(f"{len(hits) - len(details)} more nearby. Zoom in for detail.")
+        self.setToolTip("<br>".join(details))
+        if kp is not None:
+            self.kpHovered.emit(kp)
+
+    def _click(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            kp, _hits = self._at(event.scenePos())
+            if kp is not None:
+                self.kpClicked.emit(kp)
+
+
+class PlanEventLane(_ProfileLane):
+    def __init__(self, depth_plot, *, compact_when_crowded=False):
+        super().__init__(compact_when_crowded=compact_when_crowded)
+        self.leaders = EventLeaderItem(self.layer)
+        self.leaders.setZValue(9)
+        depth_plot.addItem(self.leaders, ignoreBounds=True)
+        self.getViewBox().sigXRangeChanged.connect(lambda *_: self.leaders.update())
+
+    def set_rows(self, events, sections, labels, method, event_color, section_styles, rpl_events=()):
+        entries = list(rpl_events)
         for row in events:
             kp = _finite_kp(row.get("kp"))
             if kp is None:
@@ -72,30 +137,48 @@ class PlanEventLane(pg.PlotWidget):
                 detail += " · " + row["state"]
             entries.append(ProfileEvent(a, b, SRC_BURIAL, GROUP_OPERATIONS, label, detail,
                                         section_styles[kind][0].getRgb()[:3]))
-        self.layer.set_events(entries)
-        self.setFixedHeight(self.layer.lane_height() + 2)
-        self.setVisible(bool(entries))
+        self._set_entries(entries)
+
+
+class CableTypeBar(_ProfileLane):
+    """One read-only row of contiguous RPL cable types at the plan's KPs."""
+
+    def __init__(self):
+        super().__init__()
+        self.layer.set_style(tiers=1)
+        axis = self.getAxis("left")
+        axis.setStyle(showValues=True, tickLength=0, tickTextOffset=2, tickFont=self.layer.font)
+        axis.setTextPen(pg.mkPen("#444"))
+        axis.setTicks([[(0.5, "Cable type")]])
+        self.cursor = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen("#444", style=Qt.PenStyle.DashLine))
+        self.addItem(self.cursor, ignoreBounds=True)
+        self.cursor.setZValue(10)
+        self.cursor.hide()
+        self._starts = []
+
+    def set_ranges(self, ranges):
+        from ..workbench.layer_style import colour_for_cable_type, user_cable_type_colours
+        palette = user_cable_type_colours() if ranges else {}
+        entries = []
+        for start, end, label in ranges:
+            rgb = QColor(colour_for_cable_type(label, palette)).getRgb()[:3]
+            detail = f"Cable type: {label}\nKP {start:.3f}–{end:.3f}"
+            entries.append(ProfileEvent(start, end, SRC_RPL, "cable_type", label, detail, rgb))
+        self._set_entries(entries)
+        self._starts = [e.kp for e in self.layer.events]
+        self.setToolTip("")
+        self.cursor.hide()
 
     def _at(self, pos):
-        vb = self.getPlotItem().vb
-        rect = vb.sceneBoundingRect()
-        if not rect.contains(pos):
+        # The whole slim row is a target, including very short or unlabelled runs.
+        vb = self.getViewBox()
+        if not vb.sceneBoundingRect().contains(pos):
             return None, []
-        hits = self.layer.events_at(pos.x() - rect.left(), pos.y(), rect.top())
-        point = next((e for e in hits if not e.is_range), None)
-        return (point.kp if point else vb.mapSceneToView(pos).x()), hits
-
-    def _hover(self, pos):
-        kp, hits = self._at(pos)
-        self.setToolTip("<br>".join(html.escape(e.detail) for e in hits) if hits else "")
-        if kp is not None:
-            self.kpHovered.emit(kp)
-
-    def _click(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            kp, _hits = self._at(event.scenePos())
-            if kp is not None:
-                self.kpClicked.emit(kp)
+        kp = vb.mapSceneToView(pos).x()
+        i = bisect_right(self._starts, kp) - 1
+        if i >= 0 and kp <= self.layer.events[i].kp_end:
+            return kp, [self.layer.events[i]]
+        return kp, []
 
 
 class _WindowRegion(pg.LinearRegionItem):

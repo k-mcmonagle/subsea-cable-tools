@@ -22,6 +22,7 @@ Signals:
 from __future__ import annotations
 
 import math
+from bisect import bisect_left, bisect_right
 from typing import Dict, List, Optional, Tuple
 
 import pyqtgraph as pg
@@ -42,6 +43,7 @@ from qgis.PyQt.QtWidgets import (
     QSplitter,
     QTableWidgetItem,
     QToolButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -401,6 +403,17 @@ class EventMarkerItem(pg.GraphicsObject):
             painter.restore()
 
 
+class _ProfileSplitter(QSplitter):
+    def minimumSizeHint(self):
+        size = super().minimumSizeHint()
+        visible = sum(not self.widget(i).isHidden() for i in range(self.count()))
+        # In a scrolled dock Qt otherwise sizes every visible plot at its
+        # hard minimum, leaving even a visible splitter handle unable to move.
+        if visible > 1:
+            size.setHeight(size.height() + visible * 3 * self.fontMetrics().lineSpacing())
+        return size
+
+
 class BurialProfileWidget(QWidget):
     kpHovered = pyqtSignal(float)
     kpClicked = pyqtSignal(float)
@@ -449,9 +462,11 @@ class BurialProfileWidget(QWidget):
         self._active_plot = self.plot
         self._linked_plots = [self.plot, self.slope_plot]
         self._event_lane = None
+        self._cable_type_bar = None
         self._lane_enabled = False
         self._lane_content = None
         self._event_rows, self._section_rows = [], []
+        self._rpl_lane_events = []
         self._event_labels, self._label_method = {}, ""
         self._navigator = None
         self._navigator_enabled = False
@@ -540,6 +555,12 @@ class BurialProfileWidget(QWidget):
             "Untick to return to the stretched auto-scaled view.")
         self._true_scale_toggle.toggled.connect(self._true_scale_toggled)
         depth_toggle_row.addWidget(self._true_scale_toggle)
+        self._find_seabed = QToolButton()
+        self._find_seabed.setText("Find seabed")
+        self._find_seabed.setToolTip("Centre depth on the seabed in the current KP window, keeping the same zoom.")
+        self._find_seabed.setEnabled(False)
+        self._find_seabed.clicked.connect(self._find_visible_seabed)
+        depth_toggle_row.addWidget(self._find_seabed)
         # Overlays: show/hide each overlay kind, and filter Insufficient
         # Information by source criterion (all persisted).
         self._overlay_visible: Dict[str, bool] = {
@@ -660,7 +681,7 @@ class BurialProfileWidget(QWidget):
         depth_layout.addWidget(self._measure_table)
 
         # User-adjustable split between depth and slope panels, persisted.
-        self._splitter = QSplitter(_VERTICAL)
+        self._splitter = _ProfileSplitter(_VERTICAL)
         self._splitter.addWidget(self._depth_pane)
         self._splitter.addWidget(self._slope_pane)
         self._splitter.setStretchFactor(0, 3)
@@ -681,6 +702,13 @@ class BurialProfileWidget(QWidget):
             except Exception:
                 pass
         self._splitter.splitterMoved.connect(self._save_splitter_state)
+        self._splitter.setHandleWidth(7)
+        self._splitter.setObjectName("burialProfileSplitter")
+        self._splitter.setStyleSheet(
+            "QSplitter#burialProfileSplitter::handle:vertical { background: palette(midlight); }"
+            "QSplitter#burialProfileSplitter::handle:hover { background: palette(highlight); }")
+        for i in (1, 2):
+            self._splitter.handle(i).setToolTip("Drag to resize the adjacent plots")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -842,13 +870,18 @@ class BurialProfileWidget(QWidget):
         other_item.setXLink(self._active_plot.getPlotItem())
         self._linked_plots.append(plot_widget)
 
-    def set_layout_mode(self, mode, ground_plot):
+    def set_detail_plots(self, bathy, slope, ground, ground_plot):
         """Use the visible plot as KP master, including when bathymetry is hidden."""
         window = self._active_plot.viewRange()[0]
-        master = ground_plot if mode == "ground" else self.plot
-        self._ground_pane.setVisible(mode != "bathy")
-        self._depth_pane.setVisible(mode != "ground")
-        self._update_kp_axis_titles()
+        if bathy:
+            master = self.plot
+        else:
+            master = ground_plot if ground else self.slope_plot
+            if self.measuring():
+                self.set_measuring(False)
+        self._ground_pane.setVisible(ground)
+        self._depth_pane.setVisible(bathy)
+        self.set_slope_visible(slope)
         if master is not self._active_plot:
             master.setXLink(None)
             self._active_plot = master
@@ -881,10 +914,22 @@ class BurialProfileWidget(QWidget):
             else:
                 self._navigator.curve.clear()
 
+    def set_cable_type_ranges(self, ranges):
+        if self._cable_type_bar is None:
+            if not ranges:
+                return
+            from .profile_panels import CableTypeBar
+            self._cable_type_bar = CableTypeBar()
+            self.link_kp_plot(self._cable_type_bar)
+            self.layout().insertWidget(1 if self._event_lane is not None else 0, self._cable_type_bar)
+            self._cable_type_bar.kpHovered.connect(self._hover_at_kp)
+            self._cable_type_bar.kpClicked.connect(self.kpClicked)
+        self._cable_type_bar.set_ranges(ranges)
+
     def set_event_lane_visible(self, visible):
         if visible and self._event_lane is None:
             from .profile_panels import PlanEventLane
-            self._event_lane = PlanEventLane(self.plot)
+            self._event_lane = PlanEventLane(self.plot, compact_when_crowded=True)
             self.link_kp_plot(self._event_lane)
             self.layout().insertWidget(0, self._event_lane)
             self._event_lane.kpHovered.connect(self._hover_at_kp)
@@ -899,6 +944,12 @@ class BurialProfileWidget(QWidget):
                 self._event_lane.setToolTip("")
         self._apply_overlay_visibility()
 
+    def set_rpl_lane_events(self, events):
+        if self._rpl_lane_events != events:
+            self._rpl_lane_events = events
+            self._lane_content = None
+            self._update_lane()
+
     def _update_lane(self):
         lane = self._event_lane
         if lane is None:
@@ -907,9 +958,9 @@ class BurialProfileWidget(QWidget):
         if self._lane_enabled:
             if options != self._lane_content:
                 lane.set_rows(self._event_rows if options[0] else [], self._section_rows if options[1] else [],
-                              self._event_labels, self._label_method, _event_color, _STRIP_STYLES)
+                              self._event_labels, self._label_method, _event_color, _STRIP_STYLES, self._rpl_lane_events)
                 self._lane_content = options
-            lane.leaders.setVisible(options[0])
+            lane.leaders.setVisible(options[0] or bool(self._rpl_lane_events))
         else:
             lane.hide()
             lane.leaders.hide()
@@ -921,6 +972,26 @@ class BurialProfileWidget(QWidget):
         curve = self._slope_curves.get(key)
         if curve is not None:
             curve.setVisible(bool(checked))
+
+    def _find_visible_seabed(self):
+        view = self.plot.getViewBox()
+        (lo, hi), (shallow, deep) = view.viewRange()
+        mid = (lo + hi) / 2
+        depth = self._snap_depth(mid)
+        if depth is None:
+            # A missing midpoint can lie in a survey gap. Only fall back to
+            # an actual sounding inside the displayed window.
+            xs, ys = self._series_xs, self._series_ys
+            indices = range(bisect_left(xs, lo), bisect_right(xs, hi))
+            nearest = min((i for i in indices if is_finite(ys[i])),
+                          key=lambda i: abs(xs[i] - mid), default=None)
+            if nearest is None:
+                QToolTip.showText(self._find_seabed.mapToGlobal(self._find_seabed.rect().bottomLeft()),
+                                  "No sampled seabed in this KP window.", self._find_seabed)
+                return
+            depth = ys[nearest]
+        half_height = (deep - shallow) / 2
+        view.setYRange(depth - half_height, depth + half_height, padding=0)
 
     def _save_splitter_state(self, *_args) -> None:
         QSettings().setValue(f"{_SETTINGS_ROOT}/profile_splitter_state",
@@ -1312,6 +1383,7 @@ class BurialProfileWidget(QWidget):
         ys = [float("nan") if d is None else d for _kp, d in self._series]
         self._series_xs = xs  # cached for the per-hover lookups
         self._series_ys = ys
+        self._find_seabed.setEnabled(bool(xs) and any(is_finite(y) for y in ys))
         self._curve.setData(xs, ys, connect="finite")
         if self._lane_enabled:
             self._event_lane.leaders.set_cable(self._curve.xData, self._curve.yData)
@@ -1830,6 +1902,8 @@ class BurialProfileWidget(QWidget):
         self.set_profile([])
         self.set_overlays(generation.ResolutionContext())
         self.set_hazards([])
+        self.set_cable_type_ranges([])
+        self.set_rpl_lane_events([])
         self.set_events([], "")
         self.set_sections([])
         self.set_slope_series([], [], [])
@@ -1890,6 +1964,9 @@ class BurialProfileWidget(QWidget):
         self._vline.setVisible(True)
         self._slope_vline.setPos(kp)
         self._slope_vline.setVisible(True)
+        if self._cable_type_bar is not None and not self._cable_type_bar.isHidden():
+            self._cable_type_bar.cursor.setValue(kp)
+            self._cable_type_bar.cursor.show()
         lines = [f"KP {schema.format_kp(kp)}"]
         if depth is not None:
             lines.append(f"Depth {depth:.1f} m")
@@ -1923,6 +2000,8 @@ class BurialProfileWidget(QWidget):
         if kp is None:
             self._vline.setVisible(False)
             self._slope_vline.setVisible(False)
+            if self._cable_type_bar is not None:
+                self._cable_type_bar.cursor.hide()
             self._readout.setVisible(False)
             return
         self._hover_at_kp(kp)

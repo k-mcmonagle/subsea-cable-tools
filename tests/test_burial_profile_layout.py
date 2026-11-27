@@ -2,7 +2,7 @@
 import unittest
 from unittest.mock import Mock, patch
 
-from qgis.core import QgsPointXY
+from qgis.core import QgsFeature, QgsField, QgsGeometry, QgsPointXY, QgsProject, QgsVectorLayer
 from qgis.PyQt.QtCore import QPoint, QPointF, QSettings, Qt
 from qgis.PyQt.QtTest import QTest
 from qgis.PyQt.QtWidgets import QApplication, QSplitter, QWidget
@@ -17,9 +17,10 @@ class ProfileLayoutTests(unittest.TestCase):
     def setUp(self):
         self.settings = QSettings()
         self.keys = ["SubseaCableTools/BurialPlanner/" + k for k in (
-            "profile_layout", "event_lane_visible", "navigator_visible", "dock_splitter_state",
+            "profile_layout", "event_lane_visible", "cable_type_bar_visible", "navigator_visible", "dock_splitter_state",
             "profile_splitter_state", "ground_splitter_state", "profile_drag_enabled",
-            "profile_overlay_events", "profile_overlay_sections", "slope_panel_visible")]
+            "profile_overlay_events", "profile_overlay_sections", "slope_panel_visible",
+            "lane_rpl_repeater", "lane_rpl_bodies", "lane_rpl_crossings", "lane_rpl_alter_courses", "lane_rpl_other")]
         self.previous = {k: self.settings.value(k) for k in self.keys if self.settings.contains(k)}
         for key in self.keys:
             self.settings.remove(key)
@@ -56,7 +57,13 @@ class ProfileLayoutTests(unittest.TestCase):
         self.assertEqual(p.plot.viewRange()[0], [13, 18])
         d.slope_toggle.setChecked(True)
         for mode in ("stacked", "ground", "bathy"):
-            d._profile_layout_actions[mode].trigger()
+            if mode == "bathy":
+                d.bathy_toggle.trigger()
+                d.ground_toggle.trigger()
+            elif mode == "ground":
+                d.bathy_toggle.trigger()
+            else:
+                d.ground_toggle.trigger()
             # Showing a splitter child posts layout requests through the
             # profile, the outer splitter and the dock on successive turns.
             QTest.qWait(50)
@@ -85,6 +92,20 @@ class ProfileLayoutTests(unittest.TestCase):
         self.assertTrue(nav.isHidden())
         self.assertIsNone(nav._view)
         self.assertFalse(nav.region.isVisible())
+
+    def test_view_menu_allows_several_plot_changes_while_open(self):
+        d = self.dock
+        menu = d.view_button.menu()
+        menu.popup(d.view_button.mapToGlobal(QPoint(0, 0)))
+        self.addCleanup(menu.close)
+        QTest.qWait(30)
+        for action in (d.slope_toggle, d.ground_toggle):
+            pos = menu.actionGeometry(action).center()
+            QTest.mouseMove(menu, pos)
+            QTest.mouseClick(menu, Qt.MouseButton.LeftButton, pos=pos)
+            self.assertTrue(action.isChecked())
+            self.assertTrue(menu.isVisible())
+        self.assertFalse(self.profile._depth_pane.isHidden())
 
     def test_navigator_pan_edges_and_missing_bathymetry(self):
         d, p = self.dock, self.profile
@@ -117,12 +138,200 @@ class ProfileLayoutTests(unittest.TestCase):
         self.assertIn("Depth 45.5 m", p._readout.toPlainText())
         self.assertEqual(p._scope, (12, 22))
 
+    def test_hiding_middle_plot_keeps_a_movable_divider_and_kp_master(self):
+        d, p = self.dock, self.profile
+        d.resize(760, 640)
+        d.slope_toggle.trigger()
+        d.ground_toggle.trigger()
+        d.navigator_toggle.trigger()
+        d.slope_toggle.trigger()
+        QTest.qWait(60)
+        before = p._splitter.sizes()
+        self.assertEqual(before[1], 0)
+        low, high = p._splitter.getRange(2)
+        self.assertGreater(high - low, 20)
+        self.assertTrue(p._splitter.handle(2).isVisible())
+        p._splitter.moveSplitter(low if before[0] > (low + high) / 2 else high, 2)
+        after = p._splitter.sizes()
+        self.assertNotEqual(before[0], after[0])
+        self.assertNotEqual(before[2], after[2])
+        self.assertGreater(min(after[0], after[2]), 0)
+        p._navigator.region.setRegion((13, 16))
+        p.set_measuring(True)
+        d.slope_toggle.trigger()
+        d.bathy_toggle.trigger()
+        d.ground_toggle.trigger()
+        QTest.qWait(50)
+        self.assertIs(p._active_plot, p.slope_plot)
+        self.assertFalse(p.measuring())
+        self.assertFalse(d.slope_toggle.isEnabled())
+        self.assertEqual(p.slope_plot.viewRange()[0], [13, 16])
+        p.slope_plot.setXRange(14, 17, padding=0)
+        self.assertEqual(p._navigator.region.getRegion(), (14, 17))
+        d.bathy_toggle.trigger()
+        d.slope_toggle.trigger()
+        QTest.qWait(50)
+        self.assertEqual(p.plot.viewRange()[0], [14, 17])
+
+    def test_find_seabed_only_translates_the_vertical_axis(self):
+        p = self.profile
+        view = p.plot.getViewBox()
+        for locked in (False, True):
+            p.set_true_scale(locked)
+            p.plot.setXRange(13.1, 13.9, padding=0)
+            view.translateBy(y=100)
+            x, y = view.viewRange()
+            p._find_seabed.click()
+            after_x, after_y = view.viewRange()
+            for old, new in zip(x, after_x):
+                self.assertAlmostEqual(old, new, places=6)
+            self.assertAlmostEqual(after_y[1] - after_y[0], y[1] - y[0], places=6)
+            self.assertAlmostEqual(sum(after_y)/2, 45.5, places=6)
+        p.set_true_scale(False)
+        p.plot.setXRange(14, 16, padding=0)
+        p._find_seabed.click()  # No sounding at KP 15. Centre on a visible neighbour.
+        self.assertIn(round(sum(view.viewRange()[1])/2), (46, 49))
+        p.plot.setXRange(19, 20, padding=0)
+        before = view.viewRange()
+        with patch("qgis.PyQt.QtWidgets.QToolTip.showText"):
+            p._find_seabed.click()
+        self.assertEqual(view.viewRange(), before)
+
+    def test_rpl_lane_uses_plan_chainage_and_filters_without_editing(self):
+        from ..burial.analysis_task import build_route_frame
+        from ..burial.profile_panels import read_rpl_lane_events
+        from ..workbench.schema import CATEGORY_BODY
+
+        d, p = self.dock, self.profile
+        points = QgsVectorLayer("Point?crs=EPSG:4326&field=Event:string&field=DistCumulative:double", "positions", "memory")
+        positions = [QgsPointXY(0.01*i, 0) for i in range(3)]
+        for i, (pos, label) in enumerate(zip(positions, ("Unit 1", "A/C 2", "Joint"))):
+            feature = QgsFeature(points.fields())
+            feature.setGeometry(QgsGeometry.fromPointXY(pos))
+            feature.setAttributes([label, 100 + i])
+            points.dataProvider().addFeatures([feature])
+        lines = QgsVectorLayer("LineString?crs=EPSG:4326", "route", "memory")
+        feature = QgsFeature()
+        feature.setGeometry(QgsGeometry.fromPolylineXY(positions))
+        lines.dataProvider().addFeatures([feature])
+        route, _ = build_route_frame(lines, QgsProject.instance(), start_kp_km=12.)
+        store = Mock()
+        store.get_rpl.return_value = {"points_layer": "points"}
+        store.open_layer.return_value = points
+        store.list_event_rules.return_value = [dict(pattern="^Unit", category=CATEGORY_BODY, body_type="repeater")]
+        with patch.object(d.model, "route", route), patch.object(d.model, "resolved_rpl_id", "active"), \
+                patch.object(d.model, "workbench_store", store), \
+                patch("subsea_cable_tools.burial.profile_panels.read_rpl_lane_events", wraps=read_rpl_lane_events) as read:
+            d.event_lane_toggle.trigger()
+            lane = p._event_lane
+            self.assertEqual([e.label for e in lane.layer.events], ["Unit 1", "Joint"])
+            d._rpl_filters["alter_courses"].trigger()
+            self.assertEqual([e.label for e in lane.layer.events], ["Unit 1", "A/C 2", "Joint"])
+            event = lane.layer.events[1]
+            self.assertAlmostEqual(event.kp, route.kp_at_point(positions[1]).kp_km, places=5)
+            self.assertIn("printed KP 101.000", event.detail)
+            d._rpl_filters["bodies"].trigger()
+            self.assertEqual([e.label for e in lane.layer.events], ["Unit 1", "A/C 2"])
+            self.assertEqual(read.call_count, 1)
+            store.get_rpl.assert_called_once_with("active")
+        d._refresh_rpl_lane()
+        self.assertFalse(lane.layer.events)
+        self.assertTrue(lane.isHidden())
+
+    def test_cable_type_bar_follows_measured_legs_view_and_map(self):
+        from ..qgis_compat import FIELD_TYPE_STRING
+        from .test_kp_reference import _FakeWorkbench, _plan_on
+
+        d, p = self.dock, self.profile
+        wb = _FakeWorkbench()
+        vertices = [(0, 0), (.01, 0), (.02, 0), (.01, 0), (.01, .01), (.02, .01)]
+        wb.add("typed", "1", vertices, start_kp=12, bias=200)
+        wb.add("untyped", "2", vertices, start_kp=12)
+        lines = wb.open_layer("typed_l")
+        provider = lines.dataProvider()
+        provider.addAttributes([QgsField("CableType", FIELD_TYPE_STRING)])
+        lines.updateFields()
+        labels = ["Type A", "Type A", None, "Type A", "Type B"]
+        provider.changeAttributeValues({
+            f.id(): {lines.fields().indexOf("CableType"): labels[f["SeqNo"] - 1]} for f in lines.getFeatures()})
+        _plan_on(d.model, wb, "typed")
+        self.assertTrue(d.cable_type_toggle.isEnabled())
+        self.assertIsNone(p._cable_type_bar)
+        route = d.model.route
+        edges = [12 + m / 1000 for m in route.feature_offsets_m] + [route.end_kp_km]
+        expected = [(edges[0], edges[2], "Type A"), (edges[3], edges[4], "Type A"), (edges[4], edges[5], "Type B")]
+        self.assertEqual(d.model.cable_type_ranges, expected)
+        saved = dict(d.model.plan)
+        with patch("subsea_cable_tools.workbench.layer_style.user_cable_type_colours", return_value={"TYPEA": "#123456"}):
+            d.cable_type_toggle.trigger()
+        bar = p._cable_type_bar
+        self.assertTrue(bar.isVisible())
+        self.assertFalse(d.event_lane_toggle.isChecked())
+        self.assertEqual(bar.layer.events[0].colour, (18, 52, 86))
+        d.ground_toggle.trigger()
+        d.bathy_toggle.trigger()
+        d.navigator_toggle.trigger()
+        p._navigator.region.setRegion((edges[1], edges[4]))
+        QTest.qWait(40)
+        for actual, wanted in zip(bar.viewRange()[0], (edges[1], edges[4])):
+            self.assertAlmostEqual(actual, wanted, places=4)
+        vb = bar.getViewBox()
+        middle = (edges[1] + edges[2]) / 2
+        pos = vb.mapViewToScene(QPointF(middle, 0.5))
+        bar._hover(pos)
+        self.assertIn("Type A", bar.toolTip())
+        self.assertIn(f"{edges[0]:.3f}–{edges[2]:.3f}", bar.toolTip())
+        self.assertAlmostEqual(bar.cursor.value(), middle, places=6)
+        click = Mock()
+        click.button.return_value = Qt.MouseButton.LeftButton
+        click.scenePos.return_value = pos
+        with patch.object(d, "highlight_kp") as highlight:
+            bar._click(click)
+        self.assertAlmostEqual(highlight.call_args[0][0], middle, places=6)
+        gap = (edges[2] + edges[3]) / 2
+        bar._hover(vb.mapViewToScene(QPointF(gap, .5)))
+        self.assertEqual(bar.toolTip(), "")
+        p.focus_kp(edges[3])
+        self.assertAlmostEqual(bar.cursor.value(), edges[3])
+        self.assertEqual(d.model.plan, saved)
+        d.cable_type_toggle.trigger()
+        self.assertTrue(bar.isHidden())
+        self.assertFalse(bar.layer.events)
+        d.cable_type_toggle.trigger()
+        _plan_on(d.model, wb, "untyped")
+        self.assertTrue(bar.isHidden())
+        self.assertFalse(d.cable_type_toggle.isEnabled())
+        self.assertFalse(bar.layer.events)
+        _plan_on(d.model, wb, "typed")
+        self.assertTrue(bar.isVisible())
+
+    def test_crowded_labels_keep_all_ticks_and_exact_kps(self):
+        d, p = self.dock, self.profile
+        d.profile_expand.click()
+        d.event_lane_toggle.trigger()
+        rows = [dict(kp=12.2 + i*.4, event_id=str(i),
+                     event_type=schema.EVENT_BURIAL_START if i%2 else schema.EVENT_BURIAL_END) for i in range(24)]
+        p.set_events(rows, "plough")
+        lane = p._event_lane
+        QTest.qWait(50)
+        # Deterministic device width for both displays and font scales.
+        with patch.object(lane.layer, "x_mapping", return_value=(12, 22, 0, 420, 0)):
+            layout = lane.layer.layout()
+            self.assertTrue(layout["compact"])
+            self.assertEqual(len(layout["slots"]), len(rows))
+            i = next(i for i, slot in enumerate(layout["slots"]) if slot.tier < 0)
+            hits = lane.layer.events_at(layout["x"][i], lane.layer.lane_height() - 1, 0)
+            self.assertIn(lane.layer.events[i], hits)
+            self.assertIn(f"{lane.layer.events[i].kp:.3f}", lane.layer.events[i].detail)
+        with patch.object(lane.layer, "x_mapping", return_value=(12, 13, 0, 420, 0)):
+            self.assertFalse(lane.layer.layout()["compact"])
+
     def test_compact_planning_keeps_controls_and_restores_the_table(self):
         d, p = self.dock, self.profile
         d.refresh_plans()
         d.tabs.setCurrentWidget(d.bas_tab)
         d.resize(720, 620)
-        d._profile_layout_actions["stacked"].trigger()
+        d.ground_toggle.trigger()
         d.slope_toggle.setChecked(True)
         d.navigator_toggle.setChecked(True)
         p.set_route_extent(10, 30)
@@ -199,7 +408,8 @@ class ProfileLayoutTests(unittest.TestCase):
 
     def test_layout_preference_restores_in_another_dock(self):
         d = self.dock
-        d._profile_layout_actions["ground"].trigger()
+        d.ground_toggle.trigger()
+        d.bathy_toggle.trigger()
         d.event_lane_toggle.trigger()
         d.navigator_toggle.trigger()
         legacy = QSplitter(Qt.Orientation.Vertical)
@@ -209,7 +419,7 @@ class ProfileLayoutTests(unittest.TestCase):
         self.settings.setValue("SubseaCableTools/BurialPlanner/profile_splitter_state", legacy.saveState())
         with _Harness() as reopened:
             other = reopened.dock
-            self.assertTrue(other._profile_layout_actions["ground"].isChecked())
+            self.assertTrue(other.ground_toggle.isChecked())
             self.assertIs(other.profile._active_plot, other.ground_tab.plot.plot)
             self.assertFalse(other.profile_drag_toggle.isEnabled())
             self.assertTrue(other.event_lane_toggle.isChecked())

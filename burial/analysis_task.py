@@ -835,16 +835,21 @@ def build_route_frame(lines_layer: QgsVectorLayer,
                       project: Optional[QgsProject] = None,
                       start_kp_km: float = 0.0,
                       distance_mode: str = "ellipsoidal",
-                      grid_crs: str = ""
+                      grid_crs: str = "", *,
+                      cable_type_ranges: Optional[List[Tuple[float, float, str]]] = None
                       ) -> Tuple[RouteFrame, object]:
     """Clone a route (lines layer in Workbench RPL format) into a RouteFrame
     over WGS84 geometries. Main thread only.
 
     ``start_kp_km`` is the RPL's start KP (its first position's stated KP),
     so plan KPs read like the RPL even when it does not start at 0; all
-    chainage beyond the start is measured (geodesic, WGS84)."""
+    chainage beyond the start follows the plan's distance mode. If supplied,
+    ``cable_type_ranges`` receives the typed runs from this same snapshot."""
     project = project or QgsProject.instance()
     ordered = []
+    type_field = lines_layer.fields().indexFromName("CableType") if cable_type_ranges is not None else -1
+    if type_field >= 0:
+        from ..workbench.rpl_layer_io import _attr
     xform = None
     if lines_layer.crs() != WGS84:
         xform = QgsCoordinateTransform(lines_layer.crs(), WGS84, project)
@@ -865,9 +870,10 @@ def build_route_frame(lines_layer: QgsVectorLayer,
             seq = int(feat["SeqNo"])
         except (KeyError, TypeError, ValueError):
             seq = len(ordered)
-        ordered.append((seq, geom))
+        cable_type = str(_attr(feat, "CableType") or "").strip() if type_field >= 0 else ""
+        ordered.append((seq, geom, cable_type))
     ordered.sort(key=lambda t: t[0])
-    geoms = [g for _, g in ordered]
+    geoms = [g for _, g, _ in ordered]
     if not geoms:
         raise ri.RuleInputError("The route layer has no usable line geometry.")
     from ..kp_geo_utils import crosses_antimeridian
@@ -886,9 +892,23 @@ def build_route_frame(lines_layer: QgsVectorLayer,
     # the RPL's stored line segments exactly. Great-circle interpolation
     # between sparse geographic vertices can otherwise render several metres
     # away from the source line.
-    return RouteFrame.from_source(
+    frame = RouteFrame.from_source(
         geoms, distance, follow_stored_geometry=True,
-        start_kp_km=start_kp_km), distance
+        start_kp_km=start_kp_km)
+    if cable_type_ranges is not None:
+        runs = []
+        if type_field >= 0:
+            edges = [frame.start_kp_km + m / 1000.0 for m in frame.feature_offsets_m]
+            edges.append(frame.end_kp_km)
+            for (_, _, label), start, end in zip(ordered, edges, edges[1:]):
+                if end <= start or not label or label.upper() == "NULL":
+                    continue
+                if runs and runs[-1][1] == start and runs[-1][2].casefold() == label.casefold():
+                    runs[-1] = (runs[-1][0], end, runs[-1][2])
+                else:
+                    runs.append((start, end, label))
+        cable_type_ranges[:] = runs
+    return frame, distance
 
 
 def build_work(route: RouteFrame, distance, plan: Dict, rule_rows: List[Dict],

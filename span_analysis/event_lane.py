@@ -26,7 +26,7 @@ import numpy as np
 import pyqtgraph as pg
 
 from qgis.PyQt.QtCore import QObject, QPointF, QRectF, Qt, pyqtSignal
-from qgis.PyQt.QtGui import QColor, QFont, QFontMetricsF, QPen
+from qgis.PyQt.QtGui import QColor, QFont, QFontMetricsF, QPen, qGray
 
 from . import events as ev
 
@@ -57,9 +57,10 @@ class EventLayer(QObject):
 
     changed = pyqtSignal()
 
-    def __init__(self, lane_vb, parent=None):
+    def __init__(self, lane_vb, parent=None, *, compact_when_crowded=False):
         super().__init__(parent)
         self.lane_vb = lane_vb
+        self.compact_when_crowded = compact_when_crowded
         self.events: List[ev.ProfileEvent] = []
         self.tiers = 2
         self.label_mode = LABEL_NAME
@@ -94,9 +95,9 @@ class EventLayer(QObject):
     def lane_height(self) -> int:
         return PAD_PX + self.tiers * ROW_PX + self.range_rows * (BAR_PX + 1) + TICK_PX + 1
 
-    def text_of(self, e: ev.ProfileEvent) -> str:
+    def text_of(self, e: ev.ProfileEvent, compact=False) -> str:
         label = e.label if len(e.label) <= MAX_LABEL_CHARS else e.label[:MAX_LABEL_CHARS - 1] + "…"
-        if self.label_mode == LABEL_NAME_KP and not e.is_range:
+        if self.label_mode == LABEL_NAME_KP and not e.is_range and not compact:
             label += f"  {e.kp:.3f}"
         return _glyph(e) + label
 
@@ -145,7 +146,18 @@ class EventLayer(QObject):
                 items.append((x, w, e.priority))
             xs.append(x)
         slots = ev.layout_labels(items, width, self.tiers)
-        self._layout = {"slots": slots, "x": xs, "width": width, "lo": lo, "hi": hi}
+        compact = False
+        if self.compact_when_crowded and self.label_mode == LABEL_NAME_KP:
+            points = [i for i, e in enumerate(self.events) if not e.is_range and lo <= e.kp <= hi]
+            hidden = sum(slots[i].tier < 0 for i in points)
+            if hidden:
+                for i in points:
+                    x, _, priority = items[i]
+                    items[i] = (x, self._metrics.horizontalAdvance(self.text_of(self.events[i], compact=True)) + 8, priority)
+                shorter = ev.layout_labels(items, width, self.tiers)
+                if sum(shorter[i].tier < 0 for i in points) < hidden:
+                    slots, compact = shorter, True
+        self._layout = {"slots": slots, "x": xs, "width": width, "lo": lo, "hi": hi, "compact": compact}
         self._cache_key = key
         return self._layout
 
@@ -241,7 +253,7 @@ class EventLaneItem(_DeviceItem):
 
             # KP ranges: bars on their rows.
             for i, e in enumerate(layer.events):
-                if not e.is_range:
+                if not e.is_range or e.hi <= lay["lo"] or e.lo >= lay["hi"]:
                     continue
                 row = layer.range_row(i)
                 a, b = sorted((x_of(max(e.lo, lay["lo"])), x_of(min(e.hi, lay["hi"]))))
@@ -275,8 +287,10 @@ class EventLaneItem(_DeviceItem):
                 painter.setPen(pen)
                 painter.setBrush(QColor(255, 255, 255, 235))
                 painter.drawRoundedRect(box, 2.5, 2.5)
-                painter.setPen(colour)
-                painter.drawText(box, int(getattr(_ALIGN, "value", _ALIGN)), layer.text_of(e))
+                # A light range colour still identifies the bar and border;
+                # darken the lettering against the white label.
+                painter.setPen(colour.darker(180) if e.is_range and qGray(colour.rgb()) > 140 else colour)
+                painter.drawText(box, int(getattr(_ALIGN, "value", _ALIGN)), layer.text_of(e, lay["compact"]))
         finally:
             painter.restore()
 

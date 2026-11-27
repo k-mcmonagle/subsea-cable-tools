@@ -135,6 +135,7 @@ class PlanModel(QObject):
         self._route_geom_fp = ""
         self._kp_path_fp: Optional[str] = None
         self.route = None            # RouteFrame over the plan's RPL (WGS84)
+        self.cable_type_ranges: List[Tuple[float, float, str]] = []
         self.distance = None
         self.resolved_rpl_id = ""
         self.route_notice = ""
@@ -352,6 +353,7 @@ class PlanModel(QObject):
         self._route_geom_fp = ""
         self._kp_path_fp = None
         self.route = None
+        self.cable_type_ranges = []
         self.resolved_rpl_id = ""
         self.route_notice = ""
         self.acq_cache.clear()
@@ -380,6 +382,7 @@ class PlanModel(QObject):
     def _load_route(self) -> None:
         """Route geometry from the Workbench RPL, or any registered line layer."""
         self.route = None
+        self.cable_type_ranges = []
         self.distance = None
         self.resolved_rpl_id = ""
         self.route_notice = ""
@@ -434,7 +437,8 @@ class PlanModel(QObject):
                 # chainage anchored at the RPL's start KP.
                 from .rereference_qgis import rpl_route
                 self.route, self.distance, self.rpl_positions = rpl_route(
-                    self.workbench_store, rpl_row, project, self.kp_mode())
+                    self.workbench_store, rpl_row, project, self.kp_mode(),
+                    cable_type_ranges=self.cable_type_ranges)
             else:
                 mode, grid = self.kp_mode()
                 self.route, self.distance = build_route_frame(
@@ -792,7 +796,8 @@ class PlanModel(QObject):
         # An edited layer may be the only copy of the new geometry. Keep
         # the old in-memory frame available for a retry if saving fails.
         previous_route = (self.route, self.distance, self.resolved_rpl_id, self.route_notice,
-                          self.route_error, self.rpl_positions, self.kp_check, self.newer_rpl)
+                          self.route_error, self.rpl_positions, self.kp_check, self.newer_rpl,
+                          self.cable_type_ranges)
         result = None
         try:
             self.plan = dict(previous_plan, **updates)
@@ -813,7 +818,8 @@ class PlanModel(QObject):
             if result is None:
                 self.plan = previous_plan
                 (self.route, self.distance, self.resolved_rpl_id, self.route_notice,
-                 self.route_error, self.rpl_positions, self.kp_check, self.newer_rpl) = previous_route
+                 self.route_error, self.rpl_positions, self.kp_check, self.newer_rpl,
+                 self.cable_type_ranges) = previous_route
                 self._route_geom_fp = ""
                 self._kp_path_fp = None
                 self._segment_wkt_cache.clear()

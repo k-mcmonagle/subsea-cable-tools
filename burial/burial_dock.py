@@ -68,6 +68,7 @@ except (ImportError, AttributeError):  # pragma: no cover
             return False
 
 from ..elided_label import ElidedLabel
+from ..plotkit.widgets import StayOpenMenu
 from ..plugin_log import log_debug, log_exception, log_info, log_warning
 from ..schema_guard import NewerVersionError
 from ..qgis_compat import (
@@ -352,22 +353,16 @@ class BurialPlannerDock(QDockWidget):
         self.view_button.setPopupMode(TOOLBUTTON_POPUP_MODE_INSTANT)
         self.view_button.setToolTip(
             "Choose the profile layout, visible panels and editing tools.")
-        view_menu = QMenu(self.view_button)
+        view_menu = StayOpenMenu(self.view_button)
         view_menu.setToolTipsVisible(True)
-        layouts = view_menu.addMenu("Profile layout")
-        self._profile_layout_actions = {}
-        for mode, title in (("bathy", "Bathymetry"), ("ground", "Below seabed"), ("stacked", "Stacked profiles")):
-            action = layouts.addAction(title)
-            action.setCheckable(True)
-            action.triggered.connect(lambda _checked, key=mode: self._set_profile_layout(key))
-            self._profile_layout_actions[mode] = action
         self.event_lane_toggle = view_menu.addAction("Event and section lane")
         self.event_lane_toggle.setCheckable(True)
-        self.event_lane_toggle.setToolTip("Show plan events and section ranges above the profile, aligned by KP.")
-        self.navigator_toggle = view_menu.addAction("Full-route navigator")
-        self.navigator_toggle.setCheckable(True)
-        self.navigator_toggle.setToolTip("Drag the visible window or its edges to pan or zoom the profiles.")
-        self.slope_toggle = view_menu.addAction("Slope panel")
+        self.event_lane_toggle.setToolTip("Show plan and RPL events by KP. Zoom in for more labels or hover a tick for details.")
+        self.cable_type_toggle = view_menu.addAction("RPL cable type bar")
+        self.cable_type_toggle.setCheckable(True)
+        self.bathy_toggle = view_menu.addAction("Bathymetry")
+        self.bathy_toggle.setCheckable(True)
+        self.slope_toggle = view_menu.addAction("Slope")
         self.slope_toggle.setCheckable(True)
         self.slope_toggle.setChecked(bool(QSettings().value(
             "SubseaCableTools/BurialPlanner/slope_panel_visible", False,
@@ -377,7 +372,40 @@ class BurialPlannerDock(QDockWidget):
             "starboard of travel) and absolute slope under the depth "
             "profile. Cross/absolute need cross-offset samples — resample "
             "the profile after configuring bathymetry.")
-        self.slope_toggle.toggled.connect(self._slope_panel_toggled)
+        self.ground_toggle = view_menu.addAction("Ground model (below seabed)")
+        self.ground_toggle.setCheckable(True)
+        self.navigator_toggle = view_menu.addAction("Full-route navigator")
+        self.navigator_toggle.setCheckable(True)
+        self.navigator_toggle.setToolTip("Drag the visible window or its edges to pan or zoom the profiles.")
+        self._lane_rpl_key = None
+        self._lane_rpl_rows = []
+        self._lane_rpl_issue = ""
+        self._lane_filter_menu = StayOpenMenu("Event lane contents", view_menu)
+        self._lane_filter_menu.setToolTipsVisible(True)
+        view_menu.addMenu(self._lane_filter_menu)
+        self._plan_lane_filters = {}
+        for key, label in (("events", "Plan events"), ("sections", "Plan sections")):
+            action = self._lane_filter_menu.addAction(label)
+            action.setCheckable(True)
+            action.setToolTip("Also controls this overlay on bathymetry when the event lane is closed.")
+            action.triggered.connect(lambda checked, k=key: self.profile.set_overlay_visible(k, checked))
+            self._plan_lane_filters[key] = action
+        self._lane_filter_menu.aboutToShow.connect(self._sync_lane_filters)
+        self._lane_filter_menu.addSeparator()
+        self._rpl_notice = self._lane_filter_menu.addAction("")
+        self._rpl_notice.setEnabled(False)
+        self._rpl_filters = {}
+        for key, label, enabled in (("repeater", "RPL repeaters", True), ("bodies", "Other RPL cable bodies", True),
+                                    ("crossings", "RPL crossings", False), ("alter_courses", "RPL alter courses (A/C)", False),
+                                    ("other", "Other RPL events", False)):
+            action = self._lane_filter_menu.addAction(label)
+            action.setCheckable(True)
+            setting = "SubseaCableTools/BurialPlanner/lane_rpl_" + key
+            action.setChecked(QSettings().value(setting, enabled, type=bool))
+            action.toggled.connect(lambda checked, path=setting: QSettings().setValue(path, checked))
+            action.toggled.connect(self._refresh_rpl_lane)
+            self._rpl_filters[key] = action
+        view_menu.addSeparator()
         self.profile_drag_toggle = view_menu.addAction("Allow event dragging")
         self.profile_drag_toggle.setCheckable(True)
         self.profile_drag_toggle.setChecked(bool(QSettings().value(
@@ -445,8 +473,11 @@ class BurialPlannerDock(QDockWidget):
         settings = QSettings()
         self._set_profile_layout(settings.value("SubseaCableTools/BurialPlanner/profile_layout", "bathy"),
                                  remember=False)
+        for toggle in (self.bathy_toggle, self.slope_toggle, self.ground_toggle):
+            toggle.toggled.connect(self._apply_plot_selection)
         for action, key, apply in (
                 (self.event_lane_toggle, "event_lane_visible", self.profile.set_event_lane_visible),
+                (self.cable_type_toggle, "cable_type_bar_visible", self._refresh_cable_type_bar),
                 (self.navigator_toggle, "navigator_visible", self.profile.set_navigator_visible)):
             path = f"SubseaCableTools/BurialPlanner/{key}"
             action.setChecked(settings.value(path, False, type=bool))
@@ -457,7 +488,7 @@ class BurialPlannerDock(QDockWidget):
         self.profile.kpClicked.connect(self.goto_kp)
         self.profile.kpDoubleClicked.connect(self._on_profile_double_clicked)
         self.profile.eventMoveRequested.connect(self._on_profile_event_moved)
-        self.profile.set_slope_visible(self.slope_toggle.isChecked())
+        self.event_lane_toggle.toggled.connect(self._refresh_rpl_lane)
         self.profile_scroll = _scroll_panel(self.profile)
         self.profile_scroll.setMinimumHeight(110)
         profile_layout.addWidget(self.profile_scroll, 1)
@@ -1356,8 +1387,12 @@ class BurialPlannerDock(QDockWidget):
         plan = self.model.plan
         self._cancel_profile_refresh(silent=True)
         self._profile_generation += 1
+        self._refresh_cable_type_bar(self.cable_type_toggle.isChecked())
         if not plan or self.model.route is None:
             self._profile_scope_key = None
+            self._lane_rpl_key = None
+            self._lane_rpl_rows = []
+            self._lane_rpl_issue = ""
             self.profile.clear()
             self.profile_status.setText(
                 self.model.route_error or "Select a plan route to display its profile.")
@@ -1481,22 +1516,37 @@ class BurialPlannerDock(QDockWidget):
             "SubseaCableTools/BurialPlanner/dock_splitter_state",
             self.splitter.saveState())
 
-    def _slope_panel_toggled(self, checked: bool) -> None:
-        QSettings().setValue(
-            "SubseaCableTools/BurialPlanner/slope_panel_visible", bool(checked))
-        self.profile.set_slope_visible(bool(checked))
-
     def _set_profile_layout(self, mode, remember=True):
-        if mode not in self._profile_layout_actions:
+        if mode not in ("bathy", "ground", "stacked", "slope"):
             mode = "bathy"
-        for key, action in self._profile_layout_actions.items():
-            action.setChecked(key == mode)
-        self.ground_tab.place_plot(None if mode == "bathy" else self.profile.ground_layout)
-        self.profile.set_layout_mode(mode, self.ground_tab.plot.plot)
-        self.profile_drag_toggle.setEnabled(mode != "ground")
-        self._style_view_button(mode != "ground" and self.profile_drag_toggle.isChecked())
+        for action, checked in ((self.bathy_toggle, mode in ("bathy", "stacked")),
+                                (self.ground_toggle, mode in ("ground", "stacked")),
+                                (self.slope_toggle, mode == "slope" or self.slope_toggle.isChecked())):
+            previous = action.blockSignals(True)
+            action.setChecked(checked)
+            action.blockSignals(previous)
+        self._apply_plot_selection(remember=remember)
+
+    def _apply_plot_selection(self, _checked=False, *, remember=True):
+        actions = (self.bathy_toggle, self.slope_toggle, self.ground_toggle)
+        bathy, slope, ground = [a.isChecked() for a in actions]
+        count = sum((bathy, slope, ground))
+        if not count:
+            self._set_profile_layout("bathy", remember)
+            return
+        for action in actions:
+            action.setEnabled(not action.isChecked() or count > 1)
+        self.ground_tab.place_plot(self.profile.ground_layout if ground else None)
+        self.profile.set_detail_plots(bathy, slope, ground, self.ground_tab.plot.plot)
+        self.profile_drag_toggle.setEnabled(bathy)
+        self._style_view_button(bathy and self.profile_drag_toggle.isChecked())
         if remember:
+            if bathy:
+                mode = "stacked" if ground else "bathy"
+            else:
+                mode = "ground" if ground else "slope"
             QSettings().setValue("SubseaCableTools/BurialPlanner/profile_layout", mode)
+            QSettings().setValue("SubseaCableTools/BurialPlanner/slope_panel_visible", slope)
 
     def _resample_profile(self) -> None:
         self._cancel_profile_refresh(silent=True)
@@ -1655,10 +1705,51 @@ class BurialPlannerDock(QDockWidget):
                 for r in self.model.rules}
 
     def _refresh_profile_events(self) -> None:
+        self._refresh_rpl_lane()
         self.profile.set_events(
             self.model.events, self.model.label_method,
             editable=self.profile_drag_toggle.isChecked(),
             labels=self.model.event_labels())
+
+    def _sync_lane_filters(self):
+        for key, action in self._plan_lane_filters.items():
+            action.setChecked(self.profile.overlay_visible(key))
+        has_rpl = self.model.route is not None and bool(self.model.resolved_rpl_id)
+        notice = self._lane_rpl_issue if has_rpl else "RPL events require a registered plan route."
+        self._rpl_notice.setText(notice)
+        self._rpl_notice.setVisible(bool(notice))
+        for action in self._rpl_filters.values():
+            action.setEnabled(has_rpl)
+
+    def _refresh_cable_type_bar(self, checked):
+        ranges = self.model.cable_type_ranges
+        self.cable_type_toggle.setEnabled(bool(ranges))
+        self.cable_type_toggle.setToolTip(
+            "Show the route's cable types by KP. Hover for the range or click to go to that KP."
+            if ranges else "Available when the plan's registered RPL has cable types on its legs.")
+        self.profile.set_cable_type_ranges(ranges if checked else [])
+
+    def _refresh_rpl_lane(self, *_args):
+        selected = {key for key, action in self._rpl_filters.items() if action.isChecked()}
+        if not (self.event_lane_toggle.isChecked() and selected
+                and self.model.route is not None and self.model.resolved_rpl_id):
+            self._lane_rpl_key = None
+            self._lane_rpl_rows = []
+            self._lane_rpl_issue = ""
+            self.profile.set_rpl_lane_events([])
+            return
+        key = (self.model.route, self.model.resolved_rpl_id)
+        if key != self._lane_rpl_key:
+            from .profile_panels import read_rpl_lane_events
+            try:
+                self._lane_rpl_rows = read_rpl_lane_events(self.model)
+                self._lane_rpl_issue = "" if self._lane_rpl_rows else "No located events in this RPL."
+            except Exception:
+                log_exception("Burial Planner: could not display the plan RPL events")
+                self._lane_rpl_rows = []
+                self._lane_rpl_issue = "Could not read events from this RPL."
+            self._lane_rpl_key = key
+        self.profile.set_rpl_lane_events([event for group, event in self._lane_rpl_rows if group in selected])
 
     def _refresh_profile_sections(self) -> None:
         self.profile.set_sections(self.model.sections)

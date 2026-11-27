@@ -157,6 +157,19 @@ def classify_event(text: str, classify: Callable) -> Tuple[str, str, bool]:
     return GROUP_OTHER, "other", True
 
 
+def rpl_point_event(text, kp, printed_kp, pos_no, remarks, classify, key):
+    group, kind, matched = classify_event(text, classify)
+    lines = [f"RPL event '{text}' ({TYPE_LABELS.get(kind, kind)}"
+             + ("" if matched else ", by common names: no Workbench event rule matches it") + ")",
+             f"{_kp_text(kp)} (measured)" + (f"; printed KP {float(printed_kp):.3f}" if printed_kp is not None else "")]
+    if pos_no not in (None, ""):
+        lines.append(f"Position {pos_no}")
+    if remarks:
+        lines.append(f"Remarks: {remarks}")
+    return ProfileEvent(kp, None, SRC_RPL, group, text, "\n".join(lines), COLOURS[group],
+                        PRIORITY.get(group, 50), kind, key=key)
+
+
 def rpl_events(model, measured_kps: Sequence[float], classify: Callable) -> List[ProfileEvent]:
     """The RPL positions that carry an event, at their measured KPs."""
     out: List[ProfileEvent] = []
@@ -167,20 +180,10 @@ def rpl_events(model, measured_kps: Sequence[float], classify: Callable) -> List
         kp = float(measured_kps[i])
         if not math.isfinite(kp):
             continue
-        group, kind, matched = classify_event(text, classify)
         attrs = getattr(point, "attrs", None) or {}
         remarks = str(attrs.get("Remarks") or "").strip()
-        lines = [f"RPL event '{text}' ({TYPE_LABELS.get(kind, kind)}"
-                 + ("" if matched else ", by common names: no Workbench event rule matches it") + ")",
-                 f"{_kp_text(kp)} (measured)" + (f"; printed KP {float(point.dist_cum_km):.3f}"
-                                                  if point.dist_cum_km is not None else "")]
-        pos = getattr(point, "pos_no", None)
-        if pos not in (None, ""):
-            lines.append(f"Position {pos}")
-        if remarks:
-            lines.append(f"Remarks: {remarks}")
-        out.append(ProfileEvent(kp, None, SRC_RPL, group, text, "\n".join(lines), COLOURS[group],
-                                PRIORITY.get(group, 50), kind, key=f"rpl:{i}"))
+        out.append(rpl_point_event(text, kp, point.dist_cum_km, getattr(point, "pos_no", None),
+                                   remarks, classify, f"rpl:{i}"))
     return out
 
 

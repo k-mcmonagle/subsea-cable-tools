@@ -26,7 +26,8 @@ def rpl_label(rpl: dict) -> str:
     return f"{name} — {rev}" if rev else name
 
 
-def rpl_route(workbench_store, rpl: Dict, project, kp_mode: Tuple[str, str] = ("", "")):
+def rpl_route(workbench_store, rpl: Dict, project, kp_mode: Tuple[str, str] = ("", ""), *,
+              cable_type_ranges=None):
     """``(RouteFrame, distance, positions)`` for a Workbench RPL row.
 
     The single way an RPL becomes a route: measured WGS84 chainage along
@@ -50,7 +51,7 @@ def rpl_route(workbench_store, rpl: Dict, project, kp_mode: Tuple[str, str] = ("
     route, distance = build_route_frame(layer, project,
                                         start_kp_km=kp_datum.start_kp_of(positions),
                                         distance_mode=mode or "ellipsoidal",
-                                        grid_crs=grid or "")
+                                        grid_crs=grid or "", cable_type_ranges=cable_type_ranges)
     if route is None:
         raise ValueError(f"'{rpl_label(rpl)}' has no usable route geometry.")
     return route, distance, positions

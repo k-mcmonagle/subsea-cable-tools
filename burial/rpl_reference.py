@@ -192,7 +192,7 @@ def make_table_picker(model, config: Dict, parent=None) -> "RplReferencePicker":
     return picker
 
 
-def rpl_event_rows(model, rpl_id: str):
+def rpl_event_rows(model, rpl_id: str, *, events_only=False):
     """``(rows, label)``: every position of a registered RPL as
     :class:`rpl_plan_import.RplRow`, placed on the plan route by seabed
     position (so another revision or route translates correctly).
@@ -233,6 +233,8 @@ def rpl_event_rows(model, rpl_id: str):
 
     raw = []
     for order, feat in enumerate(layer.getFeatures()):
+        if events_only and not str(_attr(feat, "Event") or "").strip():
+            continue
         geom = feat.geometry()
         point = None
         if geom is not None and not geom.isEmpty():
@@ -257,6 +259,8 @@ def rpl_event_rows(model, rpl_id: str):
                 row.kp = round(float(hit.kp_km), 6)
                 row.offset_m = float(hit.dcc_m)
         rows.append(row)
+    if events_only:
+        return rows, rpl_label(rpl)
     if not rows:
         raise ValueError(f"'{rpl_label(rpl)}' has no positions.")
     # Segment k (SeqNo order) joins positions k and k + 1: its protection
