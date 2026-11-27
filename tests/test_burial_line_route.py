@@ -236,6 +236,14 @@ class EmptyProfileRangeTests(unittest.TestCase):
             self.assertEqual(plot._scope, (model.route.start_kp_km, model.route.end_kp_km))
             self.assertGreater(plot.plot.viewRange()[0][1] - plot.plot.viewRange()[0][0], 800)
             self.assertEqual(model.plan["scope_end_kp"], 0)
+            plot.plot.setXRange(20, 40, padding=0)
+            h.dock._refresh_profile()
+            self.assertEqual(plot.plot.viewRange()[0], [20, 40])
+            model.plan["scope_end_kp"] = 60.0
+            h.dock._refresh_profile()
+            self.assertEqual(plot._scope, (0.0, 60.0))
+            self.assertGreater(plot.plot.viewRange()[0][1], 59.9)
+            self.assertEqual(plot._route_extent, (model.route.start_kp_km, model.route.end_kp_km))
             for widget in (plot.plot, plot.slope_plot):
                 axis = widget.getPlotItem().getAxis("bottom")
                 self.assertEqual(axis.tickStrings([0, 100, 861.780529], 1, 100),

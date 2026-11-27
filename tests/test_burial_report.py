@@ -123,8 +123,8 @@ def test_report_content() -> bool:
         "10.000 km (50%)" in html_text,
         "Within Normal Operating Envelope" in html_text,
         # sections/events/labels
-        "Candidate Plough Section" in html_text,
-        "Plough Skip" in html_text,
+        "PS = Plough" in html_text,
+        "SK = Skip" in html_text,
         "PS-01" in html_text and "SK-01" in html_text,  # working section IDs
         "PLDN" in html_text and "PLUP" in html_text,
         # rules with source references and condition summaries

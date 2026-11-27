@@ -38,6 +38,7 @@ from qgis.PyQt.QtWidgets import (
     QLabel,
     QMenu,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QTableWidgetItem,
     QToolButton,
@@ -154,6 +155,14 @@ _STRIP_STYLES = {
     schema.SECTION_INSUFFICIENT: (QColor(158, 158, 158, 140),
                                   "Insufficient Information"),
 }
+
+
+def _event_color(status):
+    if status == schema.EVENT_STATUS_CONFLICT:
+        return QColor("#d62728")
+    if status == schema.EVENT_STATUS_CONFIRMED:
+        return QColor("#0e4d22")
+    return QColor("#1b7f3b")
 
 
 def _intersect(a: List[Interval], b: List[Interval]) -> List[Interval]:
@@ -437,6 +446,16 @@ class BurialProfileWidget(QWidget):
         slope_item.showGrid(x=True, y=True, alpha=0.25)
         self._setup_axes(slope_item)
         slope_item.setXLink(item)
+        self._active_plot = self.plot
+        self._linked_plots = [self.plot, self.slope_plot]
+        self._event_lane = None
+        self._lane_enabled = False
+        self._lane_content = None
+        self._event_rows, self._section_rows = [], []
+        self._event_labels, self._label_method = {}, ""
+        self._navigator = None
+        self._navigator_enabled = False
+        self._route_extent = None
         slope_item.vb.enableAutoRange(y=True)
         slope_item.vb.setAutoVisible(y=True)
         zero_line = pg.InfiniteLine(
@@ -577,27 +596,32 @@ class BurialProfileWidget(QWidget):
             "Delete removes the selected measurement.")
         self._measure_toggle.toggled.connect(self._measure_toggled)
         depth_toggle_row.addWidget(self._measure_toggle)
+        depth_toggle_row.addStretch(1)
+        self._measure_controls = QWidget()
+        measure_row = QHBoxLayout(self._measure_controls)
+        measure_row.setContentsMargins(8, 0, 8, 0)
         self._snap_toggle = QCheckBox("Snap to profile")
         self._snap_toggle.setChecked(True)
         self._snap_toggle.setToolTip(
             "Place points on the sampled seabed depth at the clicked KP "
             "(untick to measure between free points on the plot).")
-        depth_toggle_row.addWidget(self._snap_toggle)
+        measure_row.addWidget(self._snap_toggle)
         self._measure_delete = QPushButton("Delete / undo")
         self._measure_delete.setFlat(True)
         self._measure_delete.setToolTip(
             "Remove the pending point, else the selected (or last) "
             "measurement.")
         self._measure_delete.clicked.connect(self.delete_measurement)
-        depth_toggle_row.addWidget(self._measure_delete)
+        measure_row.addWidget(self._measure_delete)
         self._measure_clear = QPushButton("Clear measurements")
         self._measure_clear.setFlat(True)
         self._measure_clear.clicked.connect(self.clear_measurements)
-        depth_toggle_row.addWidget(self._measure_clear)
+        measure_row.addWidget(self._measure_clear)
         self._measure_hint = QLabel("")
         self._measure_hint.setStyleSheet(ui_helpers.hint_style())
-        depth_toggle_row.addWidget(self._measure_hint)
-        depth_toggle_row.addStretch(1)
+        self._measure_hint.setWordWrap(True)
+        self._measure_hint.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        measure_row.addWidget(self._measure_hint, 1)
         self._measure_action = QAction("Measure", self)
         self._measure_action.setCheckable(True)
         self._measure_action.setToolTip(self._measure_toggle.toolTip())
@@ -631,6 +655,7 @@ class BurialProfileWidget(QWidget):
         depth_layout.setContentsMargins(0, 0, 0, 0)
         depth_layout.setSpacing(0)
         depth_layout.addLayout(depth_toggle_row)
+        depth_layout.addWidget(self._measure_controls)
         depth_layout.addWidget(self.plot, 1)
         depth_layout.addWidget(self._measure_table)
 
@@ -641,6 +666,14 @@ class BurialProfileWidget(QWidget):
         self._splitter.setStretchFactor(0, 3)
         self._splitter.setStretchFactor(1, 1)
         self._splitter.setCollapsible(0, False)
+        self._splitter.setCollapsible(1, False)
+        self._ground_pane = QWidget()
+        self.ground_layout = QVBoxLayout(self._ground_pane)
+        self.ground_layout.setContentsMargins(0, 0, 0, 0)
+        self._splitter.addWidget(self._ground_pane)
+        self._splitter.setStretchFactor(2, 2)
+        self._splitter.setCollapsible(2, False)
+        self._ground_pane.hide()
         state = settings.value(f"{_SETTINGS_ROOT}/profile_splitter_state")
         if state is not None:
             try:
@@ -805,7 +838,80 @@ class BurialProfileWidget(QWidget):
         """
         other_item = plot_widget.getPlotItem()
         self._setup_axes(other_item)
-        other_item.setXLink(self.plot.getPlotItem())
+        other_item.setXLink(self._active_plot.getPlotItem())
+        self._linked_plots.append(plot_widget)
+
+    def set_layout_mode(self, mode, ground_plot):
+        """Use the visible plot as KP master, including when bathymetry is hidden."""
+        window = self._active_plot.viewRange()[0]
+        master = ground_plot if mode == "ground" else self.plot
+        self._ground_pane.setVisible(mode != "bathy")
+        self._depth_pane.setVisible(mode != "ground")
+        if master is not self._active_plot:
+            master.setXLink(None)
+            self._active_plot = master
+            for plot in self._linked_plots:
+                if plot is not master:
+                    plot.setXLink(master.getPlotItem())
+        if self._navigator_enabled:
+            self._navigator.set_view(master.getPlotItem().vb)
+        master.setXRange(*window, padding=0)
+
+    def set_route_extent(self, start=None, end=None):
+        self._route_extent = (start, end) if start is not None and end is not None and end > start else None
+        if self._navigator_enabled:
+            self._navigator.set_domain(self._route_extent)
+            self._navigator.setVisible(self._route_extent is not None)
+
+    def set_navigator_visible(self, visible):
+        self._navigator_enabled = visible
+        if visible and self._navigator is None:
+            from .profile_panels import RouteNavigator
+            self._navigator = RouteNavigator()
+            self._setup_axes(self._navigator.getPlotItem())
+            self.layout().addWidget(self._navigator)
+        if self._navigator is not None:
+            self._navigator.setVisible(visible and self._route_extent is not None)
+            self._navigator.set_view(self._active_plot.getPlotItem().vb if visible else None)
+            self._navigator.set_domain(self._route_extent if visible else None)
+            if visible:
+                self._navigator.curve.setData(self._series_xs, self._series_ys, connect="finite")
+            else:
+                self._navigator.curve.clear()
+
+    def set_event_lane_visible(self, visible):
+        if visible and self._event_lane is None:
+            from .profile_panels import PlanEventLane
+            self._event_lane = PlanEventLane(self.plot)
+            self.link_kp_plot(self._event_lane)
+            self.layout().insertWidget(0, self._event_lane)
+            self._event_lane.kpHovered.connect(self._hover_at_kp)
+            self._event_lane.kpClicked.connect(self.kpClicked)
+        self._lane_enabled = visible
+        if self._event_lane is not None:
+            if visible:
+                self._event_lane.leaders.set_cable(self._curve.xData, self._curve.yData)
+            else:
+                self._event_lane.leaders.set_cable(None, None)
+                self._event_lane.layer.set_events([])
+                self._event_lane.setToolTip("")
+        self._apply_overlay_visibility()
+
+    def _update_lane(self):
+        lane = self._event_lane
+        if lane is None:
+            return
+        options = self.overlay_visible("events"), self.overlay_visible("sections")
+        if self._lane_enabled:
+            if options != self._lane_content:
+                lane.set_rows(self._event_rows if options[0] else [], self._section_rows if options[1] else [],
+                              self._event_labels, self._label_method, _event_color, _STRIP_STYLES)
+                self._lane_content = options
+            lane.leaders.setVisible(options[0])
+        else:
+            lane.hide()
+            lane.leaders.hide()
+            self._lane_content = None
 
     def _series_toggled(self, key: str, checked: bool) -> None:
         QSettings().setValue(f"{_SETTINGS_ROOT}/slope_series_{key}",
@@ -899,6 +1005,7 @@ class BurialProfileWidget(QWidget):
     def _sync_measure_controls(self) -> None:
         measuring = self.measuring()
         has_rows = bool(self._measurements)
+        self._measure_controls.setVisible(measuring or has_rows)
         self._snap_toggle.setVisible(measuring)
         self._measure_delete.setVisible(measuring or has_rows)
         self._measure_clear.setVisible(measuring or has_rows)
@@ -1177,7 +1284,7 @@ class BurialProfileWidget(QWidget):
         self._scope = (lo, hi)
         # Generation pads an unset scope by 1e-9 km. That numerical guard
         # is not a useful viewport: keep an empty plot at a readable scale.
-        self.plot.setXRange(lo, hi if hi - lo > 1e-9 else lo + 1.0, padding=0.02)
+        self._active_plot.setXRange(lo, hi if hi - lo > 1e-9 else lo + 1.0, padding=0.02)
         self._update_sea_level()
 
     def set_slope_window_m(self, step_m: float) -> None:
@@ -1204,6 +1311,10 @@ class BurialProfileWidget(QWidget):
         self._series_xs = xs  # cached for the per-hover lookups
         self._series_ys = ys
         self._curve.setData(xs, ys, connect="finite")
+        if self._lane_enabled:
+            self._event_lane.leaders.set_cable(self._curve.xData, self._curve.yData)
+        if self._navigator_enabled:
+            self._navigator.curve.setData(xs, ys, connect="finite")
         self._place_cpt_markers()
         # Measurements belong to the profile they were placed on: a
         # different profile (resample, other plan) drops them, while the
@@ -1424,6 +1535,9 @@ class BurialProfileWidget(QWidget):
                 text += f" — {conclusion}"
             ranges.append((start, end, text, color))
         self._strip_band.set_ranges(ranges)
+        self._section_rows = sections or []
+        self._lane_content = None
+        self._update_lane()
 
     def set_cpts(self, points: List[Tuple[float, str]]) -> None:
         """CPT markers: ``(kp, label)`` drawn on the seabed at each KP."""
@@ -1524,13 +1638,16 @@ class BurialProfileWidget(QWidget):
         full = self._hazard_style == HAZARD_STYLE_FULL
         self._hazard_full.setVisible(hazards and full)
         self._hazard_vb.setVisible(hazards and not full)
-        self._strip_vb.setVisible(self.overlay_visible("sections"))
+        self._strip_vb.setVisible(self.overlay_visible("sections") and not self._lane_enabled)
         cpts = getattr(self, "_cpt_markers", None)
         if cpts is not None:
             cpts.setVisible(self.overlay_visible("cpts") and bool(self._cpts))
-        self._event_markers.setVisible(self.overlay_visible("events"))
+        self._event_markers.setVisible(self.overlay_visible("events") and not self._lane_enabled)
         for line in self._event_lines:
             line.setVisible(self.overlay_visible("events"))
+            if getattr(line, "label", None) is not None:
+                line.label.setVisible(not self._lane_enabled)
+        self._update_lane()
         self._position_strip()
         self._sync_overlay_button()
 
@@ -1548,7 +1665,7 @@ class BurialProfileWidget(QWidget):
     def _sync_overlay_button(self) -> None:
         hidden = self._hidden_overlay_count()
         self._overlay_button.setText(
-            f"Overlays ({hidden} hidden) ▾" if hidden else "Overlays ▾")
+            f"Overlays ({hidden} hidden)" if hidden else "Overlays")
 
     @staticmethod
     def _swatch(color: str) -> QIcon:
@@ -1640,6 +1757,8 @@ class BurialProfileWidget(QWidget):
             item.removeItem(line)
         self._event_lines = []
         self._editable = editable
+        self._event_rows, self._event_labels, self._label_method = events, labels or {}, method
+        self._lane_content = None
         painted = []
         lo, hi = self._scope
         for event in events:
@@ -1649,15 +1768,11 @@ class BurialProfileWidget(QWidget):
                 continue
             is_start = event.get("event_type") == schema.EVENT_BURIAL_START
             status = event.get("status") or ""
-            if status == schema.EVENT_STATUS_CONFLICT:
-                color = QColor("#d62728")
-            elif status == schema.EVENT_STATUS_CONFIRMED:
-                color = QColor("#0e4d22")
-            else:
-                color = QColor("#1b7f3b")
+            color = _event_color(status)
             style = _PEN_STYLE.SolidLine if status == schema.EVENT_STATUS_CONFIRMED \
                 else _PEN_STYLE.DashLine
-            label = (labels or {}).get(str(event.get("event_id") or ""))                 or ev.event_label(event.get("event_type") or "", method)
+            label = (self._event_labels.get(str(event.get("event_id") or ""))
+                     or ev.event_label(event.get("event_type") or "", method))
             marker = "▼" if is_start else "▲"
             text = f"{marker} {label} {schema.format_kp(kp)}"
             pen = pg.mkPen(color, width=2, style=style)
@@ -1674,6 +1789,7 @@ class BurialProfileWidget(QWidget):
                 line = pg.InfiniteLine(pos=kp, angle=90, movable=movable,
                                        pen=pen)
             line.setZValue(10)
+            line.setToolTip(text)
             if hi > lo and movable:
                 line.setBounds((lo, hi))
             line._bp_event_id = event.get("event_id") or ""
@@ -1697,6 +1813,9 @@ class BurialProfileWidget(QWidget):
                 return
 
     def clear(self) -> None:
+        self._hover_timer.stop()
+        self._hover_kp = None
+        self.set_route_extent()
         self.set_scope(0.0, 0.0)
         self.set_profile([])
         self.set_overlays(generation.ResolutionContext())
@@ -1723,23 +1842,6 @@ class BurialProfileWidget(QWidget):
         view = plot.getViewBox().mapSceneToView(pos)
         return float(view.x())
 
-    def _nearest_sample(self, kp: float) -> Optional[Tuple[float, float]]:
-        if not self._series:
-            return None
-        import bisect
-
-        xs = self._series_xs
-        i = bisect.bisect_left(xs, kp)
-        candidates = [j for j in (i - 1, i) if 0 <= j < len(self._series)]
-        if not candidates:
-            return None
-        j = min(candidates, key=lambda j: abs(xs[j] - kp))
-        return self._series[j] if self._series[j][1] is not None else None
-
-    def _interp_depth(self, xs, kp):
-        from ..slope_utils import interpolate_covered
-        return interpolate_covered(xs, [d for x,d in self._series], kp)
-
     def _slope_at(self, kp):
         # Read the same supported series as the pane/rules; never recalculate
         # a different window from the hover position.
@@ -1749,7 +1851,7 @@ class BurialProfileWidget(QWidget):
         """Show the profile crosshair/readout at a table-selected KP."""
         self._hover_timer.stop()
         self._hover_kp = None
-        lo, hi = self._scope
+        lo, hi = self._route_extent or self._scope
         value = float(kp)
         if hi > lo:
             value = min(max(value, lo), hi)
@@ -1759,28 +1861,28 @@ class BurialProfileWidget(QWidget):
         """Zoom the shared KP axis to a selected section and show its centre."""
         lo, hi = sorted((float(start_kp), float(end_kp)))
         if hi > lo:
-            self.plot.setXRange(lo, hi, padding=0.08)
+            self._active_plot.setXRange(lo, hi, padding=0.08)
             self.focus_kp((lo + hi) / 2.0)
 
     def reset_scope_view(self) -> None:
         lo, hi = self._scope
         if hi - lo <= 1e-9:
-            self.plot.setXRange(lo, lo + 1.0, padding=0.02)
+            self._active_plot.setXRange(lo, lo + 1.0, padding=0.02)
         elif hi > lo:
-            if self.true_scale():
+            if self._active_plot is self.plot and self.true_scale():
                 self._fit_true_scale()
             else:
-                self.plot.setXRange(lo, hi, padding=0.02)
+                self._active_plot.setXRange(lo, hi, padding=0.02)
 
     def _show_kp_readout(self, kp: float) -> None:
-        sample = self._nearest_sample(kp)
+        depth = interpolate_covered(self._series_xs, self._series_ys, kp)
         self._vline.setPos(kp)
         self._vline.setVisible(True)
         self._slope_vline.setPos(kp)
         self._slope_vline.setVisible(True)
         lines = [f"KP {schema.format_kp(kp)}"]
-        if sample is not None:
-            lines.append(f"Depth {sample[1]:.1f} m")
+        if depth is not None:
+            lines.append(f"Depth {depth:.1f} m")
             slope = self._slope_at(kp)
             if slope is not None:
                 lines.append(f"Slope {slope:+.1f}°")
@@ -1795,14 +1897,12 @@ class BurialProfileWidget(QWidget):
                     value = self._slope_series_value_at(key, kp)
                     if value is not None:
                         lines.append(fmt.format(value))
-            lines.extend(self.overlay_labels_at(kp)[:4])
-            self._readout.setText("\n".join(lines))
-            self._readout.setPos(kp, sample[1])
-            self._readout.setVisible(True)
         else:
-            lines.extend(self.overlay_labels_at(kp)[:4])
-            self._readout.setText("\n".join(lines))
-            self._readout.setVisible(True)
+            depth = sum(self.plot.viewRange()[1]) / 2.0
+        lines.extend(self.overlay_labels_at(kp)[:4])
+        self._readout.setText("\n".join(lines))
+        self._readout.setPos(kp, depth)
+        self._readout.setVisible(True)
 
     def _emit_hover(self) -> None:
         if self._hover_kp is not None:
@@ -1815,9 +1915,12 @@ class BurialProfileWidget(QWidget):
             self._slope_vline.setVisible(False)
             self._readout.setVisible(False)
             return
-        self._show_kp_readout(kp)
+        self._hover_at_kp(kp)
         if self.measuring():
             self._measure_move(pos, plot)
+
+    def _hover_at_kp(self, kp):
+        self._show_kp_readout(kp)
         # Throttled: the map marker + tool footprint follow the latest KP at
         # ~30 ms cadence instead of once per mouse-move event.
         self._hover_kp = kp

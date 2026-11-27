@@ -306,7 +306,7 @@ class EventLeaderItem(_DeviceItem):
         try:
             painter.resetTransform()
             for e in points:
-                depth = float(np.interp(e.kp, self._kp, self._depth)) if len(self._kp) else math.nan
+                depth = float(np.interp(e.kp, self._kp, self._depth, left=np.nan, right=np.nan)) if len(self._kp) else math.nan
                 if not math.isfinite(depth):
                     continue
                 end = t.map(QPointF(e.kp, depth))

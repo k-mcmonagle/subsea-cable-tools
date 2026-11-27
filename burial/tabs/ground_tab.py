@@ -88,6 +88,8 @@ class GroundTab(QWidget):
         self._loading = False
         self._dirty = False
         self._loaded_plan_id = ""
+        self._working_basis = None
+        self._saved_units = []
         self._working: List[Dict] = []
         self._horizon_params = None
         self._horizon_rows = []
@@ -117,7 +119,6 @@ class GroundTab(QWidget):
                                         "Review the CPT derivation settings and influence limits before saving.")
         self.strength_button.clicked.connect(lambda: self.add_cpt_dataset("su", strength_preset=True))
         mode_row.addWidget(self.strength_button)
-        self._mode_row = mode_row
         self.horizons_button = QPushButton("Horizons…")
         self.horizons_button.setToolTip("Import and manage sub-bottom horizons and optional text annotations from DXF sections.")
         self.horizons_button.clicked.connect(self._manage_horizons)
@@ -128,9 +129,11 @@ class GroundTab(QWidget):
         mode_row.addWidget(self.sources_button)
         self.horizon_status = QLabel()
         self.horizon_status.setWordWrap(True)
-        mode_row.addWidget(self.horizon_status)
         mode_row.addStretch()
         layout.addLayout(mode_row)
+        trace_row = QHBoxLayout()
+        layout.addLayout(trace_row)
+        layout.addWidget(self.horizon_status)
 
         toolbar = QHBoxLayout()
         self.import_button = QPushButton("Import…")
@@ -160,12 +163,14 @@ class GroundTab(QWidget):
         self.show_map.setChecked(bool(QSettings().value(
             f"{_SETTINGS_ROOT}/ground_layer_visible", True, type=bool)))
         self.show_map.toggled.connect(self._map_toggled)
-        toolbar.addWidget(self.show_map)
         toolbar.addStretch(1)
+        layout.addLayout(toolbar)
+        status_row = QHBoxLayout()
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
-        toolbar.addWidget(self.status_label, 2)
-        layout.addLayout(toolbar)
+        status_row.addWidget(self.status_label, 1)
+        status_row.addWidget(self.show_map)
+        layout.addLayout(status_row)
 
         self.plot_box = QGroupBox("Ground model — depth below seabed vs KP")
         plot_layout = QVBoxLayout(self.plot_box)
@@ -259,10 +264,11 @@ class GroundTab(QWidget):
         layout.addWidget(self.splitter, 1)
 
         self.numeric = NumericProfilePanel(model, dock, self.plot, self)
-        layout.insertWidget(3, self.numeric)
+        layout.insertWidget(layout.indexOf(self.splitter), self.numeric)
         self.numeric.hide()
         self.cpts = CptPanel(model, dock, self.plot, self)
-        self._mode_row.insertWidget(2, self.cpts.overlay_controls)
+        trace_row.addWidget(self.cpts.overlay_controls)
+        trace_row.addStretch(1)
         self._pane_layout.addWidget(self.cpts, 1)
         self.cpts.hide()
         self.display_mode.currentIndexChanged.connect(self._display_changed)
@@ -272,11 +278,24 @@ class GroundTab(QWidget):
             cpts_signal.connect(self.numeric.reload_sources)
 
         refresh_soon = ui_helpers.coalesced(self, self.refresh)
-        model.planChanged.connect(refresh_soon)
+        def plan_changed():
+            if self._dirty and self.model.plan_id != self._loaded_plan_id:
+                self._dirty = False
+            refresh_soon()
+        model.planChanged.connect(plan_changed)
         model.groundChanged.connect(refresh_soon)
         if cpts_signal is not None:
             cpts_signal.connect(refresh_soon)
         self.refresh()
+
+    def place_plot(self, profile_layout=None):
+        """Move this plot with its live data, selection and map connections."""
+        home = self.plot_box.layout()
+        target = home if profile_layout is None else profile_layout
+        if target.indexOf(self.plot) < 0:
+            target.insertWidget(0, self.plot, 1)
+            self.plot.show()
+        self.plot_box.setVisible(profile_layout is None)
 
     def _source_links(self):
         from ..source_links_dialog import open_sources
@@ -336,6 +355,7 @@ class GroundTab(QWidget):
             self._rebuild_table()
             self.plot.clear()
             self.horizon_status.clear()
+            self.horizon_status.hide()
             self._horizon_params = None
             self._horizon_rows = []
             self._annotation_state = {"groups": [], "visible": True}
@@ -347,6 +367,8 @@ class GroundTab(QWidget):
             self._refresh_plot()
             return
         self._working = [ground_model.normalise_unit(u) for u in self.model.ground_units]
+        self._working_basis = self.model.kp_edit_basis()
+        self._saved_units = self.model.ground_units
         self._dirty = False
         self._loaded_plan_id = plan_id
         self._rebuild_table()
@@ -413,6 +435,7 @@ class GroundTab(QWidget):
             self.plot.set_annotations([])
             self.horizon_status.setText("Horizons / annotations unavailable")
             self.horizon_status.setToolTip(str(exc))
+        self.horizon_status.setVisible(bool(self.horizon_status.text()))
 
     def _update_status(self) -> None:
         if not self._working:
@@ -750,7 +773,8 @@ class GroundTab(QWidget):
                 return
         new_classes = ground_model.missing_classes(self._working, self.model.ground_classes)
         if self.model.save_ground_units(self._working, reason="edited in Ground Model tab",
-                                        new_classes=new_classes or None):
+                                        new_classes=new_classes or None, expected_basis=self._working_basis,
+                                        expected_rows=self._saved_units):
             self._dirty = False
             self.refresh()
 
@@ -762,6 +786,7 @@ class GroundTab(QWidget):
     def _import(self) -> None:
         if not self.model.plan:
             return
+        basis, saved_units = self._working_basis, self._saved_units
         dialog = GroundImportDialog(self.model, self.dock, self)
         if qt_exec(dialog) != DIALOG_ACCEPTED:
             return
@@ -781,7 +806,7 @@ class GroundTab(QWidget):
                 units, action=change_log.ACTION_IMPORT_GROUND,
                 reason=f"imported {len(dialog.units)} unit(s) from {dialog.source_ref or 'file'}",
                 new_classes=new_classes or None,
-                params_updates={"ground_model": meta}):
+                params_updates={"ground_model": meta}, expected_basis=basis, expected_rows=saved_units):
             self._dirty = False
             self.refresh()
 
@@ -814,6 +839,7 @@ class GroundTab(QWidget):
             return
         rows = self._selected_rows()
         targets = rows if rows else list(range(len(self._working)))
+        basis, saved_units = self._working_basis, self._saved_units
         dialog = RereferenceDialog(self.model, self.dock,
                                    [self._working[r] for r in targets], self)
         if qt_exec(dialog) != DIALOG_ACCEPTED or dialog.kp_map is None:
@@ -832,7 +858,7 @@ class GroundTab(QWidget):
                 merged, action=change_log.ACTION_REREFERENCE_GROUND,
                 reason=f"re-referenced {len(targets)} unit(s): "
                        f"{dialog.kp_map.diagnostics.summary()[:200]}",
-                params_updates={"ground_model": meta}):
+                params_updates={"ground_model": meta}, expected_basis=basis, expected_rows=saved_units):
             self._dirty = False
             self.refresh()
 

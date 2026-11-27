@@ -208,6 +208,44 @@ def sort_rows(rows: Iterable[Dict]) -> List[Dict]:
     return out
 
 
+def compare_polygon_rows(existing, generated):
+    """Compare non-overlapping generated intervals to any existing register.
+
+    Each conflict contains the proposed row, the overlapping register indices,
+    and the single exact interval that can be updated in place, if any.
+    """
+    from bisect import bisect_right
+
+    tolerance = 1e-9
+    proposals = sorted(generated, key=lambda r: r["start_kp"])
+    ends = [r["end_kp"] for r in proposals]
+    overlaps = [[] for _ in proposals]
+    for i, row in enumerate(existing):
+        lo, hi = row.get("start_kp"), row.get("end_kp")
+        if lo is None or hi is None:
+            continue
+        j = bisect_right(ends, lo + tolerance)
+        while j < len(proposals) and proposals[j]["start_kp"] < hi - tolerance:
+            overlaps[j].append(i)
+            j += 1
+
+    additions, conflicts, unchanged = [], [], 0
+    for proposed, hits in zip(proposals, overlaps):
+        if not hits:
+            additions.append(proposed)
+            continue
+        exact = [i for i in hits if all(abs(existing[i][k] - proposed[k]) <= tolerance
+                                        for k in ("start_kp", "end_kp"))]
+        values = proposed["values"]
+        note = proposed.get("notes") or ""
+        if any(all(existing[i]["values"].get(k, "") == v for k, v in values.items())
+               and (not note or note in (existing[i].get("notes") or "")) for i in exact):
+            unchanged += 1
+        else:
+            conflicts.append((proposed, hits, exact[0] if len(exact) == 1 else None))
+    return additions, conflicts, unchanged
+
+
 def validate_rows(rows: Iterable[Dict], columns: Sequence[Dict] = ()
                   ) -> List[str]:
     """Problems: missing/inverted KPs (blocking) and overlapping ranges,

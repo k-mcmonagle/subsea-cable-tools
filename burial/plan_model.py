@@ -79,6 +79,10 @@ def describe_kp(plan_row: Dict, model) -> str:
     return describe_kp_mode(mode, grid)
 
 
+class _DraftChanged(ValueError):
+    """The saved inputs to an editor no longer match its working copy."""
+
+
 class PlanModel(QObject):
     planChanged = pyqtSignal()
     inputsChanged = pyqtSignal()
@@ -161,6 +165,9 @@ class PlanModel(QObject):
     def _store_write(self, action: str, func: Callable, *args, **kwargs):
         try:
             result = func(*args, **kwargs)
+        except _DraftChanged as exc:
+            self.storeError.emit(str(exc))
+            return False, None
         except Exception as exc:
             help_text = (
                 "\n\nSQLite reports corruption. This operation was not saved. "
@@ -517,6 +524,23 @@ class PlanModel(QObject):
         from ..kp_range_utils import describe_kp_mode
         mode, grid = self.kp_mode()
         return describe_kp_mode(mode, grid)
+
+    def kp_edit_basis(self, plan=None):
+        """Saved identity of the chainage on which a table was opened."""
+        row = self.plan if plan is None else plan
+        params = (self._display_settings() if row is self.plan else
+                  analysis_state.decode_json(row.get("params_json"), {}))
+        datum = params.get("kp_datum") if isinstance(params, dict) else None
+        datum = datum if isinstance(datum, dict) else {}
+        return (self.store.gpkg_path, row.get("plan_id"), row.get("rpl_id") or "",
+                row.get("rpl_gpkg_path") or "", datum.get("route_geometry") or "",
+                datum.get("start_kp"), datum.get("mode") or "ellipsoidal",
+                datum.get("grid_crs") or "")
+
+    def _check_edit_basis(self, expected):
+        if expected is not None and self.kp_edit_basis(self.store.get_plan(self.plan_id) or {}) != expected:
+            raise _DraftChanged("The saved route or KP basis changed after these edits began. "
+                                "Copy any edits you need, reload the plan and review its current KPs.")
 
     def _set_kp_datum(self, plan_row: Dict, start_kp: float,
                       mode: Optional[Tuple[str, str]] = None) -> Dict:
@@ -1835,13 +1859,14 @@ class PlanModel(QObject):
         self.load_plan(plan_id)
         return plan_id
 
-    def update_plan(self, updates: Dict, reason: str = "") -> bool:
+    def update_plan(self, updates: Dict, reason: str = "", expected_basis=None) -> bool:
         if not self.plan:
             return False
         before = dict(self.plan)
         self.plan.update(updates)
 
         def write() -> None:
+            self._check_edit_basis(expected_basis)
             self.store.save_plan(self.plan)
             self.store.append_change(
                 self.plan_id, change_log.ACTION_EDIT_PLAN, self.plan_id,
@@ -2071,7 +2096,7 @@ class PlanModel(QObject):
             scope.end_km if end_kp is None else end_kp)
 
     def update_targets(self, default_m: Optional[float],
-                       ranges: List[Dict]) -> bool:
+                       ranges: List[Dict], expected_basis=None) -> bool:
         """Save the default target and its KP-range overrides together (one
         change-log entry); refreshes the ground overlay's target horizon."""
         try:
@@ -2088,7 +2113,7 @@ class PlanModel(QObject):
         ok = self.update_plan({
             "target_burial_m": default_m if default_m else None,
             "params_json": json.dumps(params),
-        }, reason="target burial depth")
+        }, reason="target burial depth", expected_basis=expected_basis)
         if ok and "target_burial_m" not in self.plan:
             self.refresh_layers(parts=("ground",))
         return ok
@@ -2164,7 +2189,7 @@ class PlanModel(QObject):
     def save_ground_units(self, units: List[Dict],
                           action: str = change_log.ACTION_EDIT_GROUND,
                           reason: str = "", new_classes: Optional[List[Dict]] = None,
-                          params_updates: Optional[Dict] = None) -> bool:
+                          params_updates: Optional[Dict] = None, expected_basis=None, expected_rows=None) -> bool:
         """One logged replacement of the plan's ground-model units.
 
         ``new_classes`` (codes the units use that the registry lacks) are
@@ -2176,26 +2201,31 @@ class PlanModel(QObject):
             return False
         from . import ground_model
 
-        before = {schema.TABLE_GROUND_UNIT: [dict(u) for u in self.ground_units]}
         ordered = ground_model.sort_units(units)
         for unit in ordered:
             unit["plan_id"] = self.plan_id
             unit.setdefault("unit_id", schema.new_id())
 
-        def write() -> None:
+        def write():
+            self._check_edit_basis(expected_basis)
+            saved = self.store.list_ground_units(self.plan_id)
+            if expected_rows is not None and saved != expected_rows:
+                raise _DraftChanged("Ground units changed after editing began. Export your draft and reload the plan.")
             if new_classes:
                 merged = list(self.store.list_ground_classes()) + list(new_classes)
                 self.store.save_ground_classes(merged)
             self.store.save_ground_units(self.plan_id, ordered)
-            self.ground_units = self.store.list_ground_units(self.plan_id)
+            updated = self.store.list_ground_units(self.plan_id)
             self.store.append_change(
-                self.plan_id, action, "", before=before,
-                after={schema.TABLE_GROUND_UNIT: [dict(u) for u in self.ground_units]},
+                self.plan_id, action, "", before={schema.TABLE_GROUND_UNIT: saved},
+                after={schema.TABLE_GROUND_UNIT: updated},
                 reason=reason)
+            return updated
 
-        ok, _ = self._store_transaction("save the ground model", write)
+        ok, updated = self._store_transaction("save the ground model", write)
         if not ok:
             return False
+        self.ground_units = updated
         if new_classes:
             self.refresh_ground_classes(emit=False)
         if params_updates:
@@ -2330,7 +2360,8 @@ class PlanModel(QObject):
 
     def save_bas(self, rows: List[Dict], columns: Optional[List[Dict]] = None,
                  action: str = change_log.ACTION_EDIT_BAS, reason: str = "",
-                 meta_updates: Optional[Dict] = None) -> bool:
+                 meta_updates: Optional[Dict] = None, expected_basis=None,
+                 expected_rows=None, expected_columns=None) -> bool:
         """One logged replacement of the BAS rows; ``columns`` (when given)
         and ``meta_updates`` patch ``params_json["bas"]`` without marking
         the plan stale (the register does not feed generation)."""
@@ -2345,10 +2376,13 @@ class PlanModel(QObject):
                 row["row_id"] = schema.new_id()
 
         def write():
+            self._check_edit_basis(expected_basis)
             before = {schema.TABLE_BAS_ROW: self.store.list_bas_rows(self.plan_id)}
+            if expected_rows is not None and [bas_model.decode_row(r) for r in before[schema.TABLE_BAS_ROW]] != expected_rows:
+                raise _DraftChanged("The saved BAS rows changed after editing began. Export your draft and reload the plan.")
             after = {schema.TABLE_BAS_ROW: ordered}
             updated_plan = None
-            if columns is not None or meta_updates:
+            if columns is not None or meta_updates or expected_columns is not None:
                 plan = self.store.get_plan(self.plan_id)
                 if not plan:
                     raise ValueError("The plan was removed before the BAS register could be saved.")
@@ -2359,10 +2393,12 @@ class PlanModel(QObject):
                 if not isinstance(params, dict):
                     params = {}
                 meta = dict(params["bas"]) if isinstance(params.get("bas"), dict) else {}
+                if expected_columns is not None and bas_model.normalise_columns(meta.get("columns") or []) != expected_columns:
+                    raise _DraftChanged("The saved BAS columns changed after editing began. Export your draft and reload the plan.")
                 if columns is not None:
                     meta["columns"] = bas_model.normalise_columns(columns)
                 meta.update(meta_updates or {})
-                if meta != params.get("bas"):
+                if (columns is not None or meta_updates) and meta != params.get("bas"):
                     params["bas"] = meta
                     updated_plan = dict(plan, params_json=json.dumps(params))
                     self.store.save_plan(updated_plan)

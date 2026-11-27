@@ -12,7 +12,7 @@ def generate_sections(route, sources, columns, scope, rpl_label="", progress=Non
     overlay = RoutePolygonIntersections(route)
     route_crs = route._distance.sourceCrs()
     start, end = route.start_kp_km, route.end_kp_km
-    if scope.end_km > scope.start_km:
+    if scope is not None and scope.end_km > scope.start_km:
         start, end = max(start, scope.start_km), min(end, scope.end_km)
     if end <= start:
         raise ValueError("The plan scope does not intersect its current route.")

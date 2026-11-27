@@ -67,16 +67,16 @@ def test_trencher_vocabulary() -> bool:
     return _result("PLB / MFE / Inspection vocabulary and default label method", ok)
 
 
-def test_plough_vocabulary_unchanged() -> bool:
+def test_plough_vocabulary() -> bool:
     ok = ev.event_label(schema.EVENT_BURIAL_START, schema.METHOD_PLOUGH) == "PLDN"
     ok = ok and schema.section_kind_label(
-        schema.SECTION_BURIAL, schema.METHOD_PLOUGH) == "Candidate Plough Section"
+        schema.SECTION_BURIAL, schema.METHOD_PLOUGH) == "Plough"
     ok = ok and schema.section_ref_legend(schema.METHOD_PLOUGH) == (
-        "PS = Candidate Plough Section, SK = Plough Skip, "
+        "PS = Plough, SK = Skip, "
         "II = Insufficient Information — numbered in travel order")
     ok = ok and schema.section_kind_label(
         schema.SECTION_SKIP, "") == "Skip"
-    return _result("plough/default vocabulary unchanged", ok)
+    return _result("plough and skip labels keep their working references", ok)
 
 
 def test_method_alias_normalisation() -> bool:
@@ -251,7 +251,7 @@ def test_placement_maths() -> bool:
 def run_all() -> list:
     return [
         test_trencher_vocabulary(),
-        test_plough_vocabulary_unchanged(),
+        test_plough_vocabulary(),
         test_method_alias_normalisation(),
         test_trencher_event_type_import_aliases(),
         test_tool_registration_in_schema(),

@@ -268,7 +268,8 @@ def build_report_html(plan: Dict,
                       ground_units: Optional[Sequence[Dict]] = None,
                       ground_classes: Optional[Sequence[Dict]] = None,
                       bas_rows: Optional[Sequence[Dict]] = None,
-                      bas_columns: Optional[Sequence[Dict]] = None) -> str:
+                      bas_columns: Optional[Sequence[Dict]] = None,
+                      profile_caption: str = "") -> str:
     """Assemble the full report; pure formatting, no QGIS access."""
     # Sections without their own tool use the plan default tool's type.
     method = tools_mod.plan_label_method(plan, tools or [])
@@ -364,11 +365,14 @@ def build_report_html(plan: Dict,
                             conclusion_rows))
 
     # -- profile --------------------------------------------------------------
+    if profile_png or profile_caption:
+        parts.append("<h2>Longitudinal profile</h2>")
     if profile_png:
         encoded = base64.b64encode(profile_png).decode("ascii")
-        parts.append("<h2>Longitudinal profile</h2>")
-        parts.append(f"<img class='profile' alt='Bathymetry profile' "
+        parts.append(f"<img class='profile' alt='Saved plan profile' "
                      f"src='data:image/png;base64,{encoded}'>")
+    if profile_caption:
+        parts.append(f"<p>{_esc(profile_caption)}</p>")
 
     # -- installation paths --------------------------------------------------
     parts.append("<h2>Installation paths</h2>")

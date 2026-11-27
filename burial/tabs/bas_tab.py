@@ -68,6 +68,8 @@ class BasTab(QWidget):
         self._loading = False
         self._dirty = False
         self._loaded_plan_id = ""
+        self._working_basis = None
+        self._saved_rows = []
         self._working: List[Dict] = []
         self._columns: List[Dict] = []
         self._draft_base_columns = None
@@ -77,11 +79,8 @@ class BasTab(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
         intro = QLabel(
-            "Burial Assessment Study conclusions as KP ranges: required depth "
-            "of lowering, achievable depth per tool, risk category, soil "
-            "province — whatever the study delivers. Import the study's table "
-            "(stating which RPL revision its KPs follow) or build the register "
-            "here; every cell is editable, and the columns are yours to shape.")
+            "Record Burial Assessment Study results by KP range. Import a table, "
+            "generate sections from soil polygons or add rows. Use Columns to choose what to record.")
         intro.setWordWrap(True)
         intro.setStyleSheet(ui_helpers.hint_style())
         layout.addWidget(intro)
@@ -117,12 +116,14 @@ class BasTab(QWidget):
         self.show_map.setChecked(bool(QSettings().value(
             f"{_SETTINGS_ROOT}/bas_layer_visible", True, type=bool)))
         self.show_map.toggled.connect(self._map_toggled)
-        toolbar.addWidget(self.show_map)
         toolbar.addStretch(1)
+        layout.addLayout(toolbar)
+        status_row = QHBoxLayout()
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
-        toolbar.addWidget(self.status_label, 2)
-        layout.addLayout(toolbar)
+        status_row.addWidget(self.status_label, 1)
+        status_row.addWidget(self.show_map)
+        layout.addLayout(status_row)
 
         self.strip = VerdictStrip()
         self.strip.setToolTip("Scope coverage of the register (green = covered; "
@@ -179,7 +180,11 @@ class BasTab(QWidget):
         layout.addWidget(self.table, 1)
 
         refresh_soon = ui_helpers.coalesced(self, self.refresh)
-        model.planChanged.connect(refresh_soon)
+        def plan_changed():
+            if self._dirty and self.model.plan_id != self._loaded_plan_id:
+                self._dirty = False
+            refresh_soon()
+        model.planChanged.connect(plan_changed)
         model.basChanged.connect(refresh_soon)
         self.refresh()
 
@@ -213,6 +218,8 @@ class BasTab(QWidget):
             self._update_status()
             return
         self._working = [bas_model.decode_row(r) for r in self.model.bas_rows]
+        self._working_basis = self.model.kp_edit_basis()
+        self._saved_rows = self.model.bas_rows
         self._draft_base_columns = None
         self._columns = columns
         self._dirty = False
@@ -676,10 +683,12 @@ class BasTab(QWidget):
             if answer != MESSAGE_BOX_YES:
                 return
         keep = {c["key"] for c in self._columns}
-        for row in self._working:
-            row["values"] = {k: v for k, v in row.get("values", {}).items() if k in keep}
-        if self.model.save_bas(self._working, columns=self._columns if self._draft_base_columns is not None else None,
-                               reason="edited in BAS tab"):
+        rows = [dict(r, values={k: v for k, v in r["values"].items() if k in keep}) for r in self._working]
+        generated_columns = self._draft_base_columns is not None
+        if self.model.save_bas(rows, columns=self._columns if generated_columns else None,
+                               reason="edited in BAS tab", expected_basis=self._working_basis,
+                               expected_rows=self._saved_rows,
+                               expected_columns=self._draft_base_columns if generated_columns else self._columns):
             self._dirty = False
             self.refresh()
 
@@ -691,6 +700,7 @@ class BasTab(QWidget):
     def _import(self) -> None:
         if not self.model.plan:
             return
+        basis, saved_rows = self._working_basis, self._saved_rows
         dialog = BasImportDialog(self.model, self.dock, self)
         if qt_exec(dialog) != DIALOG_ACCEPTED:
             return
@@ -718,39 +728,59 @@ class BasTab(QWidget):
         if self.model.save_bas(
                 rows, columns=columns, action=change_log.ACTION_IMPORT_BAS,
                 reason=f"imported {len(dialog.rows)} row(s) from {dialog.source_ref or 'file'}",
-                meta_updates=meta):
+                meta_updates=meta, expected_basis=basis, expected_rows=saved_rows):
             self._dirty = False
             self.refresh()
 
     def _generate(self):
         from qgis.core import QgsCsException
 
-        from ..bas_polygon_dialog import BasPolygonDialog
+        from ..bas_polygon_dialog import BasChangesDialog, BasPolygonDialog
         from ..bas_polygons import generate_sections
         from ..rpl_reference import plan_rpl_label
 
         if self.model.route is None:
             self._set_status("Select a plan with a resolved route.", "warn")
             return
-        dialog = BasPolygonDialog(self)
+        route, plan_id = self.model.route, self.model.plan_id
+        params = self.model.gen_params()
+        scope = params.scope if params.scope_end_kp > params.scope_start_kp else None
+        lo, hi = route.start_kp_km, route.end_kp_km
+        if scope is not None:
+            lo, hi = max(lo, scope.start_km), min(hi, scope.end_km)
+        if hi - lo <= 1e-9:
+            self._set_status("The applied scope has no measurable length on this route. Review the scope on Inputs.", "warn")
+            return
+        extent = "Plan scope" if scope is not None else "No scope applied. Full route"
+        dialog = BasPolygonDialog(self, f"{extent} · KP {lo:.3f}–{hi:.3f}", full_route=scope is None)
+        saved_scope = (self.model.plan.get("scope_start_kp"), self.model.plan.get("scope_end_kp"))
+        original_rows = [bas_model.decode_row(r) for r in self._working]
+        original_columns = [dict(c) for c in self._columns]
+
+        def current():
+            return (self.model.route is route and self.model.plan_id == plan_id
+                    and saved_scope == (self.model.plan.get("scope_start_kp"), self.model.plan.get("scope_end_kp")))
+
         if not dialog.tree.topLevelItemCount():
             self._set_status("Add a polygon layer to the project to generate BAS sections.", "warn")
             return
         if qt_exec(dialog) != DIALOG_ACCEPTED:
             return
-        route, plan_id = self.model.route, self.model.plan_id
+        if not current():
+            self._set_status("The plan route or scope changed. Generate again to review the new extent.", "warn")
+            return
         progress = QProgressDialog("Intersecting polygons…", "Cancel", 0, 0, self)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
 
         def advance(layer_name):
             progress.setLabelText(f"Intersecting {layer_name}…")
             QApplication.processEvents()
-            return not progress.wasCanceled() and self.model.route is route and self.model.plan_id == plan_id
+            return not progress.wasCanceled() and current()
 
         try:
             rows, columns = generate_sections(route, dialog.sources(), self._columns,
-                                              self.model.gen_params().scope, plan_rpl_label(self.model), advance)
-            cancelled = progress.wasCanceled() or self.model.route is not route or self.model.plan_id != plan_id
+                                              scope, plan_rpl_label(self.model), advance)
+            cancelled = progress.wasCanceled() or not current()
         except (QgsCsException, ValueError, RuntimeError) as exc:
             QMessageBox.warning(self, "Generate BAS sections", str(exc))
             return
@@ -762,7 +792,33 @@ class BasTab(QWidget):
         if not rows:
             self._set_status("The selected polygons cover no length of route within the plan scope.", "warn")
             return
-        self._working.extend(rows)
+        additions, conflicts, unchanged = bas_model.compare_polygon_rows(original_rows, rows)
+        selected = []
+        if conflicts:
+            review = BasChangesDialog(self, original_rows, conflicts, columns, len(additions), unchanged)
+            if qt_exec(review) != DIALOG_ACCEPTED:
+                return
+            selected = review.selected()
+        if not current() or self._working != original_rows or self._columns != original_columns:
+            self._set_status("The plan or BAS register changed during review. Generate again.", "warn")
+            return
+        if not additions and not selected:
+            self._set_status(f"No changes staged. {unchanged} interval(s) already present.", "info")
+            return
+        staged = list(additions)
+        updated = 0
+        for index in selected:
+            proposed, _hits, exact = conflicts[index]
+            if exact is None:
+                staged.append(proposed)
+            else:
+                row = self._working[exact]
+                row["values"].update(proposed["values"])
+                updated += 1
+                note = proposed.get("notes")
+                if note and note not in row["notes"]:
+                    row["notes"] = "\n".join(filter(None, (row["notes"], note)))
+        self._working.extend(staged)
         if self._draft_base_columns is None:
             self._draft_base_columns = self.model.bas_columns()
         self._columns = columns
@@ -770,9 +826,8 @@ class BasTab(QWidget):
         self._mark_dirty()
         self._rebuild_table()
         self._refresh_strip()
-        issues = sum(bool(row["notes"]) for row in rows)
-        self._set_status(f"Generated {len(rows)} section(s). {issues} marked for review in Notes. "
-                         "Choose Apply changes to save.", "info")
+        self._set_status(f"Staged {len(staged)} new and {updated} "
+                         f"updated intervals. {unchanged} already present. Choose Apply changes to save.", "info")
 
     def _export(self) -> None:
         if not self.model.plan:
@@ -803,6 +858,7 @@ class BasTab(QWidget):
             return
         rows = self._selected_rows()
         targets = rows if rows else list(range(len(self._working)))
+        basis, saved_rows = self._working_basis, self._saved_rows
         dialog = RereferenceDialog(self.model, self.dock,
                                    [self._working[r] for r in targets], self,
                                    mapper=bas_model.rereference_rows,
@@ -822,7 +878,7 @@ class BasTab(QWidget):
                 merged, action=change_log.ACTION_REREFERENCE_BAS,
                 reason=f"re-referenced {len(targets)} row(s): "
                        f"{dialog.kp_map.diagnostics.summary()[:200]}",
-                meta_updates=meta):
+                meta_updates=meta, expected_basis=basis, expected_rows=saved_rows):
             self._dirty = False
             self.refresh()
 

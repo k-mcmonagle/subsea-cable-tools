@@ -829,11 +829,15 @@ def test_profile_widget_axes_crosshair_toggles() -> bool:
     ok = ok and widget._slope_curves["cross"].isVisible()
     # Depth and slope plots sit in a user-adjustable splitter; context menus
     # are enabled for export/axis options.
-    ok = ok and widget._splitter.count() == 2
+    visible_panes = [widget._splitter.widget(i) for i in range(widget._splitter.count())
+                     if not widget._splitter.widget(i).isHidden()]
+    ok = ok and visible_panes == [widget._depth_pane, widget._slope_pane]
     ok = ok and plot_item.vb.menu is not None
     linked_plot.close()
     linked_plot.deleteLater()
-    return _result("profile widget: axes, alignment, crosshair, toggles", ok)
+    return _result("profile widget: axes, alignment, crosshair, toggles", ok,
+                   "" if ok else f"slope KP {(lo, hi)}, linked KP {(linked_lo, linked_hi)}, "
+                   f"visible panes {len(visible_panes)}, readout {text!r}")
 
 
 def test_profile_widget_measurements() -> bool:

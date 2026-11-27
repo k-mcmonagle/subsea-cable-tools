@@ -521,6 +521,7 @@ class InputsTab(QWidget):
         # Unapplied edits mark the matching Apply button; a background
         # refresh of the same plan must not clobber them.
         self._dirty = set()
+        self._edit_basis = None
         for widget, signal in (
                 (self.scope_start, "valueChanged"),
                 (self.scope_end, "valueChanged"),
@@ -548,6 +549,8 @@ class InputsTab(QWidget):
     def _mark_dirty(self, key: str) -> None:
         if self._loading:
             return
+        if not self._dirty:
+            self._edit_basis = self.model.kp_edit_basis()
         self._dirty.add(key)
         self._sync_dirty_markers()
 
@@ -848,16 +851,8 @@ class InputsTab(QWidget):
         kp_map = None
         reason = "Route set."
         outside = 0
-        if changed:
-            pending = []
-            if self._dirty:
-                pending.append("Inputs")
-            for title, tab in (("BAS", "bas_tab"), ("Ground Model", "ground_tab")):
-                if getattr(getattr(self.dock, tab, None), "_dirty", False):
-                    pending.append(title)
-            if pending and (self.model.route or self.model._plan_has_kp_data()):
-                self._set_status("Finish the pending edits in " + ", ".join(pending)
-                                 + " before changing the route.", "warn")
+        if changed and (self.model.route or self.model._plan_has_kp_data()):
+            if self._has_pending_kp_edits("changing the route"):
                 return
         if changed and self.model._plan_has_kp_data():
             choice = self._review_route_change(route, label, same_source)
@@ -935,8 +930,20 @@ class InputsTab(QWidget):
             return None, reason, outside
         return None
 
+    def _has_pending_kp_edits(self, action: str) -> bool:
+        pending = ["Inputs"] if self._dirty else []
+        for title, tab in (("BAS", "bas_tab"), ("Ground Model", "ground_tab")):
+            if getattr(getattr(self.dock, tab, None), "_dirty", False):
+                pending.append(title)
+        if pending:
+            self._set_status("Finish the pending edits in " + ", ".join(pending)
+                             + " before " + action + ".", "warn")
+        return bool(pending)
+
     def _change_kp_mode(self) -> None:
         if not self.model.plan:
+            return
+        if self._has_pending_kp_edits("changing the KP distance"):
             return
         from ...kp_settings_dialog import KpSettingsDialog
         mode, grid = self.model.kp_mode()
@@ -1028,7 +1035,7 @@ class InputsTab(QWidget):
             "scope_start_kp": start,
             "scope_end_kp": end,
             "direction": self.direction_combo.currentData(),
-        }, reason="scope/direction")
+        }, reason="scope/direction", expected_basis=self._edit_basis if self._dirty else None)
         if saved:
             self._clear_dirty("scope")
             self._set_status(
@@ -1429,10 +1436,10 @@ class InputsTab(QWidget):
         if length:
             # Clamp the 3-dp rounding past the route end onto the route.
             for entry in ranges:
-                entry["start_kp"] = max(0.0, entry["start_kp"])
-                entry["end_kp"] = min(length, entry["end_kp"])
+                entry["start_kp"] = max(length[0], entry["start_kp"])
+                entry["end_kp"] = min(length[1], entry["end_kp"])
         if self.model.update_targets(self.target_burial.value() or None,
-                                     ranges):
+                                     ranges, expected_basis=self._edit_basis if self._dirty else None):
             self._clear_dirty("target")
             self._update_target_summary()
             self._set_status("Target burial depth applied.", "ok")

@@ -37,6 +37,7 @@ from qgis.PyQt.QtWidgets import (
     QComboBox,
     QDockWidget,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -45,6 +46,8 @@ from qgis.PyQt.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSplitter,
     QTabWidget,
     QToolButton,
@@ -130,6 +133,39 @@ _FLOATING_GEOMETRY_KEY = "SubseaCableTools/BurialPlanner/floating_geometry"
 _FLOATING_MODE_KEY = "SubseaCableTools/BurialPlanner/floating"
 
 
+def _scroll_panel(widget):
+    area = QScrollArea()
+    area.setFrameShape(QFrame.Shape.NoFrame)
+    area.setWidgetResizable(True)
+    area.setWidget(widget)
+    return area
+
+
+class _PageTabs(QTabWidget):
+    """Keep the tab bar fixed while each page scrolls within its own viewport."""
+
+    def add_page(self, page, title):
+        return self.addTab(_scroll_panel(page), title)
+
+    def widget(self, index):
+        host = super().widget(index)
+        return host.widget() if isinstance(host, QScrollArea) else host
+
+    def currentWidget(self):
+        return self.widget(self.currentIndex())
+
+    def indexOf(self, page):
+        for index in range(self.count()):
+            if self.widget(index) is page:
+                return index
+        return super().indexOf(page)
+
+    def setCurrentWidget(self, page):
+        index = self.indexOf(page)
+        if index >= 0:
+            self.setCurrentIndex(index)
+
+
 def _path_key(path: str) -> str:
     return os.path.normcase(os.path.abspath(path)) if path else ""
 
@@ -171,6 +207,7 @@ class BurialPlannerDock(QDockWidget):
         self._task_plan_id = ""
         self._profile_task: Optional[analysis_task.ProfileSamplingTask] = None
         self._profile_generation = 0
+        self._profile_scope_key = None
         self._generate_after_analysis = False
         self._generate_fresh = False
         self._fresh_keep_client = True
@@ -242,7 +279,7 @@ class BurialPlannerDock(QDockWidget):
         outer.addLayout(self._build_plan_strip())
 
         self.splitter = QSplitter(_VERTICAL)
-        self.tabs = QTabWidget()
+        self.tabs = _PageTabs()
         self.plan_tab = PlanTab(self.model)
         self.inputs_tab = InputsTab(self.model, self.workbench_store, dock=self)
         self.tools_tab = ToolsTab(self.model, self)
@@ -254,60 +291,80 @@ class BurialPlannerDock(QDockWidget):
         self.paths_tab = PathsTab(self.model, self)
         self.builder_tab = BuilderTab(self.model, self)
         self.review_tab = ReviewTab(self.model, self)
-        self.tabs.addTab(self.plan_tab, "Plan")
-        self.tabs.addTab(self.inputs_tab, "Inputs")
-        self.tabs.addTab(self.tools_tab, "Burial Tools")
-        self.tabs.addTab(self.profile_tab, "Bathymetry Profile")
-        self.tabs.addTab(self.ground_tab, "Ground Model")
-        self.tabs.addTab(self.bas_tab, "BAS")
-        self.tabs.addTab(self.rules_tab, "Exclusions")
-        self.tabs.addTab(self.risk_tab, "Risk Profile")
-        self.tabs.addTab(self.paths_tab, "Installation Paths")
-        self.tabs.addTab(self.builder_tab, "Plan Builder")
-        self.tabs.addTab(self.review_tab, "Review && Export")
+        self.tabs.add_page(self.plan_tab, "Plan")
+        self.tabs.add_page(self.inputs_tab, "Inputs")
+        self.tabs.add_page(self.tools_tab, "Burial Tools")
+        self.tabs.add_page(self.profile_tab, "Bathymetry Profile")
+        self.tabs.add_page(self.ground_tab, "Ground Model")
+        self.tabs.add_page(self.bas_tab, "BAS")
+        self.tabs.add_page(self.rules_tab, "Exclusions")
+        self.tabs.add_page(self.risk_tab, "Risk Profile")
+        self.tabs.add_page(self.paths_tab, "Installation Paths")
+        self.tabs.add_page(self.builder_tab, "Plan Builder")
+        self.tabs.add_page(self.review_tab, "Review && Export")
         # Workflow badges: these tabs gain a " ⚠" suffix (and a tooltip)
         # when a prerequisite the workflow depends on is missing or stale.
         self._tab_titles = {
             self.inputs_tab: "Inputs",
             self.profile_tab: "Bathymetry Profile",
         }
-        self.workflow_tabs = QTabWidget()
-        self.workflow_tabs.addTab(self.tabs, "Planning")
+        self.workflow_tabs = _PageTabs()
+        self.workflow_tabs.addTab(self.splitter, "Planning")
         # Acquired burial data (burial/acquired/): its own data file beside
         # the plan file, assessed against the open plan's target depth.
         self.acquired = AcquiredController(self.model, self)
         self.acquired_tab = AcquiredDataTab(self.acquired, self.model, self)
         self.assessment_tab = AssessmentTab(self.acquired, self.model, self)
         self.reporting_tab = ReportingTab(self.acquired, self.model, self.assessment_tab, self)
-        self.workflow_tabs.addTab(self.acquired_tab, "Acquired Data")
-        self.workflow_tabs.addTab(self.assessment_tab, "Assessment")
-        self.workflow_tabs.addTab(self.reporting_tab, "Reporting")
-        self.splitter.addWidget(self.workflow_tabs)
+        self.workflow_tabs.add_page(self.acquired_tab, "Acquired Data")
+        self.workflow_tabs.add_page(self.assessment_tab, "Assessment")
+        self.workflow_tabs.add_page(self.reporting_tab, "Reporting")
+        self.splitter.addWidget(self.tabs)
 
-        profile_pane = QWidget()
-        profile_layout = QVBoxLayout(profile_pane)
+        self.profile_pane = QWidget()
+        profile_layout = QVBoxLayout(self.profile_pane)
         profile_layout.setContentsMargins(0, 0, 0, 0)
-        profile_status_row = QHBoxLayout()
-        self.profile_status = QLabel("Bathymetry profile")
-        profile_status_row.addWidget(self.profile_status, 1)
+        self.profile_header = QWidget()
+        profile_status_row = QHBoxLayout(self.profile_header)
+        profile_status_row.setContentsMargins(0, 0, 0, 0)
+        self.profile_fold = QToolButton()
+        self.profile_fold.setText("Profiles")
+        self.profile_fold.setArrowType(Qt.ArrowType.DownArrow)
+        self.profile_fold.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.profile_fold.setToolTip("Collapse profiles to give the planning table more room")
+        self.profile_fold.clicked.connect(self._toggle_profiles)
+        profile_status_row.addWidget(self.profile_fold)
+        profile_status_row.addStretch(1)
         self.goto_kp_edit = QLineEdit()
         self.goto_kp_edit.setPlaceholderText("Go to KP…")
-        self.goto_kp_edit.setMaximumWidth(90)
+        self.goto_kp_edit.setFixedWidth(90)
         self.goto_kp_edit.setToolTip(
             "Type a KP (km) and press Enter to centre the map and the "
             "profile crosshair there.")
         self.goto_kp_edit.returnPressed.connect(self._goto_kp_entered)
         profile_status_row.addWidget(self.goto_kp_edit)
-        # The three profile view toggles live in one compact menu button so
+        # The profile view options live in one compact menu button so
         # the row survives narrow (screen-share) dock widths.
         self.view_button = QToolButton()
-        self.view_button.setText("View ▾")
+        self.view_button.setText("View")
         self.view_button.setPopupMode(TOOLBUTTON_POPUP_MODE_INSTANT)
         self.view_button.setToolTip(
-            "Profile view options: slope panel, event dragging, tool "
-            "outline, image export.")
+            "Choose the profile layout, visible panels and editing tools.")
         view_menu = QMenu(self.view_button)
         view_menu.setToolTipsVisible(True)
+        layouts = view_menu.addMenu("Profile layout")
+        self._profile_layout_actions = {}
+        for mode, title in (("bathy", "Bathymetry"), ("ground", "Below seabed"), ("stacked", "Stacked profiles")):
+            action = layouts.addAction(title)
+            action.setCheckable(True)
+            action.triggered.connect(lambda _checked, key=mode: self._set_profile_layout(key))
+            self._profile_layout_actions[mode] = action
+        self.event_lane_toggle = view_menu.addAction("Event and section lane")
+        self.event_lane_toggle.setCheckable(True)
+        self.event_lane_toggle.setToolTip("Show plan events and section ranges above the profile, aligned by KP.")
+        self.navigator_toggle = view_menu.addAction("Full-route navigator")
+        self.navigator_toggle.setCheckable(True)
+        self.navigator_toggle.setToolTip("Drag the visible window or its edges to pan or zoom the profiles.")
         self.slope_toggle = view_menu.addAction("Slope panel")
         self.slope_toggle.setCheckable(True)
         self.slope_toggle.setChecked(bool(QSettings().value(
@@ -364,32 +421,53 @@ class BurialPlannerDock(QDockWidget):
         self.view_button.setMenu(view_menu)
         self._style_view_button(self.profile_drag_toggle.isChecked())
         profile_status_row.addWidget(self.view_button)
+        self.profile_expand = QToolButton()
+        self.profile_expand.setText("Expand")
+        self.profile_expand.setToolTip("Give profiles all the space in Planning")
+        self.profile_expand.clicked.connect(self._toggle_profile_focus)
+        profile_status_row.addWidget(self.profile_expand)
         self.profile_progress = QProgressBar()
         self.profile_progress.setRange(0, 100)
-        self.profile_progress.setMaximumWidth(240)
+        self.profile_progress.setMaximumWidth(120)
         self.profile_progress.setVisible(False)
         profile_status_row.addWidget(self.profile_progress)
-        self.profile_cancel = QPushButton("Stop profile refresh")
+        self.profile_cancel = QPushButton("Stop")
+        self.profile_cancel.setToolTip("Stop the running profile refresh")
         self.profile_cancel.setVisible(False)
         self.profile_cancel.clicked.connect(self._cancel_profile_refresh)
         profile_status_row.addWidget(self.profile_cancel)
-        profile_layout.addLayout(profile_status_row)
+        profile_layout.addWidget(self.profile_header)
         self.profile = BurialProfileWidget()
         self.profile.link_kp_plot(self.paths_tab.dcc_plot)
         self.profile.link_kp_plot(self.ground_tab.plot.plot)
+        settings = QSettings()
+        self._set_profile_layout(settings.value("SubseaCableTools/BurialPlanner/profile_layout", "bathy"),
+                                 remember=False)
+        for action, key, apply in (
+                (self.event_lane_toggle, "event_lane_visible", self.profile.set_event_lane_visible),
+                (self.navigator_toggle, "navigator_visible", self.profile.set_navigator_visible)):
+            path = f"SubseaCableTools/BurialPlanner/{key}"
+            action.setChecked(settings.value(path, False, type=bool))
+            apply(action.isChecked())
+            action.toggled.connect(apply)
+            action.toggled.connect(lambda checked, setting=path: QSettings().setValue(setting, checked))
         self.profile.kpHovered.connect(self._on_profile_hover)
         self.profile.kpClicked.connect(self.goto_kp)
         self.profile.kpDoubleClicked.connect(self._on_profile_double_clicked)
         self.profile.eventMoveRequested.connect(self._on_profile_event_moved)
         self.profile.set_slope_visible(self.slope_toggle.isChecked())
-        profile_layout.addWidget(self.profile, 1)
-        self.splitter.addWidget(profile_pane)
-        self.workflow_tabs.currentChanged.connect(lambda index: profile_pane.setVisible(index == 0))
+        self.profile_status = QLabel("Bathymetry profile")
+        self.profile_status.setWordWrap(True)
+        self.profile_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        profile_layout.addWidget(self.profile_status)
+        self.profile_scroll = _scroll_panel(self.profile)
+        self.profile_scroll.setMinimumHeight(110)
+        profile_layout.addWidget(self.profile_scroll, 1)
+        self.splitter.addWidget(self.profile_pane)
+        self._pane_mode = "split"
+        self._split_sizes = [3, 2]
         self.splitter.setStretchFactor(0, 3)
         self.splitter.setStretchFactor(1, 1)
-        # The tabs' size hints could otherwise squash the profile pane on
-        # refresh; the user's chosen split is restored across sessions.
-        profile_pane.setMinimumHeight(150)
         splitter_state = QSettings().value(
             "SubseaCableTools/BurialPlanner/dock_splitter_state")
         if splitter_state is not None:
@@ -398,8 +476,13 @@ class BurialPlannerDock(QDockWidget):
             except (TypeError, ValueError):
                 log_exception("Burial Planner: saved splitter layout ignored",
                               level=logging.DEBUG)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(7)
+        self.splitter.handle(1).setToolTip("Drag to resize the planning table and profiles")
+        if splitter_state is None or not all(self.splitter.sizes()):
+            self.splitter.setSizes([480, 300])
         self.splitter.splitterMoved.connect(self._save_dock_splitter_state)
-        outer.addWidget(self.splitter, 1)
+        outer.addWidget(self.workflow_tabs, 1)
         self.setWidget(container)
         self._arm_watchdog()
 
@@ -596,6 +679,8 @@ class BurialPlannerDock(QDockWidget):
         strip = QHBoxLayout()
         strip.addWidget(QLabel("Plan:"))
         self.plan_combo = QComboBox()
+        self.plan_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.plan_combo.setMinimumWidth(90)
         self.plan_combo.setPlaceholderText(
             "No plans in this file — use Plan file… to open an existing file")
         self.plan_combo.currentIndexChanged.connect(self._plan_chosen)
@@ -603,7 +688,7 @@ class BurialPlannerDock(QDockWidget):
         # One compact menu instead of four buttons so the strip fits a
         # narrow (screen-share) dock width.
         self.plan_actions_button = ui_helpers.menu_tool_button(
-            "Plan ▾",
+            "Plan",
             (("New…", self._new_plan),
              ("Duplicate…", self._duplicate_plan),
              ("Rename…", self._rename_plan),
@@ -614,6 +699,7 @@ class BurialPlannerDock(QDockWidget):
         self.status_badge = QLabel("")
         strip.addWidget(self.status_badge)
         self.gpkg_name = QLabel("")
+        self.gpkg_name.setMinimumWidth(1)
         strip.addWidget(self.gpkg_name)
         self.gpkg_button = QPushButton("Plan file…")
         self.gpkg_button.setToolTip(self.store.gpkg_path)
@@ -661,7 +747,7 @@ class BurialPlannerDock(QDockWidget):
             else:
                 placeholder = ("Plan file unavailable — Plan file… → Open existing plans"
                                if project_gpkg_path() else
-                               "No plan file open — Plan ▾ New… starts one, Plan file… opens one")
+                               "No plan file open — choose New from the Plan menu or open a plan file")
             self.plan_combo.setPlaceholderText(placeholder)
         finally:
             self._loading = False
@@ -671,9 +757,37 @@ class BurialPlannerDock(QDockWidget):
         """The user picked a plan in the selector."""
         if self._loading:
             return
+        if self.plan_combo.currentData() != self.model.plan_id and not self._confirm_leave_plan():
+            blocked = self.plan_combo.blockSignals(True)
+            try:
+                self.plan_combo.setCurrentIndex(self.plan_combo.findData(self.model.plan_id))
+            finally:
+                self.plan_combo.blockSignals(blocked)
+            return
         if self.plan_combo.currentData():
             self._adopt_project()
         self._plan_selected()
+
+    def _confirm_leave_plan(self) -> bool:
+        if not self.model.plan:
+            return True
+        drafts = [(tab, label) for tab, label, flag in (
+            (self.plan_tab, "Plan", "_dirty"), (self.inputs_tab, "Inputs", "_dirty"),
+            (self.profile_tab, "Bathymetry Profile", "_dirty"), (self.ground_tab, "Ground Model", "_dirty"),
+            (self.bas_tab, "BAS", "_dirty"), (self.rules_tab, "Exclusions", "_params_dirty"),
+            (self.builder_tab, "Plan Builder", "_min_section_dirty"))
+            if getattr(tab, flag)]
+        if not drafts:
+            return True
+        labels = ", ".join(label for _, label in drafts)
+        discard = QMessageBox.question(
+            self, "Unapplied plan edits",
+            f"Discard the pending edits in {labels} and leave this plan?",
+            MESSAGE_BOX_YES | MESSAGE_BOX_NO, MESSAGE_BOX_NO)
+        if discard == MESSAGE_BOX_YES:
+            return True
+        self._show_planning_tab(drafts[0][0])
+        return False
 
     def _plan_selected(self) -> None:
         if self._loading:
@@ -800,7 +914,7 @@ class BurialPlannerDock(QDockWidget):
                                     "or Create new plan file for a separate set of plans.")
             return
         name, ok = QInputDialog.getText(self, "New burial plan", "Name:")
-        if not ok or not name.strip():
+        if not ok or not name.strip() or not self._confirm_leave_plan():
             return
         if not self.store_ready and not self._create_project_store():
             return
@@ -818,7 +932,7 @@ class BurialPlannerDock(QDockWidget):
         proposed = f"{self.model.plan.get('name') or 'Plan'} copy"
         name, ok = QInputDialog.getText(self, "Duplicate plan", "Copy name:",
                                         text=proposed)
-        if not ok or not name.strip():
+        if not ok or not name.strip() or not self._confirm_leave_plan():
             return
         try:
             new_id = self.store.duplicate_plan(self.model.plan_id, name.strip())
@@ -871,7 +985,7 @@ class BurialPlannerDock(QDockWidget):
         path, _filter = QFileDialog.getOpenFileName(
             self, "Open existing Burial Planner plans", start,
             "GeoPackage (*.gpkg)")
-        if not path:
+        if not path or not self._confirm_leave_plan():
             return
         try:
             store = self._open_existing_store(path)
@@ -887,7 +1001,7 @@ class BurialPlannerDock(QDockWidget):
 
         path = choose_new_gpkg(self, "Create new Burial Planner plan file",
                                default_project_gpkg_path(prefer_existing=False))
-        if not path:
+        if not path or not self._confirm_leave_plan():
             return False
         try:
             store = BurialStore(path)
@@ -997,7 +1111,7 @@ class BurialPlannerDock(QDockWidget):
                 "settings, then click Apply & rebuild profile."
                 + ("\n\nOut of date because:\n• " + "\n• ".join(reasons)
                    if reasons else ""))
-            self.tabs.setCurrentWidget(self.profile_tab)
+            self._show_planning_tab(self.profile_tab)
             return
         stations = params.scope.length_km * 1000.0 / max(params.coarse_step_m, 1.0)
         if stations > 500000:
@@ -1245,18 +1359,24 @@ class BurialPlannerDock(QDockWidget):
         self._cancel_profile_refresh(silent=True)
         self._profile_generation += 1
         if not plan or self.model.route is None:
+            self._profile_scope_key = None
             self.profile.clear()
             self.profile_status.setText(
                 self.model.route_error or "Select a plan route to display its profile.")
             return
+        self.profile.set_route_extent(self.model.route.start_kp_km, self.model.route.end_kp_km)
         params = self.model.gen_params()
         scope = params.scope
         if params.scope_end_kp > params.scope_start_kp:
-            self.profile.set_scope(scope.start_km, scope.end_km)
+            bounds = scope.start_km, scope.end_km
         else:
             # Preview the route until a scope is applied. Do not use the
             # generation engine's epsilon-sized placeholder as a viewport.
-            self.profile.set_scope(self.model.route.start_kp_km, self.model.route.end_kp_km)
+            bounds = self.model.route.start_kp_km, self.model.route.end_kp_km
+        scope_key = self.model.plan_id, self.model.route_geometry_fingerprint(), bounds
+        if self._profile_scope_key != scope_key:
+            self.profile.set_scope(*bounds)
+            self._profile_scope_key = scope_key
         # Replaced with the stored profile's actual resolution when it is
         # displayed. This fallback covers the empty/loading state.
         self.profile.set_slope_window_m(
@@ -1330,7 +1450,45 @@ class BurialPlannerDock(QDockWidget):
         self.profile.set_slope_series(long_series, cross_series, abs_series,
                                       list(zip(profile.kps, profile.cross_max_deg)))
 
+    def _show_planning_tab(self, page) -> None:
+        self.workflow_tabs.setCurrentIndex(0)
+        if self._pane_mode == "profiles":
+            self._set_pane_mode("split")
+        self.tabs.setCurrentWidget(page)
+
+    def _toggle_profiles(self) -> None:
+        self._set_pane_mode("split" if self._pane_mode == "tables" else "tables")
+
+    def _toggle_profile_focus(self) -> None:
+        self._set_pane_mode("split" if self._pane_mode == "profiles" else "profiles")
+
+    def _set_pane_mode(self, mode) -> None:
+        if self._pane_mode == "split" and all(self.splitter.sizes()):
+            self._split_sizes = self.splitter.sizes()
+        self._pane_mode = mode
+        folded = mode == "tables"
+        focused = mode == "profiles"
+        self.tabs.setVisible(not focused)
+        self.profile_status.setVisible(not folded)
+        self.profile_scroll.setVisible(not folded)
+        self.profile_pane.layout().activate()
+        self.splitter.handle(1).setEnabled(not folded)
+        self.splitter.setStretchFactor(1, 0 if folded else 1)
+        self.profile_fold.setArrowType(Qt.ArrowType.RightArrow if folded else Qt.ArrowType.DownArrow)
+        self.profile_fold.setToolTip("Show profiles" if folded else "Collapse profiles to give the planning table more room")
+        self.profile_expand.setText("Restore split" if focused else "Expand")
+        self.profile_expand.setToolTip("Show the planning table and profiles together" if focused
+                                      else "Give profiles all the space in Planning")
+        if folded:
+            header_height = self.profile_header.sizeHint().height()
+            self.splitter.setSizes([max(1, self.splitter.height() - self.splitter.handleWidth() - header_height),
+                                    header_height])
+        elif not focused:
+            self.splitter.setSizes(self._split_sizes)
+
     def _save_dock_splitter_state(self, *_args) -> None:
+        if self._pane_mode != "split" or not all(self.splitter.sizes()):
+            return
         QSettings().setValue(
             "SubseaCableTools/BurialPlanner/dock_splitter_state",
             self.splitter.saveState())
@@ -1339,6 +1497,18 @@ class BurialPlannerDock(QDockWidget):
         QSettings().setValue(
             "SubseaCableTools/BurialPlanner/slope_panel_visible", bool(checked))
         self.profile.set_slope_visible(bool(checked))
+
+    def _set_profile_layout(self, mode, remember=True):
+        if mode not in self._profile_layout_actions:
+            mode = "bathy"
+        for key, action in self._profile_layout_actions.items():
+            action.setChecked(key == mode)
+        self.ground_tab.place_plot(None if mode == "bathy" else self.profile.ground_layout)
+        self.profile.set_layout_mode(mode, self.ground_tab.plot.plot)
+        self.profile_drag_toggle.setEnabled(mode != "ground")
+        self._style_view_button(mode != "ground" and self.profile_drag_toggle.isChecked())
+        if remember:
+            QSettings().setValue("SubseaCableTools/BurialPlanner/profile_layout", mode)
 
     def _resample_profile(self) -> None:
         self._cancel_profile_refresh(silent=True)
@@ -1555,7 +1725,7 @@ class BurialPlannerDock(QDockWidget):
         if not self.model.plan:
             return
         self.builder_tab.set_add_kp(kp)
-        self.tabs.setCurrentWidget(self.builder_tab)
+        self._show_planning_tab(self.builder_tab)
         self.goto_kp(kp)
 
     # -- KP picking -----------------------------------------------------------
@@ -1710,6 +1880,8 @@ class BurialPlannerDock(QDockWidget):
         self._on_profile_hover(kp, sync_ground=sync_ground)
 
     def _on_profile_hover(self, kp: float, *, sync_ground: bool = True) -> None:
+        if self._suspended or self._shutting_down:
+            return  # a queued hover may arrive just after closing the dock
         self.rules_tab.overview.set_hover_kp(kp)
         self.rules_tab._fire_hover.set_hover_kp(kp)
         self.risk_tab._fire_hover.set_hover_kp(kp)

@@ -194,7 +194,7 @@ class GroundModelPlot(QWidget):
         self.plot.setBackground("w")
         self.plot.setMenuEnabled(True)
         self.plot.setLabel("bottom", "KP", units="km")
-        self.plot.setLabel("left", "Depth below seabed", units="m")
+        self.plot.setLabel("left", "Below seabed", units="m")
         self.plot.setMouseEnabled(x=True, y=True)
         self.plot.setMinimumHeight(120)
         item = self.plot.getPlotItem()
@@ -242,6 +242,7 @@ class GroundModelPlot(QWidget):
         self._target_label.setVisible(False)
         item.addItem(self._target_label, ignoreBounds=True)
         self._target_runs: List = []
+        item.vb.sigXRangeChanged.connect(self._position_target_label)
 
         self._vline = pg.InfiniteLine(
             angle=90, movable=False,
@@ -474,11 +475,19 @@ class GroundModelPlot(QWidget):
             text = ("Target burial " + (f"{depths[0]:.2f} m" if len(depths) == 1
                     else f"{depths[0]:g}–{depths[-1]:g} m"))
             self._target_label.setText(text)
-            self._target_label.setPos(cleaned[0][0], cleaned[0][2])
-            self._target_label.setVisible(True)
-        else:
-            self._target_label.setVisible(False)
+        self._position_target_label()
         self._fit_depth()
+
+    def _position_target_label(self, *_args) -> None:
+        lo, hi = self.plot.viewRange()[0]
+        for start, end, depth in self._target_runs:
+            if end > lo and start < hi:
+                kp = max(lo, start)
+                self._target_label.setAnchor((int(kp > (lo + hi) / 2), 1))
+                self._target_label.setPos(kp, depth)
+                self._target_label.show()
+                return
+        self._target_label.hide()
 
     def target_at(self, kp: float) -> Optional[float]:
         for start, end, depth in self._target_runs:
@@ -490,6 +499,10 @@ class GroundModelPlot(QWidget):
         self._unit_item.set_selected(unit_id)
 
     def clear(self) -> None:
+        self.set_scope(0, 0)
+        self.set_target_runs([])
+        self.set_numeric(None)
+        self.set_cpts([])
         self.set_annotations([])
         self.set_horizons([])
         self.set_units([], [])

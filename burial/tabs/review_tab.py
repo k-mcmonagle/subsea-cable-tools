@@ -235,33 +235,9 @@ class ReviewTab(QWidget):
             return
         self.status_label.setText(f"Exported {kind} CSV → {path}")
 
-    def _profile_png(self):
-        """Snapshot the dock's profile pane as PNG bytes, or None.
-
-        The pane renders even when hidden/collapsed as long as it has a
-        useful size, so the report doesn't silently lose its profile image
-        because of transient dock state.
-        """
-        try:
-            from qgis.PyQt.QtCore import QBuffer, QByteArray, QIODevice
-
-            widget = self.dock.profile
-            if widget is None or widget.width() < 100 or widget.height() < 60:
-                return None
-            pixmap = widget.grab()
-            if pixmap.isNull():
-                return None
-            data = QByteArray()
-            buffer = QBuffer(data)
-            open_mode = getattr(QIODevice, "OpenModeFlag", QIODevice).WriteOnly
-            buffer.open(open_mode)
-            pixmap.save(buffer, "PNG")
-            buffer.close()
-            return bytes(data)
-        except Exception:
-            return None
-
     def _export_report(self) -> None:
+        from ..report_profile import saved_profile_figure
+
         if not self.model.plan:
             return
         plan_name = schema.sanitize_slug(self.model.plan.get("name") or "plan")
@@ -272,11 +248,17 @@ class ReviewTab(QWidget):
             return
         active = self.model.store.active_generation(self.model.plan_id) or {}
         entries = self.model.store.list_change_log(self.model.plan_id)
+        try:
+            png, caption = saved_profile_figure(self.model)
+        except Exception:
+            from ...plugin_log import log_exception
+            log_exception("Burial Planner: saved report profile could not be rendered")
+            png, caption = None, "The saved profile figure could not be rendered."
         text = report.build_report_html(
             plan=self.model.plan, sections=self.model.sections,
             events=self.model.events, rules=self.model.rules,
             inputs=self.model.inputs, generation=active,
-            change_log=entries, profile_png=self._profile_png(),
+            change_log=entries, profile_png=png, profile_caption=caption,
             hazards=self.model.hazards, risk_checks=self.model.risk_checks,
             tools=self.model.tools, path_result=self.model.path_result,
             path_state=self.model.path_state(),

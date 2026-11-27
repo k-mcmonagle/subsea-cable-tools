@@ -32,8 +32,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Improved
 
+- **Burial Planner profiles** can show bathymetry, depth below seabed or both, with an optional event and section lane and a draggable full-route KP navigator. Tables and plots scroll independently. Fold or expand the profiles to work on either pane, then restore the previous split. Plough sections now read **Plough** or **Skip** and keep their existing references and status.
 - **Burial Planner** now previews how saved KPs will change for Workbench revisions and project lines, and rollback restores the previous route reference. Existing risk scans and installation paths may need one rerun to verify their route geometry.
-- **Burial Planner BAS** can draft sections from route intersections with soil polygons and zoom to a section from its table row.
+- **Burial Planner BAS** drafts sections from soil polygons over the displayed KP extent, skips matching intervals on repeat runs and lets users review changes alongside existing classifications and notes.
 - **Burial Planner Risk Profile** supports zero-distance checks for on-route points, crossings and overlaps. Review line overlaps previously recorded as individual vertices when rerunning those checks.
 - **Burial Planner hazard register** adds search, column filters, numeric sorting and configurable scored risk levels. Coverage uses each hazard’s recorded KP range, so a point contributes zero length.
 - **KP Mouse Tool** can display temporary, zoom-aware KP markers and leaders and shows the active RPL in its status bar.
@@ -45,6 +46,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **Burial Planner** protects unapplied edits when switching plans or changing the KP basis. HTML plan report figures use saved data at the stated extent and identify the depth reference.
 - **Route Comments — images on the map:** images in map labels are now found beside the register the layer reads, so they keep showing when a project is opened from another folder or by another user (for example a synced folder under each user's own name) and before the dock is opened; labels made earlier are updated when the dock opens, keeping other label changes. Details and images now show at their own scale (a map set to 1:50,000), and an import that puts images on the map now offers to update labels that cannot show them and to zoom in.
 - **Route Comments — route references:** comments no longer show *Route unavailable* when the project and its route file are opened from another user's or computer's folder.
 - **Create Raster from XYZ / Merge MBES Rasters:** these tools now run GDAL inside QGIS instead of starting GDAL's separate programs, so they work on Windows computers whose application control policy blocks those programs (they failed with "gdal_translate failed to start" or "No rasters were created"). Outputs are unchanged.

@@ -362,7 +362,7 @@ SKIP_HANDLING_LABELS: Dict[str, str] = {
 # for tables, exports and documentation. Derived — never stored — so it always
 # reflects the current partition: sections are numbered per kind in travel
 # order (direction -1 counts from the high-KP end). Codes follow the method
-# vocabulary (plough burial sections are Candidate Plough Sections -> PS).
+# vocabulary (plough sections use PS regardless of review state).
 _SECTION_REF_CODES_DEFAULT: Dict[str, str] = {
     SECTION_BURIAL: "BS",
     SECTION_SKIP: "SK",
@@ -401,8 +401,8 @@ _SECTION_KIND_LABELS_DEFAULT: Dict[str, str] = {
 }
 _SECTION_KIND_LABELS_BY_METHOD: Dict[str, Dict[str, str]] = {
     METHOD_PLOUGH: {
-        SECTION_BURIAL: "Candidate Plough Section",
-        SECTION_SKIP: "Plough Skip",
+        SECTION_BURIAL: "Plough",
+        SECTION_SKIP: "Skip",
         SECTION_INSUFFICIENT: "Insufficient Information",
     },
     METHOD_TRENCHER: {
@@ -441,7 +441,7 @@ def section_ref_legend(method: str = "", sections=None) -> str:
     """One-line legend for UI tooltips and report footnotes.
 
     With ``sections``, burial codes are listed for every tool type in use
-    (e.g. "PS = Candidate Plough Section, PB = PLB Section, SK = …").
+    (e.g. "PS = Plough, PB = PLB Section, SK = …").
     """
     burial_methods = [normalise_method(method)]
     for section in sections or []:
