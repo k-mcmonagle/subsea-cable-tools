@@ -19,8 +19,8 @@ the layer default, so the layers come back styled even when added to a
 project without this plugin. Because of that, styling is **not** reapplied to
 a layer that already carries an RPL-shaped renderer: a style the user saved
 (or tweaked and saved as the layer default) survives being reloaded, and only
-newly appearing cable types get a category added. Pass ``force=True`` to
-deliberately restyle, which is what applying a palette change does.
+newly appearing cable types get a category added. The palette editor
+updates matching category colours in place.
 
 Pure helpers (colour lookup, normalisation) have no qgis dependency so they
 can be unit-tested headless; the ``apply_*`` functions import qgis lazily.
@@ -38,18 +38,24 @@ EVENT_FIELD = "Event"
 
 STYLE_NAME = "subsea_cable_tools"
 
-# Canonical colours for common cable protection/armour codes (Okabe-Ito based,
-# ordered roughly light protection = cool, heavy protection = warm).
+# Keep the two lightweight greens distinct in brightness on thin map lines.
 KNOWN_CABLE_TYPE_COLOURS = {
-    "LW": "#56b4e9",    # lightweight
-    "LWP": "#0072b2",   # lightweight protected
-    "LWS": "#0072b2",   # lightweight screened
-    "SA": "#009e73",    # single armour
-    "SAL": "#8fce5a",   # single armour light
+    "LW": "#63ad36",    # lightweight
+    "LWP": "#8057a6",   # lightweight protected
+    "LWS": "#155438",   # lightweight screened
+    "SA": "#006cbe",    # single armour
+    "SAL": "#57bfd4",   # single armour light
     "SAM": "#e69f00",   # single armour medium
     "SAH": "#d55e00",   # single armour heavy
-    "DA": "#cc3311",    # double armour
+    "DA": "#d32f35",    # double armour
     "RA": "#882255",    # rock armour
+}
+
+# Earlier plugin defaults can be updated when the user applies the palette
+# to an existing project. Colours deliberately chosen on a layer take priority.
+_PREVIOUS_STANDARD = {
+    "LW": "#56b4e9", "LWP": "#0072b2", "LWS": "#0072b2",
+    "SA": "#009e73", "SAL": "#8fce5a", "DA": "#cc3311",
 }
 
 # Deterministic fallback palette for cable types not in the canonical map.
@@ -238,7 +244,28 @@ def is_cable_type_categorised(layer) -> bool:
         return False
     renderer = layer.renderer()
     return isinstance(renderer, QgsCategorizedSymbolRenderer) \
-        and renderer.classAttribute() == CABLE_TYPE_FIELD
+        and renderer.classAttribute() in (CABLE_TYPE_FIELD, f'"{CABLE_TYPE_FIELD}"')
+
+
+def _category_types(category):
+    values = category.value()
+    if not isinstance(values, list):
+        values = [values]
+    return [value.strip() for value in values if isinstance(value, str) and value.strip()]
+
+
+def layer_cable_type_colours(layer) -> Dict[str, str]:
+    """Exact category values and symbol colours on this project's RPL layer."""
+    if not is_cable_type_categorised(layer):
+        return {}
+    colours = {}
+    for category in layer.renderer().categories():
+        symbol = category.symbol()
+        if symbol is None:
+            continue
+        for value in _category_types(category):
+            colours[value] = symbol.color().name()
+    return colours
 
 
 def is_rule_based(layer) -> bool:
@@ -256,23 +283,20 @@ def refresh_line_categories(layer, overrides: Optional[Dict[str, str]] = None) -
     """Add categories for CableType values that appeared since styling.
 
     Keeps any colour tweaks the user made to existing categories; only truly
-    new values get a category. Falls back to a full restyle when the layer is
-    not categorised on CableType.
+    new values get a category. Other renderer types belong to the layer.
     """
     try:
-        from qgis.core import QgsCategorizedSymbolRenderer, QgsRendererCategory
+        from qgis.core import QgsRendererCategory
     except ImportError:  # pragma: no cover - headless
         return
     if layer is None or not layer.isValid():
         return
-    renderer = layer.renderer()
-    if not isinstance(renderer, QgsCategorizedSymbolRenderer) \
-            or renderer.classAttribute() != CABLE_TYPE_FIELD:
-        apply_line_style(layer, overrides)
+    if not is_cable_type_categorised(layer):
         return
+    renderer = layer.renderer()
     if overrides is None:
         overrides = user_cable_type_colours()
-    existing = {str(c.value()) for c in renderer.categories()}
+    existing = {value for category in renderer.categories() for value in _category_types(category)}
     added = False
     for value in _unique_strings(layer, CABLE_TYPE_FIELD):
         if value not in existing:
@@ -280,6 +304,7 @@ def refresh_line_categories(layer, overrides: Optional[Dict[str, str]] = None) -
                 value, _line_symbol(colour_for_cable_type(value, overrides)), value))
             added = True
     if added:
+        layer.emitStyleChanged()
         layer.triggerRepaint()
 
 
@@ -336,6 +361,11 @@ def save_default_style(layer) -> None:
     try:
         layer.saveStyleToDatabase(
             STYLE_NAME, "Subsea Cable Tools standard style", True, "")
+        # OGR can retain a stale read handle after writing layer_styles in
+        # the same GeoPackage. Refresh the provider, keeping the layer's
+        # renderer and any uncommitted changes in its edit buffer.
+        if layer.providerType() == "ogr":
+            layer.dataProvider().reloadData()
     except Exception:
         pass
 
@@ -349,8 +379,7 @@ def style_rpl_layer(layer, layer_name: Optional[str] = None, persist: bool = Tru
     either a style the user saved as the GeoPackage default or one applied
     earlier this session, and silently overwriting it is how custom
     symbology used to get lost. Line layers still gain categories for cable
-    types that appeared since. ``force=True`` restyles regardless, which is
-    what applying a palette change does.
+    types that appeared since. ``force=True`` explicitly replaces the renderer.
     """
     name = layer_name or (layer.name() if layer is not None else "")
     # Project layer names are display names, so fall back to the gpkg table.
@@ -387,15 +416,17 @@ def source_layer_name(layer) -> str:
 
 
 def restyle_workbench_layers(project=None, gpkg_path: str = "",
-                             overrides: Optional[Dict[str, str]] = None) -> int:
-    """Reapply the standard style to every RPL layer in the project.
+                             overrides: Optional[Dict[str, str]] = None, *,
+                             previous_overrides: Optional[Dict[str, str]] = None,
+                             persist: bool = True, line_names=None) -> int:
+    """Recolour loaded CableType categories. Return the number of layers changed.
 
-    Used after a palette change: unlike normal styling this is deliberate,
-    so it forces the renderer and re-saves the GeoPackage default style.
-    Returns the number of layers restyled.
+    The palette editor supplies the previous palette so that layer-specific
+    colours survive. Grouped categories and compound symbols keep their styles.
     """
     try:
         from qgis.core import QgsProject, QgsVectorLayer
+        from qgis.PyQt.QtGui import QColor
     except ImportError:  # pragma: no cover - headless
         return 0
     import os
@@ -408,13 +439,45 @@ def restyle_workbench_layers(project=None, gpkg_path: str = "",
         if not isinstance(layer, QgsVectorLayer) or not layer.isValid():
             continue
         name = source_layer_name(layer)
-        if not name.endswith(("_points", "_lines")):
+        if line_names is not None:
+            if name not in line_names:
+                continue
+        elif not name.endswith("_lines"):
             continue
         if gpkg_path:
             source = str(layer.source() or "").split("|")[0]
             if os.path.normcase(os.path.abspath(source)) \
                     != os.path.normcase(os.path.abspath(gpkg_path)):
                 continue
-        style_rpl_layer(layer, name, persist=True, force=True, overrides=overrides)
-        count += 1
+        if not is_cable_type_categorised(layer):
+            continue
+        changed = False
+        renderer = layer.renderer()
+        for index, category in enumerate(renderer.categories()):
+            value, symbol = category.value(), category.symbol()
+            if not isinstance(value, str) or not value.strip() or symbol is None or symbol.symbolLayerCount() != 1:
+                continue
+            token = normalise_cable_type(value)
+            current = symbol.color()
+            target = colour_for_cable_type(value, overrides)
+            if current.name() == target:
+                continue
+            if previous_overrides is not None and current.name() not in (
+                    colour_for_cable_type(value, previous_overrides),
+                    standard_colour_for_cable_type(value), _PREVIOUS_STANDARD.get(token)):
+                continue
+            updated = symbol.clone()
+            colour = QColor(target)
+            colour.setAlpha(current.alpha())
+            updated.setColor(colour)
+            renderer.updateCategorySymbol(index, updated)
+            changed = True
+        if changed:
+            layer.emitStyleChanged()
+            layer.triggerRepaint()
+            if persist:
+                save_default_style(layer)
+            count += 1
+    if count:
+        project.setDirty(True)
     return count

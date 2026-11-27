@@ -70,6 +70,7 @@ class EventLayer(QObject):
         self._cache_key = None
         self._layout: Dict = {}
         self.range_rows = 0
+        self.range_alpha = 170
         self._rows: List[int] = []
 
     # -- content -----------------------------------------------------------------------
@@ -261,7 +262,7 @@ class EventLaneItem(_DeviceItem):
                     continue
                 y = labels_bottom + row * (BAR_PX + 1)
                 colour = QColor(*((160, 160, 160) if e.muted else e.colour))
-                colour.setAlpha(170)
+                colour.setAlpha(layer.range_alpha)
                 painter.fillRect(QRectF(a, y, max(b - a, 1.5), BAR_PX), colour)
             # Ticks at every point event.
             for e, x in zip(layer.events, xs):
@@ -289,7 +290,7 @@ class EventLaneItem(_DeviceItem):
                 painter.drawRoundedRect(box, 2.5, 2.5)
                 # A light range colour still identifies the bar and border;
                 # darken the lettering against the white label.
-                painter.setPen(colour.darker(180) if e.is_range and qGray(colour.rgb()) > 140 else colour)
+                painter.setPen(colour.darker(180) if e.is_range and qGray(colour.rgb()) > 118 else colour)
                 painter.drawText(box, int(getattr(_ALIGN, "value", _ALIGN)), layer.text_of(e, lay["compact"]))
         finally:
             painter.restore()

@@ -1106,8 +1106,8 @@ class WorkbenchDock(QDockWidget):
             return
         self.iface.messageBar().pushInfo(
             "Cable Route Workbench",
-            f"Cable type colours applied to {restyled} layer"
-            f"{'' if restyled == 1 else 's'}.")
+            (f"Cable type palette saved and {restyled} line layer{'' if restyled == 1 else 's'} updated."
+             if restyled else "Cable type palette saved."))
 
     def _organise_map_layers(self):
         """Rename and regroup the project's workbench layers by hand."""

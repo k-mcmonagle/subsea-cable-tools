@@ -428,10 +428,65 @@ def test_user_palette_applies() -> bool:
         colours = {str(c.value()): c.symbol().color().name().lower()
                    for c in lines.renderer().categories()}
         ok = ok and restyled == 1 and colours.get("DA") == "#654321"
+        stored = store.open_layer(rpl["lines_layer"])
+        ok = ok and layer_style.layer_cable_type_colours(stored).get("DA") == "#654321"
     finally:
         layer_style.set_user_cable_type_colours(previous)
     project.clear()
     return _result("user cable-type palette is applied and reapplied", ok)
+
+
+def test_palette_preserves_layer_styles() -> bool:
+    from qgis.core import QgsLineSymbol, QgsSingleSymbolRenderer
+    from qgis.PyQt.QtGui import QColor
+
+    project = QgsProject.instance()
+    project.clear()
+    store, rpl = _store_with_rpl()
+    points, lines = project_layers.ensure_rpl_layers(project, store.gpkg_path, rpl)
+    renderer = lines.renderer()
+    i = renderer.categoryIndexForValue("LW")
+    categories = renderer.categories()
+    symbol = categories[i].symbol().clone()
+    symbol.setColor(QColor("#56b4e9"))  # previous LW default
+    symbol.setWidth(2.4)
+    renderer.updateCategorySymbol(i, symbol)
+    renderer.updateCategoryLabel(i, "Light cable")
+    renderer.updateCategoryRenderState(i, False)
+    j = renderer.categoryIndexForValue("DA")
+    custom = categories[j].symbol().clone()
+    custom.setColor(QColor("#673f91"))
+    renderer.updateCategorySymbol(j, custom)
+    point_style = points.renderer().dump()
+    count = layer_style.restyle_workbench_layers(
+        project, store.gpkg_path, {"DA": "#123456"}, previous_overrides={}, persist=False)
+    assert count == 1
+    assert layer_style.layer_cable_type_colours(lines) == {"LW": "#63ad36", "DA": "#673f91"}
+    category = lines.renderer().categories()[i]
+    assert category.label() == "Light cable" and not category.renderState()
+    assert abs(category.symbol().width() - 2.4) < 1e-8
+    assert points.renderer().dump() == point_style
+    assert layer_style.layer_cable_type_colours(store.open_layer(rpl["lines_layer"])).get("DA") != "#673f91"
+
+    # A user can choose another renderer entirely, save it, then reopen it.
+    lines.setRenderer(QgsSingleSymbolRenderer(QgsLineSymbol.createSimple({"color": "#664422"})))
+    layer_style.refresh_line_categories(lines)
+    assert layer_style.restyle_workbench_layers(project, store.gpkg_path, {}, previous_overrides={}) == 0
+    assert lines.startEditing()
+    feature = next(lines.getFeatures())
+    field = lines.fields().indexOf("CableType")
+    original = feature[field]
+    assert lines.changeAttributeValue(feature.id(), field, "Pending")
+    layer_style.save_default_style(lines)
+    assert lines.isEditable() and lines.getFeature(feature.id())[field] == "Pending"
+    assert lines.rollBack()
+    assert lines.getFeature(feature.id())[field] == original
+    project.removeMapLayer(lines.id())
+    reopened = project_layers.ensure_layer(project, store.gpkg_path, rpl["lines_layer"])
+    assert isinstance(reopened.renderer(), QgsSingleSymbolRenderer)
+    assert reopened.renderer().symbol().color().name() == "#664422"
+    project.clear()
+    return _result("palette preserves layer colours, line widths, legend and saved custom renderer", True)
 
 
 def test_organise_does_not_delete_the_registry() -> bool:
@@ -493,6 +548,7 @@ def run_all():
         test_organise_does_not_delete_the_registry(),
         test_saved_style_is_not_overwritten(),
         test_user_palette_applies(),
+        test_palette_preserves_layer_styles(),
         test_restore_after_reopen(),
         test_restore_completes_half_present_rpl(),
         test_discovers_unique_custom_named_registry(),

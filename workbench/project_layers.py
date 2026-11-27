@@ -328,6 +328,13 @@ def repair_layer(layer: QgsVectorLayer, gpkg_path: str, layer_name: str) -> bool
     return layer.isValid()
 
 
+def _style_repaired_layer(layer, name):
+    if name.endswith("_lines") and layer.renderer() is not None:
+        layer_style.refresh_line_categories(layer)
+    else:
+        layer_style.style_rpl_layer(layer, name)
+
+
 def ensure_layer(
     project: Optional[QgsProject],
     gpkg_path: str,
@@ -356,7 +363,7 @@ def ensure_layer(
     if existing is not None:
         if not existing.isValid():
             if repair_layer(existing, gpkg_path, layer_name) and apply_style:
-                layer_style.style_rpl_layer(existing, layer_name)
+                _style_repaired_layer(existing, layer_name)
         return existing if existing.isValid() else None
 
     display_name = placement.display_name if placement else layer_name
@@ -368,6 +375,12 @@ def ensure_layer(
     project.addMapLayer(layer, False)
     group.addLayer(layer)
     if apply_style:
+        if layer_name.endswith("_lines") and not layer_style.is_cable_type_categorised(layer):
+            # A fresh provider also starts with a single-symbol renderer.
+            # Only initialise it when there is no saved default to preserve.
+            _message, has_default = layer.loadDefaultStyle()
+            if has_default:
+                return layer
         layer_style.style_rpl_layer(layer, layer_name)
     return layer
 
@@ -492,7 +505,7 @@ def restore_workbench_layers(project: Optional[QgsProject] = None) -> int:
                 continue
             present_names.add(name)
             if not layer.isValid() and repair_layer(layer, gpkg_path, name):
-                layer_style.style_rpl_layer(layer, name)
+                _style_repaired_layer(layer, name)
                 touched += 1
 
         rpls = store.list_rpls()

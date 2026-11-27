@@ -326,6 +326,54 @@ class ProfileLayoutTests(unittest.TestCase):
         with patch.object(lane.layer, "x_mapping", return_value=(12, 13, 0, 420, 0)):
             self.assertFalse(lane.layer.layout()["compact"])
 
+    def test_cable_bar_uses_active_layer_categories_and_shared_editor(self):
+        from qgis.core import QgsCategorizedSymbolRenderer, QgsLineSymbol, QgsRendererCategory
+        from ..workbench import layer_style, project_layers
+        from ..workbench.cable_type_dialog import palette_updates
+        from .test_workbench_project_layers import _store_with_rpl
+
+        d = self.dock
+        store, rpl = _store_with_rpl()
+        project = QgsProject.instance()
+        lines = project_layers.ensure_layer(project, store.gpkg_path, rpl["lines_layer"])
+        layer_id = lines.id()
+        self.addCleanup(lambda: project.removeMapLayer(layer_id) if project.mapLayer(layer_id) else None)
+        previous = layer_style.user_cable_type_colours()
+        self.addCleanup(layer_style.set_user_cable_type_colours, previous)
+        layer_style.set_user_cable_type_colours({"LW": "#333333"})
+        with patch.object(d.model, "workbench_store", store), patch.object(d.model, "resolved_rpl_id", rpl["rpl_id"]), \
+                patch.object(d.model, "cable_type_ranges", [(12., 13., "DA"), (13., 14., "LW")]):
+            d._refresh_cable_type_bar(False)
+            d.cable_type_toggle.trigger()
+            bar = self.profile._cable_type_bar
+            def colours():
+                return [e.colour for e in bar.layer.events]
+
+            symbol = QgsLineSymbol.createSimple({"color": "#112233"})
+            lines.setRenderer(QgsCategorizedSymbolRenderer("CableType", [QgsRendererCategory(["DA", "SA"], symbol, "Armour")]))
+            self.assertEqual(colours(), [(17, 34, 51), (51, 51, 51)])
+            layer_style.refresh_line_categories(lines)
+            self.assertEqual(len(lines.renderer().categories()), 2)
+
+            def accept_editor(dialog):
+                dialog._palette["LW"] = "#556677"
+                return 1
+
+            action = next(a for a in d.view_button.menu().actions() if a.text() == "Cable type colours…")
+            with patch("subsea_cable_tools.workbench.cable_type_dialog.qt_exec", side_effect=accept_editor):
+                action.trigger()
+            self.assertEqual(colours(), [(17, 34, 51), (85, 102, 119)])
+            project.removeMapLayer(layer_id)
+            d._refresh_cable_type_bar(True)
+            palette_updates.changed.emit()
+            self.assertEqual(colours(), [(211, 47, 53), (85, 102, 119)])
+            self.assertIsNone(d._cable_style_layer)
+            runs = [(12., 13., "DA"), (13., 14., "da")]
+            bar.set_ranges(runs)
+            self.assertEqual([(e.kp, e.kp_end) for e in bar.layer.events], [(12., 14.)])
+            bar.set_ranges(runs, {"da": "#334455"})
+            self.assertEqual(colours(), [(211, 47, 53), (51, 68, 85)])
+
     def test_compact_planning_keeps_controls_and_restores_the_table(self):
         d, p = self.dock, self.profile
         d.refresh_plans()

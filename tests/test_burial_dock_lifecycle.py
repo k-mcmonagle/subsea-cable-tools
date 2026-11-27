@@ -114,7 +114,9 @@ def _show(dock) -> None:
 
 
 def test_close_reopen_rearms_hooks_and_follows_project() -> bool:
+    from ..workbench.cable_type_dialog import palette_updates
     project = QgsProject.instance()
+    prior_receivers = palette_updates.receivers(palette_updates.changed)
     with _Harness() as h:
         dock = h.dock
         calls = {"refresh": 0}
@@ -125,7 +127,8 @@ def test_close_reopen_rearms_hooks_and_follows_project() -> bool:
             real_refresh()
 
         dock.refresh = counting_refresh
-        ok = len(dock._project_hooks) == 3 and dock._watchdog.active
+        ok = len(dock._project_hooks) == 4 and dock._watchdog.active
+        ok = ok and palette_updates.receivers(palette_updates.changed) == prior_receivers + 1
         ok = ok and dock.workflow_tabs.isTabEnabled(0)
         ok = ok and all(dock.workflow_tabs.isTabEnabled(i) for i in (1, 2, 3))
         ok = ok and dock.tabs.isTabEnabled(dock.tabs.indexOf(dock.ground_tab))
@@ -139,6 +142,7 @@ def test_close_reopen_rearms_hooks_and_follows_project() -> bool:
                   gpkg_sql._key(h.store.gpkg_path) in gpkg_sql._connections,
                   dock.cursor_outline_toggle.isChecked())
         ok = ok and closed == (True, 0, False, False, False)
+        ok = ok and palette_updates.receivers(palette_updates.changed) == prior_receivers
         # While closed, project events are not followed.
         project.readProject.emit(QDomDocument())
         layer = QgsVectorLayer("Point?crs=EPSG:4326", "life_probe", "memory")
@@ -153,7 +157,8 @@ def test_close_reopen_rearms_hooks_and_follows_project() -> bool:
         reopened = (dock._suspended, len(dock._project_hooks),
                     dock._watchdog.active)
         QCoreApplication.processEvents()
-        ok = ok and reopened == (False, 3, True) and calls["refresh"] == 1
+        ok = ok and reopened == (False, 4, True) and calls["refresh"] == 1
+        ok = ok and palette_updates.receivers(palette_updates.changed) == prior_receivers + 1
 
         # Reopened by the plugin (show() then refresh()): one refresh only.
         dock.close()

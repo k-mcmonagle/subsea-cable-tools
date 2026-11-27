@@ -360,6 +360,7 @@ class BurialPlannerDock(QDockWidget):
         self.event_lane_toggle.setToolTip("Show plan and RPL events by KP. Zoom in for more labels or hover a tick for details.")
         self.cable_type_toggle = view_menu.addAction("RPL cable type bar")
         self.cable_type_toggle.setCheckable(True)
+        self._cable_style_layer = None
         self.bathy_toggle = view_menu.addAction("Bathymetry")
         self.bathy_toggle.setCheckable(True)
         self.slope_toggle = view_menu.addAction("Slope")
@@ -405,6 +406,7 @@ class BurialPlannerDock(QDockWidget):
             action.toggled.connect(lambda checked, path=setting: QSettings().setValue(path, checked))
             action.toggled.connect(self._refresh_rpl_lane)
             self._rpl_filters[key] = action
+        view_menu.addAction("Cable type colours…", self._edit_cable_type_colours)
         view_menu.addSeparator()
         self.profile_drag_toggle = view_menu.addAction("Allow event dragging")
         self.profile_drag_toggle.setCheckable(True)
@@ -1727,7 +1729,38 @@ class BurialPlannerDock(QDockWidget):
         self.cable_type_toggle.setToolTip(
             "Show the route's cable types by KP. Hover for the range or click to go to that KP."
             if ranges else "Available when the plan's registered RPL has cable types on its legs.")
-        self.profile.set_cable_type_ranges(ranges if checked else [])
+        layer = None
+        store = self.model.workbench_store
+        if checked and ranges and store is not None and self.model.resolved_rpl_id and not self._suspended:
+            try:
+                rpl = store.get_rpl(self.model.resolved_rpl_id) or {}
+                if store.gpkg_path and rpl.get("lines_layer"):
+                    layer = wb_project_layers.find_layer(QgsProject.instance(), store.gpkg_path, rpl["lines_layer"])
+            except Exception:
+                log_exception("Burial Planner: could not read the route layer style")
+        self._watch_cable_style(layer)
+        self._draw_cable_type_bar()
+
+    def _watch_cable_style(self, layer):
+        previous = self._cable_style_layer
+        if previous is layer:
+            return
+        if previous is not None and not _sip_isdeleted(previous):
+            previous.styleChanged.disconnect(self._draw_cable_type_bar)
+        self._cable_style_layer = layer
+        if layer is not None:
+            layer.styleChanged.connect(self._draw_cable_type_bar)
+
+    def _draw_cable_type_bar(self):
+        from ..workbench.layer_style import layer_cable_type_colours
+        ranges = self.model.cable_type_ranges if self.cable_type_toggle.isChecked() else []
+        layer = self._cable_style_layer
+        colours = layer_cable_type_colours(layer) if layer is not None and not _sip_isdeleted(layer) else {}
+        self.profile.set_cable_type_ranges(ranges, colours)
+
+    def _edit_cable_type_colours(self):
+        from ..workbench.cable_type_dialog import edit_cable_type_colours
+        edit_cable_type_colours(self.model.workbench_store, self)
 
     def _refresh_rpl_lane(self, *_args):
         selected = {key for key, action in self._rpl_filters.items() if action.isChecked()}
@@ -2871,8 +2904,10 @@ class BurialPlannerDock(QDockWidget):
         """Follow project (re)loads and layer changes (idempotent)."""
         if self._project_hooks:
             return
+        from ..workbench.cable_type_dialog import palette_updates
         project = QgsProject.instance()
-        for signal, slot in ((project.readProject, self._project_reloaded),
+        for signal, slot in ((palette_updates.changed, self._draw_cable_type_bar),
+                             (project.readProject, self._project_reloaded),
                              (project.layersAdded, self._schedule_layers_check),
                              (project.layersRemoved, self._schedule_layers_check)):
             try:
@@ -2882,6 +2917,7 @@ class BurialPlannerDock(QDockWidget):
                 log_exception("Burial Planner: cannot follow project changes")
 
     def _remove_project_hooks(self) -> None:
+        self._watch_cable_style(None)
         hooks, self._project_hooks = self._project_hooks, []
         for signal, slot in hooks:
             try:

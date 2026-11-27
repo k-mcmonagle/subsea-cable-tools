@@ -146,6 +146,7 @@ class CableTypeBar(_ProfileLane):
     def __init__(self):
         super().__init__()
         self.layer.set_style(tiers=1)
+        self.layer.range_alpha = 255  # The dedicated strip uses the map symbol's RGB on white.
         axis = self.getAxis("left")
         axis.setStyle(showValues=True, tickLength=0, tickTextOffset=2, tickFont=self.layer.font)
         axis.setTextPen(pg.mkPen("#444"))
@@ -156,12 +157,19 @@ class CableTypeBar(_ProfileLane):
         self.cursor.hide()
         self._starts = []
 
-    def set_ranges(self, ranges):
+    def set_ranges(self, ranges, layer_colours=None):
         from ..workbench.layer_style import colour_for_cable_type, user_cable_type_colours
         palette = user_cable_type_colours() if ranges else {}
+        layer_colours = layer_colours or {}
         entries = []
         for start, end, label in ranges:
-            rgb = QColor(colour_for_cable_type(label, palette)).getRgb()[:3]
+            colour = layer_colours.get(label) or colour_for_cable_type(label, palette)
+            rgb = QColor(colour).getRgb()[:3]
+            if entries:
+                last = entries[-1]
+                if last.kp_end == start and last.label.casefold() == label.casefold() and last.colour == rgb:
+                    start, label = last.kp, last.label
+                    entries.pop()
             detail = f"Cable type: {label}\nKP {start:.3f}–{end:.3f}"
             entries.append(ProfileEvent(start, end, SRC_RPL, "cable_type", label, detail, rgb))
         self._set_entries(entries)

@@ -50,11 +50,13 @@ def test_normalise_cable_type() -> bool:
 
 
 def test_known_types_have_canonical_colours() -> bool:
-    ok = True
+    defaults = {"SA": "#006cbe", "DA": "#d32f35", "LW": "#63ad36", "LWS": "#155438"}
+    ok = all(layer_style.standard_colour_for_cable_type(key) == value for key, value in defaults.items())
+    ok = ok and len(set(layer_style.KNOWN_CABLE_TYPE_COLOURS.values())) == len(layer_style.KNOWN_CABLE_TYPE_COLOURS)
     for token, colour in layer_style.KNOWN_CABLE_TYPE_COLOURS.items():
-        ok = ok and layer_style.colour_for_cable_type(token) == colour
+        ok = ok and layer_style.colour_for_cable_type(token, {}) == colour
     # case / punctuation insensitive
-    ok = ok and layer_style.colour_for_cable_type("d.a") == \
+    ok = ok and layer_style.colour_for_cable_type("d.a", {}) == \
         layer_style.KNOWN_CABLE_TYPE_COLOURS["DA"]
     return _result("canonical colours", ok)
 

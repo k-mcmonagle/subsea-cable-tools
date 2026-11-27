@@ -290,6 +290,10 @@ def test_workbench_cable_type_dialog_constructs():
                    for row in range(dialog.table.rowCount())}
         assert sources["XYZ"] == "Custom"
         assert sources["DA"] == "Standard"
+        swatches = {dialog.table.item(row, 0).text(): dialog.table.item(row, 1)
+                    for row in range(dialog.table.rowCount())}
+        assert swatches["LW"].foreground().color().name() == "#000000"
+        assert swatches["LWS"].foreground().color().name() == "#ffffff"
         assert dialog.palette() == {"xyz".upper(): "#010203"}
         dialog.deleteLater()
     finally:

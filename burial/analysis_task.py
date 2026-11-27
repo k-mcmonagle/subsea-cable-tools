@@ -903,7 +903,7 @@ def build_route_frame(lines_layer: QgsVectorLayer,
             for (_, _, label), start, end in zip(ordered, edges, edges[1:]):
                 if end <= start or not label or label.upper() == "NULL":
                     continue
-                if runs and runs[-1][1] == start and runs[-1][2].casefold() == label.casefold():
+                if runs and runs[-1][1] == start and runs[-1][2] == label:
                     runs[-1] = (runs[-1][0], end, runs[-1][2])
                 else:
                     runs.append((start, end, label))

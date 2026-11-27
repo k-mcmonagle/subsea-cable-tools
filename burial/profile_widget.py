@@ -914,7 +914,7 @@ class BurialProfileWidget(QWidget):
             else:
                 self._navigator.curve.clear()
 
-    def set_cable_type_ranges(self, ranges):
+    def set_cable_type_ranges(self, ranges, layer_colours=None):
         if self._cable_type_bar is None:
             if not ranges:
                 return
@@ -924,7 +924,7 @@ class BurialProfileWidget(QWidget):
             self.layout().insertWidget(1 if self._event_lane is not None else 0, self._cable_type_bar)
             self._cable_type_bar.kpHovered.connect(self._hover_at_kp)
             self._cable_type_bar.kpClicked.connect(self.kpClicked)
-        self._cable_type_bar.set_ranges(ranges)
+        self._cable_type_bar.set_ranges(ranges, layer_colours)
 
     def set_event_lane_visible(self, visible):
         if visible and self._event_lane is None:
