@@ -176,6 +176,7 @@ class AnnotationQgisTests(unittest.TestCase):
         overlay.redraw()
         self.assertLessEqual(len(overlay.items), overlay.MAX_VISIBLE)
         self.assertIn("zoom in", ground.plot.annotation_notice.text())
+        self.assertFalse(ground.plot.annotation_notice.isHidden())
         ground.plot.plot.setXRange(1, 1.002, padding=0)
         overlay.redraw()
         self.assertTrue(any(item.isVisible() for item in overlay.items))
@@ -183,6 +184,7 @@ class AnnotationQgisTests(unittest.TestCase):
         ground.refresh()
         overlay.redraw()
         self.assertFalse(overlay.entries)
+        self.assertTrue(ground.plot.annotation_notice.isHidden())
         self.assertTrue(all(not item.isVisible() for item in overlay.items))
         self.assertIn("check reference", ground.horizon_status.text())
 

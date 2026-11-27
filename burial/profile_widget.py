@@ -684,6 +684,7 @@ class BurialProfileWidget(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
         layout.addWidget(self._splitter)
 
         # Sea level: a real (dashed) data item rather than an InfiniteLine so
@@ -847,6 +848,7 @@ class BurialProfileWidget(QWidget):
         master = ground_plot if mode == "ground" else self.plot
         self._ground_pane.setVisible(mode != "bathy")
         self._depth_pane.setVisible(mode != "ground")
+        self._update_kp_axis_titles()
         if master is not self._active_plot:
             master.setXLink(None)
             self._active_plot = master
@@ -1467,6 +1469,14 @@ class BurialProfileWidget(QWidget):
 
     def set_slope_visible(self, visible: bool) -> None:
         self._slope_pane.setVisible(bool(visible))
+        self._update_kp_axis_titles()
+
+    def _update_kp_axis_titles(self):
+        # Keep KP ticks on every detail plot, including when lower plots are
+        # scrolled out of view. Only the last detail plot needs the units title.
+        ground_hidden = self._ground_pane.isHidden()
+        self.plot.getAxis("bottom").showLabel(ground_hidden and self._slope_pane.isHidden())
+        self.slope_plot.getAxis("bottom").showLabel(ground_hidden)
 
     def set_slope_series(self, long_series, cross_series, abs_series, cross_max_series=None) -> None:
         """Series are (kp, degrees|None) lists; None renders as a gap."""

@@ -27,6 +27,7 @@ from qgis.PyQt.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QPushButton,
+    QSizePolicy,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -78,12 +79,7 @@ class BasTab(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
-        intro = QLabel(
-            "Record Burial Assessment Study results by KP range. Import a table, "
-            "generate sections from soil polygons or add rows. Use Columns to choose what to record.")
-        intro.setWordWrap(True)
-        intro.setStyleSheet(ui_helpers.hint_style())
-        layout.addWidget(intro)
+        layout.setSpacing(3)
 
         toolbar = QHBoxLayout()
         self.import_button = QPushButton("Import…")
@@ -154,11 +150,18 @@ class BasTab(QWidget):
         layout.addLayout(edit_row)
 
         self.table = SpreadsheetTable(0, 0)
+        # The rows already scroll. Let the page fit a shorter table before
+        # the surrounding tab needs a second vertical scrollbar.
+        self.table.setMinimumHeight(self.table.minimumSizeHint().height())
+        policy = self.table.sizePolicy()
+        policy.setVerticalPolicy(QSizePolicy.Policy.Ignored)
+        self.table.setSizePolicy(policy)
         self.table.setSelectionMode(SELECTION_MODE_EXTENDED)
         self.table.setEditTriggers(EDIT_TRIGGER_DOUBLE_CLICKED
                                    | EDIT_TRIGGER_EDIT_KEY_PRESSED
                                    | EDIT_TRIGGER_SELECTED_CLICKED)
         self.table.setToolTip(
+            "Burial Assessment Study results by KP range. Use Columns to choose what to record.\n"
             "Double-click or start typing to edit. Ctrl+C / Ctrl+V copy and "
             "paste tab-separated cells (paste from Excel adds rows as needed); "
             "Delete clears; Ctrl+D fills down; Ctrl+Z / Ctrl+Y undo and redo. "
@@ -204,6 +207,7 @@ class BasTab(QWidget):
             self._dirty = False
             self._loaded_plan_id = ""
             self._rebuild_table()
+            self.strip.hide()
             self.strip.set_spans(0.0, [])
             self._set_status("No plan selected.")
             return
@@ -232,10 +236,13 @@ class BasTab(QWidget):
         self._apply_map_visibility()
 
     def _refresh_strip(self) -> None:
-        scope = self.model.gen_params().scope
-        if scope.length_km <= 0:
+        params = self.model.gen_params()
+        has_scope = params.scope_end_kp != params.scope_start_kp
+        self.strip.setVisible(has_scope)
+        if not has_scope:
             self.strip.set_spans(0.0, [])
             return
+        scope = params.scope
         selected = {self._working[r].get("row_id") for r in self._selected_rows()}
         spans = []
         for row in self._working:
@@ -249,8 +256,7 @@ class BasTab(QWidget):
 
     def _update_status(self) -> None:
         if not self._working:
-            self._set_status("No BAS rows for this plan yet — import the study's "
-                             "table or add rows.")
+            self._set_status("No BAS rows yet. Import a table, generate sections from polygons or add rows.")
             return
         with_kp = [r for r in self._working
                    if r.get("start_kp") is not None and r.get("end_kp") is not None]

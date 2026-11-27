@@ -97,14 +97,7 @@ class GroundTab(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
-
-        intro = QLabel(
-            "Ground conditions by KP and depth below seabed: soil classes, a numeric "
-            "dataset, or CPTs imported from AGS files (drawn as traces at their KP). "
-            "The KP axis follows bathymetry; the dashed line shows target burial depth.")
-        intro.setWordWrap(True)
-        intro.setStyleSheet(ui_helpers.hint_style())
-        layout.addWidget(intro)
+        layout.setSpacing(3)
 
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("Display:"))
@@ -112,7 +105,8 @@ class GroundTab(QWidget):
         self.display_mode.addItems(["Soil classes", "Numeric datasets", "CPTs"])
         self.display_mode.setToolTip("Soil classes: the plan's ground-model units. Numeric datasets: one "
                                      "measured value coloured by KP and depth. CPTs: import and check "
-                                     "cone penetration tests (AGS 3 / AGS 4).")
+                                      "cone penetration tests (AGS 3 / AGS 4). "
+                                      "The KP axis follows bathymetry. The dashed line shows target burial depth.")
         mode_row.addWidget(self.display_mode)
         self.strength_button = QPushButton("CPT strength section…")
         self.strength_button.setToolTip("Create a Su section with editable 0–5, 5–10, 10–200 and ≥200 kPa colours. "

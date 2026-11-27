@@ -12,7 +12,7 @@ import os
 from ..project_lifecycle import project_teardown_slots
 
 from qgis.PyQt.QtCore import QDateTime, QSettings, Qt
-from qgis.PyQt.QtGui import QColor, QCursor, QFontMetrics
+from qgis.PyQt.QtGui import QColor, QCursor
 from qgis.PyQt.QtWidgets import (
     QApplication, QCheckBox, QColorDialog, QComboBox, QDateTimeEdit, QDialog,
     QDialogButtonBox, QDoubleSpinBox,
@@ -21,6 +21,7 @@ from qgis.PyQt.QtWidgets import (
     QLineEdit, QMenu, QPushButton, QSlider, QTableWidgetItem,
     QTextEdit, QVBoxLayout, QWidget,
 )
+from ..elided_label import ElidedLabel
 from ..table_widgets import ResizableTableWidget as QTableWidget
 from qgis.core import (
     QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsExpression,
@@ -38,7 +39,6 @@ from ..qgis_compat import (
     MAP_LAYER_FILTER_POINT, MESSAGE_BOX_NO, MESSAGE_BOX_YES, MESSAGE_CRITICAL,
     MESSAGE_INFO, MESSAGE_WARNING,
     SELECTION_BEHAVIOR_SELECT_ROWS, SELECTION_MODE_EXTENDED,
-    SIZE_POLICY_IGNORED, SIZE_POLICY_PREFERRED, TEXT_ELIDE_RIGHT,
     WINDOW_HINT_CLOSE,
     WINDOW_HINT_CUSTOMIZE, WINDOW_HINT_MIN_MAX, WINDOW_HINT_TITLE, WINDOW_TYPE_WINDOW,
     layer_filters, qt_exec,
@@ -93,30 +93,6 @@ def _refuse_closed_project_write():
     raise RuntimeError("The QGIS project changed: reopen the Planner to plan in it.")
 
 
-class _ElidedLabel(QLabel):
-    """Label that elides its text instead of demanding layout width."""
-
-    def __init__(self, text="", parent=None):
-        super().__init__(parent)
-        self._full_text = ""
-        self.setSizePolicy(SIZE_POLICY_IGNORED, SIZE_POLICY_PREFERRED)
-        self.setText(text)
-
-    def setText(self, text):
-        self._full_text = str(text)
-        self.setToolTip(self._full_text)
-        self._apply_elide()
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._apply_elide()
-
-    def _apply_elide(self):
-        metrics = QFontMetrics(self.font())
-        super().setText(metrics.elidedText(
-            self._full_text, TEXT_ELIDE_RIGHT, max(0, self.width() - 4)))
-
-
 class PlannerDock(QDockWidget):
     def __init__(self, iface, parent=None):
         super().__init__("Planner", parent)
@@ -159,7 +135,7 @@ class PlannerDock(QDockWidget):
         self.task_table.set_history_hooks(
             self._planner_history_snapshot, self._restore_planner_history_snapshot)
         outer.addWidget(self.task_table, 1)
-        self.totals_label = _ElidedLabel("")
+        self.totals_label = ElidedLabel("")
         self.totals_label.setToolTip("Whole-plan totals; updates live with the schedule.")
         outer.addWidget(self.totals_label)
         outer.addLayout(self._build_transport_bar())
@@ -578,7 +554,7 @@ class PlannerDock(QDockWidget):
         # the label elides instead of resizing, so text changes during playback
         # can no longer push the slider around.
         layout.addWidget(self.slider, 3)
-        self.status_label = _ElidedLabel("No scenario")
+        self.status_label = ElidedLabel("No scenario")
         layout.addWidget(self.status_label, 2)
         self.labels_btn = QPushButton("Labels…")
         labels_menu = QMenu(self.labels_btn)

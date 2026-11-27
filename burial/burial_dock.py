@@ -47,7 +47,6 @@ from qgis.PyQt.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
-    QSizePolicy,
     QSplitter,
     QTabWidget,
     QToolButton,
@@ -68,6 +67,7 @@ except (ImportError, AttributeError):  # pragma: no cover
         def _sip_isdeleted(_obj):
             return False
 
+from ..elided_label import ElidedLabel
 from ..plugin_log import log_debug, log_exception, log_info, log_warning
 from ..schema_guard import NewerVersionError
 from ..qgis_compat import (
@@ -324,6 +324,7 @@ class BurialPlannerDock(QDockWidget):
         self.profile_pane = QWidget()
         profile_layout = QVBoxLayout(self.profile_pane)
         profile_layout.setContentsMargins(0, 0, 0, 0)
+        profile_layout.setSpacing(2)
         self.profile_header = QWidget()
         profile_status_row = QHBoxLayout(self.profile_header)
         profile_status_row.setContentsMargins(0, 0, 0, 0)
@@ -334,7 +335,8 @@ class BurialPlannerDock(QDockWidget):
         self.profile_fold.setToolTip("Collapse profiles to give the planning table more room")
         self.profile_fold.clicked.connect(self._toggle_profiles)
         profile_status_row.addWidget(self.profile_fold)
-        profile_status_row.addStretch(1)
+        self.profile_status = ElidedLabel("Bathymetry profile")
+        profile_status_row.addWidget(self.profile_status, 1)
         self.goto_kp_edit = QLineEdit()
         self.goto_kp_edit.setPlaceholderText("Go to KP…")
         self.goto_kp_edit.setFixedWidth(90)
@@ -456,10 +458,6 @@ class BurialPlannerDock(QDockWidget):
         self.profile.kpDoubleClicked.connect(self._on_profile_double_clicked)
         self.profile.eventMoveRequested.connect(self._on_profile_event_moved)
         self.profile.set_slope_visible(self.slope_toggle.isChecked())
-        self.profile_status = QLabel("Bathymetry profile")
-        self.profile_status.setWordWrap(True)
-        self.profile_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        profile_layout.addWidget(self.profile_status)
         self.profile_scroll = _scroll_panel(self.profile)
         self.profile_scroll.setMinimumHeight(110)
         profile_layout.addWidget(self.profile_scroll, 1)
@@ -1423,18 +1421,9 @@ class BurialPlannerDock(QDockWidget):
         if stale and not reasons:
             reasons = ["the inputs changed since sampling"]
         if reasons:
-            # Say exactly what changed — "stale" with no reason left users
-            # guessing whether to trust (or resample) the profile.
-            text += ("  —  OUT OF DATE: " + "; ".join(reasons[:2])
-                     + ("; …" if len(reasons) > 2 else "")
-                     + ". Rebuild on the Bathymetry Profile tab.")
-            self.profile_status.setStyleSheet(ui_helpers.status_style("warn"))
-            self.profile_status.setToolTip(
-                "The stored profile no longer matches its inputs:\n• "
-                + "\n• ".join(reasons))
-        else:
-            self.profile_status.setStyleSheet("")
-            self.profile_status.setToolTip("")
+            text = ("Out of date — " + "; ".join(reasons)
+                    + ". Rebuild on the Bathymetry Profile tab. " + text)
+        self.profile_status.setStyleSheet(ui_helpers.status_style("warn") if reasons else "")
         self.profile_status.setText(text)
         self.profile_tab.refresh()
         self._refresh_tab_badges()
@@ -1469,7 +1458,6 @@ class BurialPlannerDock(QDockWidget):
         folded = mode == "tables"
         focused = mode == "profiles"
         self.tabs.setVisible(not focused)
-        self.profile_status.setVisible(not folded)
         self.profile_scroll.setVisible(not folded)
         self.profile_pane.layout().activate()
         self.splitter.handle(1).setEnabled(not folded)

@@ -54,6 +54,7 @@ class ProfileLayoutTests(unittest.TestCase):
         self.assertEqual(nav.viewRange()[0], [10, 30])
         nav.region.setRegion((13, 18))
         self.assertEqual(p.plot.viewRange()[0], [13, 18])
+        d.slope_toggle.setChecked(True)
         for mode in ("stacked", "ground", "bathy"):
             d._profile_layout_actions[mode].trigger()
             # Showing a splitter child posts layout requests through the
@@ -62,6 +63,10 @@ class ProfileLayoutTests(unittest.TestCase):
             self.assertEqual(p._depth_pane.isHidden(), mode == "ground")
             self.assertEqual(d.ground_tab.plot_box.isHidden(), mode != "bathy")
             self.assertEqual(p.ground_layout.indexOf(ground) >= 0, mode != "bathy")
+            self.assertTrue(ground.plot.getAxis("bottom").label.isVisible())
+            self.assertEqual(p.slope_plot.getAxis("bottom").label.isVisible(), mode == "bathy")
+            self.assertFalse(p.plot.getAxis("bottom").label.isVisible())
+            self.assertTrue(p.plot.getAxis("bottom").style["showValues"])
             if mode == "stacked":
                 self.assertGreaterEqual(p._depth_pane.height(), p._depth_pane.minimumSizeHint().height())
                 self.assertGreaterEqual(p._ground_pane.height(), p._ground_pane.minimumSizeHint().height())
@@ -74,6 +79,8 @@ class ProfileLayoutTests(unittest.TestCase):
         self.assertEqual(d.model.plan, before)
         self.assertEqual(p._scope, (12, 22))
         self.assertEqual(nav.viewRange()[0], [10, 30])
+        d.slope_toggle.setChecked(False)
+        self.assertTrue(p.plot.getAxis("bottom").label.isVisible())
         d.navigator_toggle.trigger()
         self.assertTrue(nav.isHidden())
         self.assertIsNone(nav._view)
@@ -120,9 +127,15 @@ class ProfileLayoutTests(unittest.TestCase):
         d.navigator_toggle.setChecked(True)
         p.set_route_extent(10, 30)
         p._active_plot.setXRange(13, 18, padding=0)
-        d.profile_status.setText("The route has changed. Rebuild the bathymetry profile. " * 2)
+        message = "Out of date — the route has changed. Rebuild the bathymetry profile. " * 3
+        d.profile_status.setText(message)
         QTest.qWait(60)
         self.assertEqual(d.width(), 720)
+        self.assertIs(d.profile_status.parentWidget(), d.profile_header)
+        self.assertEqual(d.profile_status.toolTip(), message)
+        self.assertEqual(d.profile_status.accessibleName(), message)
+        self.assertLess(d.profile_scroll.y() - d.profile_header.geometry().bottom(),
+                        d.profile_status.fontMetrics().height())
         tab_bar_pos = d.tabs.tabBar().mapTo(d, QPoint())
         profile_button_pos = d.profile_fold.mapTo(d, QPoint())
         page_viewport = d.bas_tab.parentWidget()
@@ -160,6 +173,29 @@ class ProfileLayoutTests(unittest.TestCase):
         d._on_profile_double_clicked(15)
         self.assertTrue(d.builder_tab.isVisible())
         self.assertTrue(d.profile_scroll.isVisible())
+
+    def test_bas_coverage_and_scrollbars_in_a_short_pane(self):
+        d, tab = self.dock, self.dock.bas_tab
+        d.refresh_plans()
+        d.tabs.setCurrentWidget(tab)
+        self.assertTrue(tab.strip.isHidden())
+        d.model.update_plan({"scope_start_kp": 10., "scope_end_kp": 20.})
+        tab.refresh()
+        self.assertFalse(tab.strip.isHidden())
+        tab._insert_rows(None, 20)
+        QTest.qWait(50)
+        # Allocate space for a few rows between the table's native minimum
+        # and its preferred height. The vertical scrollbar belongs to the table.
+        page = tab.parentWidget()
+        height = (tab.table.minimumHeight() + tab.table.sizeHint().height()) // 2
+        top = tab.table.mapTo(d.tabs, QPoint()).y()
+        bottom = d.tabs.height() - page.mapTo(d.tabs, QPoint(0, page.height())).y()
+        desired = top + height + tab.layout().contentsMargins().bottom() + bottom
+        d.splitter.setSizes([desired, sum(d.splitter.sizes()) - desired])
+        QTest.qWait(50)
+        self.assertEqual(page.parentWidget().verticalScrollBar().maximum(), 0)
+        self.assertGreater(tab.table.verticalScrollBar().maximum(), 0)
+        self.assertGreaterEqual(tab.table.height(), tab.table.minimumHeight())
 
     def test_layout_preference_restores_in_another_dock(self):
         d = self.dock

@@ -277,8 +277,9 @@ class GroundModelPlot(QWidget):
         self.horizon_legend.hide()
         self.annotation_notice = QLabel()
         self.annotation_notice.setWordWrap(True)
+        self.annotation_notice.hide()
         self.annotations = AnnotationOverlay(self.plot)
-        self.annotations.noticeChanged.connect(self.annotation_notice.setText)
+        self.annotations.noticeChanged.connect(self._set_annotation_notice)
         layout.addWidget(self.annotation_notice)
         layout.addWidget(self.horizon_legend)
         layout.addWidget(self.plot, 1)
@@ -300,6 +301,10 @@ class GroundModelPlot(QWidget):
         self._unit_item.set_units(self._units, colors)
         self._update_legend(codes, colors)
         self._fit_depth()
+
+    def _set_annotation_notice(self, text):
+        self.annotation_notice.setText(text)
+        self.annotation_notice.setVisible(bool(text))
 
     def set_annotations(self, groups) -> None:
         self.annotations.set_groups(groups)
